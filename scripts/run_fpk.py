@@ -24,7 +24,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from fpk import data as D  # noqa: E402
-from fpk.env import DYN, TISR, pgfm_args, rkt  # noqa: E402
+from fpk.env import DYN, TISR, contract, pgfm_args, rkt  # noqa: E402
 from fpk.ensemble import Scorer, rollout  # noqa: E402
 from fpk.flow import FlowConfig, KernelFlow  # noqa: E402
 from fpk.kernel import KernelConfig, PhysicsKernel  # noqa: E402
@@ -194,7 +194,10 @@ def cmd_score(a, rest):
     w = np.cos(np.deg2rad(cl.lat))
     w = (w / w.mean()).astype(np.float64)
     dyn = np.asarray(DYN)
-    res, t_all = {}, time.time()
+    res, raws, t_all = {}, {}, time.time()
+    eps = rkt().EPS
+    clim_z = ((cl.clim - cl.mean[None, :, None, None]) / (cl.std[None, :, None, None] + eps)).astype(np.float64)
+    clim_of = lambda j: np.stack([clim_z[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] for k in j])  # noqa: E731
     for arm in a.arms:
         g = torch.Generator().manual_seed(a.seed)
         if arm == "core":
@@ -216,20 +219,24 @@ def cmd_score(a, rest):
             ens, hk = rollout(step, x0, torch.tensor(j, device=dev), tis, m, L,
                               kernel=K if (m > 1 and a.kernel_entropy) else None, gen=g)
             sc.update(ens.cpu().numpy().astype(np.float64), truth.astype(np.float64),
-                      None if hk is None else hk.cpu().numpy())
+                      None if hk is None else hk.cpu().numpy(), clim=clim_of(j))
         res[arm] = sc.summary()
+        raws[arm] = sc.raw()
         res[arm]["members"], res[arm]["sec"] = m, round(time.time() - t0)
         log({arm: {k: res[arm][k] for k in ("nrmse", "crps", "spread_skill", "entropy", "ign") if k in res[arm]}})
     # climatology as a reference (z-scored daily climatology of the training years)
-    clim_z = ((cl.clim - cl.mean[None, :, None, None]) / (cl.std[None, :, None, None] + 1e-8)).astype(np.float64)
     sc = Scorer(L, w, cl.inc, cl.std)
     for i in range(0, len(ics), a.ic_batch):
         j = ics[i:i + a.ic_batch]
-        c = np.stack([clim_z[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] for k in j])[:, None]
+        c = clim_of(j)
         truth = np.stack([te[k + 1:k + 1 + L][:, dyn] for k in j]).astype(np.float64)
-        sc.update(c, truth)
+        sc.update(c[:, None], truth, clim=c)
     res["climatology"] = sc.summary()
-    meta = dict(test_year=a.test_year, ics=len(ics), ic_stride=a.ic_stride, members=M, leads=L, steps=a.steps,
+    raws["climatology"] = sc.raw()
+    np.savez_compressed(os.path.join(a.out, f"{a.score_tag}_raw.npz"),
+                        **{f"{arm}__{k}": v for arm, r in raws.items() for k, v in r.items()},
+                        ics=ics, std=cl.std[dyn], inc=cl.inc[dyn])
+    meta = dict(test_year=a.test_year, ics=len(ics), channels=[contract.CHANNEL_NAMES[c] for c in DYN], ic_stride=a.ic_stride, members=M, leads=L, steps=a.steps,
                 core_tag=a.core_tag, kernel_tag=a.kernel_tag, sec=round(time.time() - t_all))
     path = os.path.join(a.out, f"{a.score_tag}.json")
     with open(path, "w") as f:

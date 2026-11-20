@@ -28,7 +28,9 @@ from .env import DYN, TISR, TISR_DYN, contract
 
 LOG2PI = math.log(2 * math.pi)
 SCORED = [i for i, c in enumerate(DYN) if i != TISR_DYN]  # the 65 scored dynamic channels (index into DYN)
-KEY_VARS = ["z500", "t850", "t2m", "u850", "v850", "q700", "msl", "u250"]
+KEY_VARS = ["z500", "z850", "t850", "t2m", "msl", "u850", "v850", "u250", "v250", "q700"]
+# the per-variable set of PG-CFM (physical_guide_flowmatching scripts/eval_kai_channel_gains.py); windNNN = (u, v)
+CHAN_VARS = ["z500", "z850", "t850", "t2m", "msl", "u850", "v850", "wind850", "u250", "v250", "wind250"]
 
 
 def dyn_index(name: str) -> int:
@@ -84,14 +86,29 @@ class Scorer:
     def add(self, name: str, v: np.ndarray):
         self.acc.setdefault(name, []).append(v)
 
-    def update(self, ens: np.ndarray, truth: np.ndarray, hk: Optional[np.ndarray] = None):
-        """ens (B, M, L, 66, H, W), truth (B, L, 66, H, W), normalized; hk (B, M, L, 66, H, W) kernel entropy."""
+    def update(self, ens: np.ndarray, truth: np.ndarray, hk: Optional[np.ndarray] = None,
+               clim: Optional[np.ndarray] = None):
+        """ens (B, M, L, 66, H, W), truth (B, L, 66, H, W), normalized; hk (B, M, L, 66, H, W) kernel entropy;
+        clim (B, L, 66, H, W) the daily climatology of the truth's days (ACC, activity and the MSE split)."""
         w = self.w
         M = ens.shape[1]
         self.M = M
         mu = ens.mean(1)
         err2 = area_mean((mu - truth) ** 2, w)                                          # (B, L, 66)
         self.add("mse", err2)
+        if clim is not None:
+            # as PG-CFM's score: ACC and activity of the ensemble mean's anomaly, and its MSE split exactly into
+            # bias^2 + s_o^2 (1 - r^2) (information: only a better pattern lowers it) + s_o^2 (a - r)^2 (amplitude)
+            pa, ta = mu - clim, truth - clim
+            mf, mo = area_mean(pa, w), area_mean(ta, w)
+            vf = np.maximum(area_mean(pa ** 2, w) - mf ** 2, 0)
+            vo = np.maximum(area_mean(ta ** 2, w) - mo ** 2, 1e-30)
+            cov = area_mean(pa * ta, w) - mf * mo
+            r = cov / np.sqrt(vf * vo + 1e-30)
+            act = np.sqrt(vf / vo)
+            self.add("acc", area_mean(pa * ta, w) / np.sqrt(area_mean(pa ** 2, w) * area_mean(ta ** 2, w) + 1e-30))
+            self.add("act", act)
+            self.add("terms", np.stack([(mf - mo) ** 2, vo * (1 - r ** 2), vo * (act - r) ** 2], -1))
         if M > 1:
             var = ens.var(1, ddof=1)                                                    # (B, L, 66, H, W)
             self.add("var", area_mean(var, w))
@@ -109,6 +126,10 @@ class Scorer:
         if hk is not None:
             self.add("HK", area_mean(hk.mean(1), w))
 
+    def raw(self) -> Dict[str, np.ndarray]:
+        """The per-IC arrays (N, L, 66[, 3]) behind the summary, for paired comparisons (fpk report)."""
+        return {k: np.concatenate(v, 0).astype(np.float32) for k, v in self.acc.items()}
+
     def summary(self) -> Dict:
         cat = {k: np.concatenate(v, 0) for k, v in self.acc.items()}                    # (N, L, 66)
         sc = SCORED
@@ -117,6 +138,10 @@ class Scorer:
         out["nrmse"] = rmse[:, sc].mean(1).tolist()                                    # z-score RMSE, 65-channel mean
         out["crps"] = cat["crps"].mean(0)[:, sc].mean(1).tolist()
         out["rmse_phys"] = {v: (rmse[:, dyn_index(v)] * self.std[dyn_index(v)]).tolist() for v in KEY_VARS}
+        if "acc" in cat:
+            out["acc"] = cat["acc"].mean(0)[:, sc].mean(1).tolist()
+            out["acc_vars"] = {v: cat["acc"].mean(0)[:, dyn_index(v)].tolist() for v in KEY_VARS}
+            out["activity_vars"] = {v: cat["act"].mean(0)[:, dyn_index(v)].tolist() for v in KEY_VARS}
         if "var" in cat:
             spread = np.sqrt(cat["var"].mean(0))
             out["spread"] = spread[:, sc].mean(1).tolist()
