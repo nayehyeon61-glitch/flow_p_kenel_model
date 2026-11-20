@@ -200,8 +200,9 @@ def cmd_tune(a, rest):
     """Rollout fine-tuning: M members run D days from the data's state (each day drawing from the kernel, or from
     the flow with --flow-tag), and the fair CRPS of every day against the data (units of s, area-weighted) is
     minimized, plus lam x the one-day loss the model was fitted with (kernel NLL / flow-matching loss) as an anchor.
-    The state is detached between days (the gradient of a day reaches its own draw only); the days follow the
-    curriculum --days. A memory core's memory runs along each member as in the forecast."""
+    The state is detached between days (the gradient of a day reaches its own draw only) unless --through: then the
+    gradient of a day's score goes back through the states of the days before it (the members' error growth is
+    seen by the earlier draws). The days follow the curriculum --days. A memory core's memory runs along each member as in the forecast."""
     torch.manual_seed(a.seed)
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
@@ -246,16 +247,20 @@ def cmd_tune(a, rest):
         if train and a.lam > 0:
             (a.lam * an).backward()
         K.tile(M)
-        xm, dm, out = xd.repeat_interleave(M, 0), doy.repeat_interleave(M, 0), []
+        xm, dm, out, tot = xd.repeat_interleave(M, 0), doy.repeat_interleave(M, 0), [], 0.0
         for k in range(days):
             tn = tns[:, k].repeat_interleave(M, 0)
             y = draw(xm, dm + k, tn, k > 0, gen)
             cr = crps_torch((y / K.s).view(B, M, *y.shape[1:]), yd[:, k] / K.s)
             cr = (cr * mask).sum() / mask.expand_as(cr).sum()
-            if train:
+            if train and a.through:
+                tot = tot + cr / days
+            elif train:
                 (cr / days).backward()
             out.append(float(cr))
-            xm = y.detach()
+            xm = y if (train and a.through) else y.detach()
+        if train and a.through:
+            tot.backward()
         return float(an), out
 
     def val():
@@ -285,7 +290,7 @@ def cmd_tune(a, rest):
                      val_crps=vcr, **e, sec=round(time.time() - t0)))
     if Fm is None:
         state = {k: v for k, v in K.state_dict().items() if not k.startswith("core.")}
-        torch.save(dict(state=state, cfg=K.cfg.__dict__, core_tag=a.core_tag, tuned_from=a.kernel_tag),
+        torch.save(dict(state=state, cfg=K.cfg.__dict__, core_tag=a.core_tag, tuned_from=a.kernel_tag, tune=vars(a)),
                    os.path.join(a.out, f"{a.tag}.pt"))
     else:
         torch.save(dict(state=Fm.net.state_dict(), cfg=Fm.cfg.__dict__, kernel_tag=a.kernel_tag,
@@ -395,6 +400,7 @@ def main(argv=None):
     t.add_argument("--lr", type=float, default=2e-4)
     t.add_argument("--lam", type=float, default=0.5, help="weight of the one-day loss (anchor)")
     t.add_argument("--steps", type=int, default=6)
+    t.add_argument("--through", action="store_true", help="gradient through the states of the rollout (no detach)")
     t.add_argument("--val-batches", type=int, default=4)
     t.add_argument("--log-every", type=int, default=50)
     s = sub.add_parser("score")
