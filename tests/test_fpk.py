@@ -182,3 +182,36 @@ def test_pairs_history_and_days():
         assert np.all(i + 4 <= 19)
         assert np.allclose(y[:, :, 0, 0, 0].numpy(), i[:, None] + np.arange(1, 5))
         assert np.allclose(h[:, :, 0, 0, 0].numpy(), np.maximum(i[:, None] + np.arange(-3, 0), 0))
+
+
+@pytest.mark.parametrize("which", ["core", "mcore"])
+def test_entropy_deviation_kernel(which, request):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    c = request.getfixturevalue(which)
+    D = EntropyDeviationKernel(c, DevConfig(pairs=3, hidden=8, blocks=(1,), smooth=3))
+    B = 2
+    xd, doy = torch.randn(B, 66, H, W), torch.tensor([5, 6])
+    hist = torch.randn(B, 2, 66, H, W) if which == "mcore" else None
+    ens, ent = D.rollout(xd, doy, torch.zeros(B, 3, H, W), 3, hist=hist)
+    assert ens.shape == (B, 6, 3, 66, H, W) and ent.shape == (B, 3, 66, H, W)
+    # the ensemble mean is the equation's own trajectory (antithetic pairs around it)
+    if which == "mcore":
+        c.reset(hist, doy.float() * 24.0, xd)
+    x = xd
+    for L in range(3):
+        x = c.step(x, (doy + L).float() * 24.0, torch.zeros(B, H, W))
+        assert torch.allclose(ens[:, :, L].mean(1), x, atol=1e-4)
+    # the predicted entropy is the size of the members' deviations (r = 0 at the start), and the residual moves it
+    e = D.start(xd, doy, hist)
+    x1, e1, H1, (stretch, r) = D.day(xd, e, doy, None, 0)
+    assert torch.allclose(H1, D.size(e1), atol=1e-5) and float(r.abs().max()) == 0
+    with torch.no_grad():
+        D.r_bias.fill_(0.5)
+    e = D.start(xd, doy, hist, torch.Generator().manual_seed(0))
+    _, e2, H2, _ = D.day(xd, e, doy, None, 0, torch.Generator().manual_seed(1))
+    assert torch.allclose(H2, D.size(e2), atol=1e-5)
+    loss, _ = D.ign(H2, x1, x1 + 0.1, torch.ones(1, 1, H, 1))
+    loss.backward()
+    assert D.r_bias.grad is not None and D.h_raw.grad is not None and float(D.h_raw.grad.abs().sum()) > 0
+    with torch.no_grad():
+        D.r_bias.zero_()
