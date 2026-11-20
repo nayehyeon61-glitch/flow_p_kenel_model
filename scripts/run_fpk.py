@@ -194,7 +194,7 @@ def cmd_score(a, rest):
         if arm == "core":
             step, m = (lambda x, d, tn: K.phi(x, d, tn)), 1
         elif arm == "kernel":
-            step, m = (lambda x, d, tn: K.sample(x, d, tn, g)[0]), M
+            step, m = (lambda x, d, tn: K.core.finish(K.sample(x, d, tn, g)[0], tn)), M
         elif arm == "persistence":
             step, m = (lambda x, d, tn: x), 1
         else:

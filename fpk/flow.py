@@ -26,6 +26,7 @@ import torch.nn as nn
 from .env import time_features
 from .kernel import PhysicsKernel, smooth_noise
 from pgcfm.core import Net  # noqa: E402
+from pgcfm.kai_tend import stateless_norm  # noqa: E402
 from pgcfm.seqdct import _NetCfg  # noqa: E402
 
 
@@ -54,7 +55,12 @@ class KernelFlow(nn.Module):
         n_g = core.gscale.shape[1] if kernel.gfeat else 0
         # z_tau, x, G(x), (Phi(x) - x) / s, log h, static, time of year, tau
         c_in = 66 + 66 + n_g + 66 + 66 + core.static.shape[0] + 4 + 4
-        self.net = Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks)))
+        self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.kernel.eval()  # the kernel (and its core) is frozen
+        return self
 
     @property
     def s(self):

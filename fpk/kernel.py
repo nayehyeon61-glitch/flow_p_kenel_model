@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from .env import DYN, TISR_DYN, time_features
 from .env import PGFM  # noqa: F401  (sys.path)
 from pgcfm.core import Net  # noqa: E402
-from pgcfm.kai_tend import core_step  # noqa: E402
+from pgcfm.kai_tend import core_step, stateless_norm  # noqa: E402
 from pgcfm.seqdct import _NetCfg  # noqa: E402
 
 LOG2PI = math.log(2 * math.pi)
@@ -44,7 +44,11 @@ def smooth_noise(shape, like: torch.Tensor, gen: Optional[torch.Generator] = Non
     xi = torch.randn(shape, generator=gen, device="cpu").to(like)
     xi = xi.reshape(-1, *shape[-3:])
     xi = F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect")
-    return (F.avg_pool2d(xi, 3, 1) * 3.0).reshape(shape)
+    out = F.avg_pool2d(xi, 3, 1) * 3.0
+    # the reflected halo repeats the neighbour row in the two edge rows: variance 15/9 there, back to 1
+    out[..., 0, :] *= 3.0 / math.sqrt(15.0)
+    out[..., -1, :] *= 3.0 / math.sqrt(15.0)
+    return out.reshape(shape)
 
 
 @dataclass
@@ -72,10 +76,16 @@ class PhysicsKernel(nn.Module):
         n_g = core.gscale.shape[1] if self.gfeat else 0
         n_static = core.static.shape[0]
         c_in = 66 + n_g + 66 + n_static + 4
-        self.bw = Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks)))
+        # GroupNorm, no dropout (ClimODE's block has BatchNorm + Dropout: batch-dependent, and train != eval)
+        self.bw = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
         # zero head: the bandwidth starts at h0 everywhere
         self.h_bias = nn.Parameter(torch.full((1, 66, 1, 1), math.log(math.expm1(cfg.h0 - cfg.h_min))))
         self.eps_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.eps0))))
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.core.eval()  # the equation is frozen
+        return self
 
     # ---- the pieces
     @property

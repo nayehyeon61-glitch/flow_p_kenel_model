@@ -37,6 +37,9 @@ def test_smooth_noise_shape_and_variance():
     xi = smooth_noise(tuple(x.shape), x)
     assert xi.shape == x.shape
     assert abs(float(xi.var()) - 1.0) < 0.1
+    big = torch.zeros(400, 1, 32, 64)
+    v = smooth_noise(tuple(big.shape), big).var((0, 1, 3))
+    assert float((v - 1).abs().max()) < 0.1  # every latitude row, the edge rows included
 
 
 def test_kernel_nll_is_the_kernel_sum(core):
@@ -47,7 +50,7 @@ def test_kernel_nll_is_the_kernel_sum(core):
     c, h, _, phi0 = K(xd, doy, None)
     assert c.shape == (2, 4, 66, H, W) and h.shape == (2, 66, H, W)
     # the antithetic pairs: the centres start symmetric around x, so their mean is close to Phi(x)
-    assert float((c.mean(1) - phi0).abs().max()) < 0.5
+    assert float((c.mean(1) - phi0).abs().max().detach()) < 0.5
     w = torch.ones(1, 1, H, 1)
     got = float(K.nll(c, h, y, w))
     s = core.t6
@@ -82,3 +85,16 @@ def test_fair_crps():
     M = 5
     want = np.abs(ens - obs[:, None]).mean(1) - np.abs(ens[:, :, None] - ens[:, None]).sum((1, 2)) / (2 * M * (M - 1))
     assert np.allclose(got, want)
+
+
+def test_calibrated_ensemble_scores_zero_gap_and_unit_spread_skill():
+    from fpk.ensemble import Scorer
+    rng = np.random.default_rng(1)
+    B, M, L, Hh, Ww = 40, 8, 2, 8, 16
+    ens = rng.normal(size=(B, M, L, 66, Hh, Ww))
+    truth = rng.normal(size=(B, L, 66, Hh, Ww))
+    sc = Scorer(L, np.ones(Hh), np.ones(67), np.ones(67))
+    sc.update(ens, truth)
+    out = sc.summary()
+    assert abs(out["ign"][0] - out["entropy"][0]) < 0.02
+    assert abs(out["spread_skill"][0] - 1.0) < 0.02
