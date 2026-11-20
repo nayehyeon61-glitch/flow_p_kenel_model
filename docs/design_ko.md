@@ -71,6 +71,7 @@ python scripts/run_fpk.py kernel --iters 600 --batch 4 --centres 4
 python scripts/run_fpk.py flow --source kernel --tag flow
 python scripts/run_fpk.py flow --source gauss --tag flow_gauss
 python scripts/run_fpk.py score --arms persistence core kernel flow flow_gauss --kernel-entropy
+python scripts/report_fpk.py runs/fpk/score.json --out docs/results
 python -m pytest -q tests
 ```
 
@@ -83,3 +84,34 @@ PG-CFM 에서 이미 학습한 core 를 쓰려면 `runs/kaitend/<tag>.pt` 와 �
 - **기억 core 미지원.** member 마다 ConvGRU 기억을 복제해 굴리는 것이 다음 단계입니다.
 - **entropy 는 Gaussian 모멘트 근사.** 앙상블 8 member 로는 비모수 entropy 를 추정할 수 없습니다.
 - **CPU 크기.** 5.625°, 학습 2년, 시험 2017년 IC 6일 간격. GPU 에서는 같은 명령에 `--device cuda` 와 긴 학습을 줍니다.
+
+
+## 5. 첫 결과 (CPU, 2017년, IC 60개 × member 8개)
+
+설정: ERA5 5.625° 일평균, 학습 2014~15, 검증 2016. core_gng 3,000 it(검증 1일 손실 0.265), kernel 600 it(검증 NLL 0.948 → 0.673, ε ≈ 0.23 s, h ≈ 0.50 s), flow 2,500 it 씩(물리 kernel source 0.748 → 0.493, Gaussian source 1.948 → 0.728). 전체 표는 [`results/tables.md`](results/tables.md), 수치는 [`results/scores.json`](results/scores.json).
+
+![점수](results/fig1_skill.png)
+
+![entropy](results/fig2_entropy.png)
+
+| 선행 1 / 3 / 5 / 7 / 10일 | 앙상블 평균 nRMSE | CRPS | spread / skill | IC 간 상관 (entropy 대 오차) |
+| --- | --- | --- | --- | --- |
+| core (결정론) | 0.211 / 0.354 / 0.444 / 0.503 / 0.551 | 0.152 / 0.255 / 0.317 / 0.359 / 0.397 | | |
+| 물리 kernel 단독 | 0.229 / 0.413 / 0.507 / 0.563 / 0.618 | 0.110 / 0.199 / 0.246 / **0.275 / 0.306** | 1.05 / 1.01 / 1.09 / 1.18 / 1.29 | **0.56 / 0.53 / 0.49 / 0.52 / 0.54** |
+| FM, Gaussian source | 0.207 / 0.390 / 0.497 / 0.560 / 0.620 | 0.102 / 0.193 / 0.246 / 0.279 / 0.312 | 1.01 / 0.95 / 0.99 / 1.05 / 1.15 | 0.33 / 0.22 / 0.29 / 0.22 / −0.01 |
+| FM, 물리 kernel source | **0.205** / 0.391 / 0.499 / 0.564 / 0.629 | **0.099 / 0.189 / 0.243** / 0.277 / 0.313 | 1.15 / 1.05 / 1.10 / 1.17 / 1.27 | 0.57 / 0.43 / 0.39 / 0.43 / 0.41 |
+
+읽는 법:
+
+1. **분포 예보로는 세 ensemble 모두 결정론 core 보다 크게 낫습니다.** CRPS 가 1일 −35 %, 10일 −21~23 %입니다. 1~5일은 물리 kernel source 의 FM 이 가장 좋고(Gaussian source 대비 1일 −3 %, 3일 −2 %), 7~10일은 kernel 단독이 가장 좋습니다.
+2. **예측 entropy 가 어느 예보가 틀릴지를 알려 주는 것은 물리 kernel 이 들어간 쪽뿐입니다.** IC 마다의 entropy 와 실제 오차 크기의 상관이 kernel 단독 0.49~0.56, 물리 kernel source FM 0.39~0.57 로 10일까지 유지됩니다. Gaussian source FM 은 0.33 에서 시작해 10일에 0 이 됩니다. 같은 망, 같은 조건(G(x), Φ(x) 입력)이므로 차이는 source 분포입니다. 물리가 조건으로만 들어가면 예측 가능성의 정보가 퍼짐에 실리지 않고, 분포로 들어가면 실립니다. 이 구조의 핵심 주장이고 이 결과가 뒷받침합니다.
+3. **약점: 앙상블 평균이 결정론 core 보다 나쁩니다.** 3일부터 nRMSE 가 core 보다 높고(3일 0.39 대 0.354, 10일 0.62~0.63 대 0.551) 7일부터는 기후값(0.497)보다도 높습니다. 보통 앙상블 평균은 결정론보다 좋아야 합니다. member 마다 매일 독립적인 폭 noise 와 섭동을 받고 그 상태에서 다시 방정식을 푸므로 member 하나하나가 결정론 궤적보다 빨리 나빠지고, 8개의 평균으로는 그것을 되찾지 못합니다. kernel 과 flow 는 하루 쌍으로만 학습되어 자기 rollout 의 오차 누적을 보지 못했습니다.
+4. **퍼짐: 긴 선행일에서 과대합니다.** spread / skill 이 10일 1.15~1.29 이고, 같은 방향으로 5일 이후 IGN 이 H_ens 보다 작습니다(entropy 가 실제 놀람보다 큼). 1일에는 물리 kernel source FM 이 1.15 로 넓고 Gaussian source 가 1.01 로 맞습니다.
+5. 물리 단위로 보면 1일 z500 RMSE 는 FM 두 가지가 core 와 비슷하고(195~204 대 199 m²/s²) 3일부터 core 가 앞섭니다.
+
+다음 단계 (효과가 큰 순서):
+
+1. **rollout 학습.** kernel 과 flow 를 2~4일 자기 rollout 의 CRPS(또는 energy score)로 미세조정해서 member 오차의 누적과 과대 퍼짐을 함께 잡습니다. 3번 약점의 직접적인 원인을 겨냥합니다.
+2. **평균과 편차의 분리.** 결정론 궤적(core 또는 KAI 연결)을 평균으로 두고 kernel·flow 는 그 둘레의 편차만 내게 합니다. PG-CFM 의 "회귀 평균 + FM 편차" 가정과 같은 형태입니다.
+3. **기억 core.** member 마다 ConvGRU 기억을 복제해 core_gngmz8 을 방정식으로 씁니다.
+4. GPU 에서 1.5° 와 긴 학습.

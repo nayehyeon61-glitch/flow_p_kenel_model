@@ -13,3 +13,4 @@ properscoring
 torchcfm==1.0.7
 torchdiffeq
 git+https://github.com/patrick-kidger/torchcubicspline.git
+koreanize-matplotlib
