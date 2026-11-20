@@ -52,6 +52,8 @@ def load_core(a):
     core = rkt().build_core(pa, cl.mean, cl.std, cl.inc, cl.lat, tag=a.core_tag)
     if getattr(core, "mem", 0) or getattr(core, "hist", False) or getattr(core, "entv", False):
         raise SystemExit("the kernel is built on a plain core (gfeat allowed, no memory / history / entropy state)")
+    if getattr(core, "stride", 1) != 1:
+        raise SystemExit("the kernel pipeline is daily: a core with stride > 1 (multi-day step) is not supported")
     return pa, cl, core
 
 
@@ -63,7 +65,7 @@ def log(d):
 def cmd_core(a, rest):
     """Train the tendency core with PG-CFM's own script: plain core, GroupNorm, physical terms G(x)."""
     argv = ["--arm", "core", "--tag", a.core_tag, "--core-norm", "gn", "--core-gfeat", "--log-every", "250",
-            "--iters", str(a.iters)] + list(rest)
+            "--iters", str(a.iters), "--seed", str(a.seed)] + list(rest)
     pa = pargs(a, argv)
     os.makedirs(pa.out, exist_ok=True)
     R = rkt()
@@ -115,6 +117,8 @@ def cmd_kernel(a, rest):
 
 def load_kernel(a, core, tag):
     ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location="cpu", weights_only=False)
+    if ck.get("core_tag") not in (None, a.core_tag):
+        raise SystemExit(f"kernel {tag} was fitted on core {ck['core_tag']}, not --core-tag {a.core_tag}")
     cfg = ck["cfg"]
     cfg["blocks"] = tuple(cfg["blocks"])
     K = PhysicsKernel(core, KernelConfig(**cfg))
@@ -170,6 +174,8 @@ def cmd_flow(a, rest):
 
 def load_flow(a, K, tag):
     ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location="cpu", weights_only=False)
+    if ck.get("kernel_tag") not in (None, a.kernel_tag):
+        raise SystemExit(f"flow {tag} was trained on kernel {ck['kernel_tag']}, not --kernel-tag {a.kernel_tag}")
     cfg = ck["cfg"]
     cfg["blocks"] = tuple(cfg["blocks"])
     Fm = KernelFlow(K, FlowConfig(**cfg))
