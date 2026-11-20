@@ -247,6 +247,6 @@ def test_deviation_flow_starts_as_the_kernel(core):
     assert torch.allclose(ens, ref[:, :3], atol=1e-5) and torch.allclose(ent, ent2)  # zero velocity = the kernel's +e
     e = D.start(xd, doy)
     xb, e1, H1, _ = D.day(xd, e, doy, None, 0)
-    loss = Fm.loss(e1.detach(), xb, xb + 0.2, Fm.cond(xb, H1.detach(), doy + 1, 1), torch.ones(1, 1, H, 1))
+    loss = Fm.loss(e1.detach(), xb, xb + 0.2, Fm.cond(xb, H1.detach(), doy + 1, 1), H1.detach(), torch.ones(1, 1, H, 1))
     loss.backward()
     assert all(p.grad is None for p in D.parameters()) and any(p.grad is not None for p in Fm.net.parameters())

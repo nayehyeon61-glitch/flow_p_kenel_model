@@ -10,6 +10,9 @@ the equation's. So the kernel is the SOURCE of conditional flow matching, in uni
     path     z_tau = (1 - tau) z0 + tau z1 (+ sigma_min noise),   velocity target z1 - z0
     v_theta(z_tau, tau | xbar_L, G(xbar_L), H_L, lead, time of year, static)       zero head: starts as the kernel
 
+The net works in units of the predicted spread sigma_L = exp(H_L) (input z / sigma, output x sigma) and the loss is
+the velocity error in those units, so every lead weighs the same (in units of s the day-10 error is 8 x the day-1's).
+
     member   x^m_L = xbar_L + s T(e^m_L)    T = the flow's transport (Heun steps)
 
 The kernel's own deviations go on through the equation (the flow transports each lead's distribution, it is not fed
@@ -70,41 +73,48 @@ class DeviationFlow(nn.Module):
             xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
         return torch.cat(parts, 1)
 
-    def source(self, e, gen=None):
-        """e (B, P, 66, H, W) the kernel's deviations -> the source draws (the control: unit smooth noise)."""
+    def source(self, e, gen=None, sig=None):
+        """e (B, P, 66, H, W) the kernel's deviations -> the source draws. The control ``gauss``: smooth Gaussian
+        noise of the kernel's predicted size sig (B, 1, 66, H, W) (the same variance, none of the equation's
+        directions)."""
         if self.cfg.source == "gauss":
-            return smooth_noise(tuple(e.shape), e, gen) * self.dk.keep.unsqueeze(0)
+            return smooth_noise(tuple(e.shape), e, gen) * self.dk.keep.unsqueeze(0) * (1.0 if sig is None else sig)
         return e
 
-    def velocity(self, z, tau, cond):
-        Hh, Ww = z.shape[-2:]
-        return self.net(torch.cat([z, cond, tau_features(tau, Hh, Ww)], 1)) * self.dk.keep
+    def sigma(self, H):
+        """exp(H) (B, 66, H, W), 1 on tisr (no deviation there)."""
+        k = self.dk.keep
+        return torch.exp(H.detach().clamp(-6.0, 6.0)) * k + (1 - k)
 
-    def loss(self, e, xbar, truth, cond, w, gen=None):
+    def velocity(self, z, tau, cond, sig):
+        Hh, Ww = z.shape[-2:]
+        return self.net(torch.cat([z / sig, cond, tau_features(tau, Hh, Ww)], 1)) * sig * self.dk.keep
+
+    def loss(self, e, xbar, truth, cond, H, w, gen=None):
         """Flow-matching loss of one lead: every one of the P deviations is a source draw for the same target."""
         B, P = e.shape[:2]
-        z0 = self.source(e, gen).flatten(0, 1)
+        z0 = self.source(e, gen, self.sigma(H)[:, None]).flatten(0, 1)
         z1 = ((truth - xbar) / self.dk.s * self.dk.keep).repeat_interleave(P, 0)
-        c = cond.repeat_interleave(P, 0)
+        c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
         tau = torch.rand(B * P, generator=gen).to(z0)
         t = tau.view(-1, 1, 1, 1)
-        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * torch.randn(z0.shape, generator=gen).to(z0) * self.dk.keep
-        sq = (self.velocity(zt, tau, c) - (z1 - z0)) ** 2
+        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * sig * torch.randn(z0.shape, generator=gen).to(z0) * self.dk.keep
+        sq = ((self.velocity(zt, tau, c, sig) - (z1 - z0)) / sig) ** 2
         m = self.dk.keep * w
         return (sq * m).sum() / m.expand_as(sq).sum()
 
     @torch.no_grad()
-    def transport(self, e, cond, gen=None, steps: Optional[int] = None):
+    def transport(self, e, cond, H, gen=None, steps: Optional[int] = None):
         """(B, P, 66, H, W) -> the transported deviations (Heun)."""
         B, P = e.shape[:2]
-        z = self.source(e, gen).flatten(0, 1)
-        c = cond.repeat_interleave(P, 0)
+        z = self.source(e, gen, self.sigma(H)[:, None]).flatten(0, 1)
+        c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
         n = steps or self.cfg.steps
         dt = 1.0 / n
         for i in range(n):
             t = torch.full((z.shape[0],), i * dt, device=z.device)
-            k1 = self.velocity(z, t, c)
-            k2 = self.velocity(z + dt * k1, t + dt, c)
+            k1 = self.velocity(z, t, c, sig)
+            k2 = self.velocity(z + dt * k1, t + dt, c, sig)
             z = z + 0.5 * dt * (k1 + k2)
         return z.view(B, P, *z.shape[1:])
 
@@ -117,7 +127,7 @@ class DeviationFlow(nn.Module):
         x, out, ent = xd0, [], []
         for L in range(leads):
             x, e, H, _ = dk.day(x, e, doy0 + L, tisr[:, L], L, gen)
-            z = self.transport(e, self.cond(x, H, doy0 + L + 1, L + 1), gen, steps)
+            z = self.transport(e, self.cond(x, H, doy0 + L + 1, L + 1), H, gen, steps)
             out.append(x[:, None] + dk.s.unsqueeze(0) * z)
             ent.append(H + HALF_LOG_2PIE)
         return torch.stack(out, 2), torch.stack(ent, 1)

@@ -24,22 +24,29 @@ import numpy as np
 CHANS = ["z500", "z850", "t850", "t2m", "msl", "u850", "v850", "wind850", "u250", "v250", "wind250"]
 Q = [0, 2, 4, 6, 9]  # leads 1 / 3 / 5 / 7 / 10
 NAME = {"climatology": "기후값", "persistence": "지속성", "core": "core", "kernel": "kernel 단독",
-        "flow_gauss": "FM Gaussian", "flow": "FM 물리 kernel"}
+        "flow_gauss": "FM Gaussian", "flow": "FM 물리 kernel", "flow_tt": "FM + rollout 미세조정",
+        "core_m": "메모리 core", "kernel_m": "메모리 kernel", "flow_m": "메모리 FM", "flow_mt": "메모리 FM + rollout",
+        "devk": "entropy 편차 kernel", "devk_m": "entropy 편차 kernel (메모리)", "devflow": "편차 kernel FM",
+        "devflow_gauss": "편차 FM, Gaussian source", "devflow_m": "편차 kernel FM (메모리)",
+        "devflow_gauss_m": "편차 FM, Gaussian (메모리)"}
+PAIRS = {"devk", "devk_m"}  # arms of antithetic pairs: no finite-member factor in spread / skill
 UNIT = {"z": "m²/s²", "t": "K", "u": "m/s", "v": "m/s", "w": "m/s", "m": "Pa"}
 
 
 def load(prefixes):
     S, R, names, std = {}, {}, None, None
     for p in prefixes:
+        p, _, suf = p.partition("@")  # prefix@suffix: the arms of this file are renamed arm + suffix (core -> core_m)
         d = json.load(open(p + ".json"))
         raw = np.load(p + "_raw.npz")
         names = d["meta"]["channels"]
         std = raw["std"].astype(np.float64)
-        for arm, v in d["scores"].items():
+        for a0, v in d["scores"].items():
+            arm = a0 if a0.endswith(suf) or a0 == "climatology" else a0 + suf
             if arm in S:
                 continue
             S[arm] = v
-            R[arm] = {k.split("__", 1)[1]: raw[k].astype(np.float64) for k in raw.files if k.startswith(arm + "__")}
+            R[arm] = {k.split("__", 1)[1]: raw[k].astype(np.float64) for k in raw.files if k.startswith(a0 + "__")}
     return S, R, names, std
 
 
@@ -122,7 +129,7 @@ def main():
             ci = f"{e['lo'][9]:+.1f} ~ {e['hi'][9]:+.1f}".replace("-", "−")
             acc = f(e["acc"], 3, False) if "acc" in e else ""
             act = f"{e['act'][9]:.2f}" if "act" in e else ""
-            ss = f(corr * e["spread"] / e["rmse"], 2, False) if "spread" in e else ""
+            ss = f((1.0 if x in PAIRS else corr) * e["spread"] / e["rmse"], 2, False) if "spread" in e else ""
             H = f(e["H"], 2, False) if "H" in e else ""
             co = f(e["corr"], 2, False) if "corr" in e else ""
             md.append(f"| {NAME[x]} | {f(e['rmse'], 2, False)} | {f(e['gain'])} | {f(e.get('info', np.zeros(10)))} | "

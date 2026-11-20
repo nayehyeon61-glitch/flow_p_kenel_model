@@ -309,7 +309,7 @@ def cmd_devflow(a, rest):
         for k in range(a.days):
             with torch.no_grad():
                 xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            out.append(Fm.loss(e, xb, yd[:, k], Fm.cond(xb, H, doy + k + 1, k + 1), w, gen))
+            out.append(Fm.loss(e, xb, yd[:, k], Fm.cond(xb, H, doy + k + 1, k + 1), H, w, gen))
         return out
 
     def val():
