@@ -233,3 +233,20 @@ def test_antithetic_pairs_are_scored_without_bias():
     out = sc.summary()
     assert abs(out["spread_skill"][0] - 1.0) < 0.01
     assert abs(out["ign"][0] - out["entropy"][0]) < 0.02
+
+
+def test_deviation_flow_starts_as_the_kernel(core):
+    from fpk.devflow import DevFlowConfig, DeviationFlow
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    D = EntropyDeviationKernel(core, DevConfig(pairs=3, hidden=8, blocks=(1,), smooth=3))
+    Fm = DeviationFlow(D, DevFlowConfig(hidden=8, blocks=(1,), steps=2))
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 2, H, W)
+    ens, ent = Fm.rollout(xd, doy, tis, 2, gen=torch.Generator().manual_seed(4))
+    ref, ent2 = D.rollout(xd, doy, tis, 2, gen=torch.Generator().manual_seed(4))
+    assert ens.shape == (2, 3, 2, 66, H, W)
+    assert torch.allclose(ens, ref[:, :3], atol=1e-5) and torch.allclose(ent, ent2)  # zero velocity = the kernel's +e
+    e = D.start(xd, doy)
+    xb, e1, H1, _ = D.day(xd, e, doy, None, 0)
+    loss = Fm.loss(e1.detach(), xb, xb + 0.2, Fm.cond(xb, H1.detach(), doy + 1, 1), torch.ones(1, 1, H, 1))
+    loss.backward()
+    assert all(p.grad is None for p in D.parameters()) and any(p.grad is not None for p in Fm.net.parameters())

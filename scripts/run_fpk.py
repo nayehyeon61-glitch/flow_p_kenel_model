@@ -27,6 +27,7 @@ from fpk import data as D  # noqa: E402
 from fpk.env import DYN, TISR, contract, pgfm_args, rkt  # noqa: E402
 from fpk.ensemble import Scorer, crps_torch, rollout  # noqa: E402
 from fpk.flow import FlowConfig, KernelFlow  # noqa: E402
+from fpk.devflow import DevFlowConfig, DeviationFlow  # noqa: E402
 from fpk.devkernel import DevConfig, EntropyDeviationKernel  # noqa: E402
 from fpk.kernel import KernelConfig, PhysicsKernel  # noqa: E402
 from pgcfm.kai_tend import core_step  # noqa: E402
@@ -277,6 +278,77 @@ def load_devk(a, core, tag):
     return Dk.to(a.device).eval()
 
 
+# ------------------------------------------------------------------------------------------------------- devflow
+def cmd_devflow(a, rest):
+    """Flow matching from the entropy deviation kernel (fpk.devflow): the kernel runs D days from the data's state,
+    and on every day its deviations are the source and the data's deviation from the mean the target."""
+    torch.manual_seed(a.seed)
+    pa, cl, core = load_core(a)
+    dev = torch.device(a.device)
+    Dk = load_devk(a, core, a.dev_tag)
+    Fm = DeviationFlow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps)).to(dev)
+    W = int(getattr(core, "mem", 0))
+    years = D.load(pa, a.train_years)
+    va = D.load(pa, [a.val_year])
+    tr, vr = D.Pairs(years, a.seed, hist=W, ahead=a.days), D.Pairs(va, a.seed + 1, hist=W, ahead=a.days)
+    w = D.area_weights(cl.lat).to(dev)
+    params = list(Fm.net.parameters())
+    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
+    sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.iters, pct_start=0.05)
+    dyn = torch.tensor(DYN)
+    vx = [vr(a.batch) for _ in range(a.val_batches)]
+
+    def run(batch, gen=None):
+        x, ys, doy, tns, hi = batch
+        if ys.dim() == 4:
+            ys, tns = ys[:, None], tns[:, None]
+        xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
+        with torch.no_grad():
+            e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
+        xb, out = xd, []
+        for k in range(a.days):
+            with torch.no_grad():
+                xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
+            out.append(Fm.loss(e, xb, yd[:, k], Fm.cond(xb, H, doy + k + 1, k + 1), w, gen))
+        return out
+
+    def val():
+        Fm.eval()
+        gv = torch.Generator().manual_seed(123)
+        with torch.no_grad():
+            r = np.mean([[float(v) for v in run(b, gv)] for b in vx], 0)
+        Fm.train()
+        return [round(float(v), 4) for v in r]
+
+    t0 = time.time()
+    log(dict(devflow_val_start=val(), source=a.source))
+    for it in range(1, a.iters + 1):
+        loss = sum(run(tr(a.batch))) / a.days
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        sch.step()
+        if it % a.log_every == 0 or it == a.iters:
+            log(dict(it=it, loss=round(loss.item(), 4), val=val(), sec=round(time.time() - t0)))
+    torch.save(dict(state=Fm.net.state_dict(), cfg=Fm.cfg.__dict__, dev_tag=a.dev_tag, core_tag=a.core_tag),
+               os.path.join(a.out, f"{a.tag}.pt"))
+
+
+def load_devflow(a, core, tag, pairs=0):
+    ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location="cpu", weights_only=False)
+    if ck.get("core_tag") not in (None, a.core_tag):
+        raise SystemExit(f"deviation flow {tag} was trained on core {ck['core_tag']}, not --core-tag {a.core_tag}")
+    Dk = load_devk(a, core, ck["dev_tag"])
+    if pairs:
+        Dk.cfg.pairs = pairs  # independent members of the forecast (the kernel's parameters do not depend on P)
+    cfg = ck["cfg"]
+    cfg["blocks"] = tuple(cfg["blocks"])
+    Fm = DeviationFlow(Dk, DevFlowConfig(**cfg))
+    Fm.net.load_state_dict(ck["state"])
+    return Fm.to(a.device).eval()
+
+
 # ---------------------------------------------------------------------------------------------------------- tune
 def cmd_tune(a, rest):
     """Rollout fine-tuning: M members run D days from the data's state (each day drawing from the kernel, or from
@@ -386,7 +458,7 @@ def cmd_tune(a, rest):
 def cmd_score(a, rest):
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
-    K = load_kernel(a, core, a.kernel_tag) if any(not x.startswith("devk") and x != "persistence" for x in a.arms) \
+    K = load_kernel(a, core, a.kernel_tag) if any(not x.startswith("dev") and x != "persistence" for x in a.arms) \
         else PhysicsKernel(core)
     te = D.load(pa, [a.test_year])[a.test_year]
     L, M = a.leads, a.members
@@ -401,8 +473,11 @@ def cmd_score(a, rest):
     clim_of = lambda j: np.stack([clim_z[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] for k in j])  # noqa: E731
     for arm in a.arms:
         g = torch.Generator().manual_seed(a.seed)
-        Dk = None
-        if arm.startswith("devk"):  # the entropy deviation kernel: its own rollout (mean + deviations)
+        Dk, Df = None, None
+        if arm.startswith("devflow"):  # flow matching from the deviation kernel: M independent members
+            Df = load_devflow(a, core, arm, pairs=M)
+            step, m = None, M
+        elif arm.startswith("devk"):  # the entropy deviation kernel: its own rollout (mean + deviations)
             Dk = load_devk(a, core, arm)
             step, m = None, 2 * Dk.cfg.pairs
         elif arm == "core":  # the core's own day (a memory core: its memory update, then the day)
@@ -423,7 +498,10 @@ def cmd_score(a, rest):
             truth = np.stack([te[k + 1:k + 1 + L][:, dyn] for k in j])
             hist = (torch.from_numpy(np.stack([te[np.maximum(np.arange(k - W, k), 0)][:, dyn] for k in j])).to(dev)
                     if W else None)
-            if Dk is not None:
+            if Df is not None:
+                ens, hk = Df.rollout(x0, torch.tensor(j, device=dev), tis, L, hist=hist, gen=g, steps=a.steps)
+                hk = hk[:, None]
+            elif Dk is not None:
                 ens, hk = Dk.rollout(x0, torch.tensor(j, device=dev), tis, L, hist=hist, gen=g)
                 hk = hk[:, None]  # the predicted entropy, in the place of the kernel's (B, 1, L, 66, H, W)
             else:
@@ -495,6 +573,19 @@ def main(argv=None):
     d.add_argument("--lr", type=float, default=1e-3)
     d.add_argument("--val-batches", type=int, default=6)
     d.add_argument("--log-every", type=int, default=50)
+    df = sub.add_parser("devflow")
+    common(df)
+    df.add_argument("--tag", default="devflow")
+    df.add_argument("--dev-tag", default="devk")
+    df.add_argument("--source", default="kernel", choices=["kernel", "gauss"])
+    df.add_argument("--days", type=int, default=10)
+    df.add_argument("--iters", type=int, default=600)
+    df.add_argument("--batch", type=int, default=4)
+    df.add_argument("--lr", type=float, default=5e-4)
+    df.add_argument("--hidden", type=int, default=64)
+    df.add_argument("--steps", type=int, default=6)
+    df.add_argument("--val-batches", type=int, default=4)
+    df.add_argument("--log-every", type=int, default=50)
     t = sub.add_parser("tune")
     common(t)
     t.add_argument("--tag", required=True)
@@ -530,7 +621,7 @@ def main(argv=None):
     if a.threads:
         torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
-    {"core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "score": cmd_score}[a.cmd](a, rest)
+    {"core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "devflow": cmd_devflow, "score": cmd_score}[a.cmd](a, rest)
 
 
 if __name__ == "__main__":
