@@ -298,7 +298,11 @@ def cmd_devflow(a, rest):
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
 
-    def run(batch, gen=None):
+    def save():
+        torch.save(dict(state=Fm.net.state_dict(), cfg=Fm.cfg.__dict__, dev_tag=a.dev_tag, core_tag=a.core_tag),
+                   os.path.join(a.out, f"{a.tag}.pt"))
+
+    def run(batch, gen=None, train=False):
         x, ys, doy, tns, hi = batch
         if ys.dim() == 4:
             ys, tns = ys[:, None], tns[:, None]
@@ -309,30 +313,33 @@ def cmd_devflow(a, rest):
         for k in range(a.days):
             with torch.no_grad():
                 xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            out.append(Fm.loss(e, xb, yd[:, k], Fm.cond(xb, H, doy + k + 1, k + 1), H, w, gen))
+            es = e[:, torch.randperm(e.shape[1], generator=gen)[:a.sources]] if train else e
+            lk = Fm.loss(es, xb, yd[:, k], Fm.cond(xb, H, doy + k + 1, k + 1), H, w, gen)
+            if train:  # a lead's graph is freed before the next one (ten leads at once did not fit the memory)
+                (lk / a.days).backward()
+            out.append(float(lk))
         return out
 
     def val():
         Fm.eval()
         gv = torch.Generator().manual_seed(123)
         with torch.no_grad():
-            r = np.mean([[float(v) for v in run(b, gv)] for b in vx], 0)
+            r = np.mean([run(b, gv) for b in vx], 0)
         Fm.train()
         return [round(float(v), 4) for v in r]
 
     t0 = time.time()
     log(dict(devflow_val_start=val(), source=a.source))
     for it in range(1, a.iters + 1):
-        loss = sum(run(tr(a.batch))) / a.days
         opt.zero_grad()
-        loss.backward()
+        loss = sum(run(tr(a.batch), train=True)) / a.days
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
-            log(dict(it=it, loss=round(loss.item(), 4), val=val(), sec=round(time.time() - t0)))
-    torch.save(dict(state=Fm.net.state_dict(), cfg=Fm.cfg.__dict__, dev_tag=a.dev_tag, core_tag=a.core_tag),
-               os.path.join(a.out, f"{a.tag}.pt"))
+            log(dict(it=it, loss=round(loss, 4), val=val(), sec=round(time.time() - t0)))
+            save()  # the state so far (a run that is cut off still leaves a usable flow)
+    save()
 
 
 def load_devflow(a, core, tag, pairs=0):
@@ -579,6 +586,7 @@ def main(argv=None):
     df.add_argument("--dev-tag", default="devk")
     df.add_argument("--source", default="kernel", choices=["kernel", "gauss"])
     df.add_argument("--days", type=int, default=10)
+    df.add_argument("--sources", type=int, default=2, help="source draws (of the kernel's P) per IC and lead in the loss")
     df.add_argument("--iters", type=int, default=600)
     df.add_argument("--batch", type=int, default=4)
     df.add_argument("--lr", type=float, default=5e-4)
