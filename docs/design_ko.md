@@ -115,3 +115,20 @@ PG-CFM 에서 이미 학습한 core 를 쓰려면 `runs/kaitend/<tag>.pt` 와 �
 2. **평균과 편차의 분리.** 결정론 궤적(core 또는 KAI 연결)을 평균으로 두고 kernel·flow 는 그 둘레의 편차만 내게 합니다. PG-CFM 의 "회귀 평균 + FM 편차" 가정과 같은 형태입니다.
 3. **기억 core.** member 마다 ConvGRU 기억을 복제해 core_gngmz8 을 방정식으로 씁니다.
 4. GPU 에서 1.5° 와 긴 학습.
+
+## 6. 변수별 평가 (PG-CFM 의 `eval_kai_channel_gains.py` 형식)
+
+`scripts/eval_fpk_vars.py` 가 z500 · z850 · t850 · t2m · msl · u850 · v850 · wind850 · u250 · v250 · wind250 을 변수별로 냅니다: core 대비 RMSE 이득 %(IC paired bootstrap 95 % 구간), 그 이득의 정보 항 / 진폭 항 분해, ACC, 활동도, CRPS(물리 단위), spread / skill, entropy, entropy-오차 상관. 전체 표는 [results/vars.md](results/vars.md), 수치는 `results/vars.json` 입니다.
+
+    python scripts/eval_fpk_vars.py runs/fpk/score_det runs/fpk/score_kernel runs/fpk/score_flow runs/fpk/score_flowg \
+        --ref core --out docs/results/vars.md --json docs/results/vars.json
+
+읽은 것 (2017년, IC 60개 × member 8개):
+
+1. **CRPS 는 11개 변수 모두, 모든 선행일에서 core 보다 좋습니다.** 10일 기준 z500 547 → 478~508 m²/s², t850 2.67 → 2.16~2.43 K, u250 9.47 → 6.87~7.13 m/s.
+2. **앙상블 평균 RMSE 는 3일부터 모든 변수에서 core 보다 나쁩니다** (3일 −8~−26 %, 10일 −1~−29 %). 1일에는 FM 두 가지가 core 와 비슷합니다(z500 +1.8 % / −2.5 %).
+3. **손실의 성격이 선행일에 따라 다릅니다.** 3일의 손실은 대부분 정보 항입니다(z500 −14~−25 % 중 정보 −14~−25 %): 매일의 섭동과 폭 noise 가 종관 규모의 위상 정보를 깎습니다. 10일의 손실은 대부분 진폭 항입니다(z500 FM −19 % 중 진폭 −17 %, 정보 −2 %): core 는 10일에 활동도 0.73 으로 매끄러워져 RMSE 를 줄이는데, member 8개의 평균은 활동도 0.81~0.95(온도는 1.1~1.4)로 덜 매끄럽습니다.
+4. **온도(t850, t2m)가 가장 과하게 퍼집니다**: spread / skill 10일 1.31~1.47. 지위·기압은 물리 kernel 쪽이 1.1~1.2, Gaussian source 는 0.83~0.89 로 오히려 부족합니다.
+5. entropy-오차 상관은 변수별로도 물리 kernel 쪽이 10일까지 유지됩니다(z500 10일: kernel 0.54, FM 물리 kernel 0.40, FM Gaussian 0.01).
+
+3번이 다음 실험의 근거입니다: 3일의 정보 손실은 rollout 학습과 기억으로, 10일의 진폭·과대 퍼짐은 평균/편차 분리와 entropy 로 크기를 정하는 편차 kernel 로 겨냥합니다.
