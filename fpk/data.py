@@ -52,25 +52,31 @@ def area_weights(lat: np.ndarray) -> torch.Tensor:
 class Pairs:
     """Random (x_t, x_{t+1}) day pairs from the z-scored years (no pair across a year boundary).
 
-    Returns x (B, 67, H, W), y (B, 67, H, W), doy (B,) of x, tisr_next (B, H, W) = the forcing of y's day."""
+    Returns x (B, 67, H, W), y (B, 67, H, W), doy (B,) of x, tisr_next (B, H, W) = the forcing of y's day and, with
+    ``hist`` = W > 0, the W days before x (B, W, 67, H, W), oldest first (clamped at the start of the year, as
+    PG-CFM does), else None. ``ahead`` = K > 1: y (B, K, 67, H, W) the K days after x, tisr_next (B, K, H, W)."""
 
-    def __init__(self, years: Dict[int, np.ndarray], seed: int = 0):
-        self.years = years
+    def __init__(self, years: Dict[int, np.ndarray], seed: int = 0, hist: int = 0, ahead: int = 1):
+        self.years, self.hist, self.ahead = years, int(hist), int(ahead)
         self.keys = sorted(years)
-        self.n = np.array([len(years[k]) - 1 for k in self.keys])
+        self.n = np.array([len(years[k]) - self.ahead for k in self.keys])
         self.rng = np.random.default_rng(seed)
 
     def __call__(self, B: int):
         ys = self.rng.choice(len(self.keys), size=B, p=self.n / self.n.sum())
-        x, y, d = [], [], []
+        x, y, d, h = [], [], [], []
+        K, W = self.ahead, self.hist
         for k in ys:
             arr = self.years[self.keys[k]]
-            i = int(self.rng.integers(0, len(arr) - 1))
+            i = int(self.rng.integers(0, len(arr) - K))
             x.append(arr[i])
-            y.append(arr[i + 1])
+            y.append(arr[i + 1] if K == 1 else arr[i + 1:i + 1 + K])
             d.append(i)
+            if W:
+                h.append(arr[np.maximum(np.arange(i - W, i), 0)])
         x, y = torch.from_numpy(np.stack(x)), torch.from_numpy(np.stack(y))
-        return x, y, torch.tensor(d), y[:, TISR]
+        hist = torch.from_numpy(np.stack(h)) if W else None
+        return x, y, torch.tensor(d), y[..., TISR, :, :], hist
 
 
 __all__ = ["Climate", "load", "climate", "area_weights", "Pairs", "DYN", "OROG", "TISR"]

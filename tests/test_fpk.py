@@ -98,3 +98,87 @@ def test_calibrated_ensemble_scores_zero_gap_and_unit_spread_skill():
     out = sc.summary()
     assert abs(out["ign"][0] - out["entropy"][0]) < 0.02
     assert abs(out["spread_skill"][0] - 1.0) < 0.02
+
+
+@pytest.fixture(scope="module")
+def mcore():
+    torch.manual_seed(1)
+    lat = np.linspace(-78.75, 78.75, H)
+    lon = np.linspace(0, 360, W, endpoint=False)
+    contract.register_latitudes(lat)
+    st = static_features(lat, lon, np.random.rand(H, W).astype(np.float32), np.random.rand(H, W).astype(np.float32))
+    c = make_core(st, np.full(67, 0.3), np.zeros(67), np.ones(67), lat, hidden=8, blocks=(1,), norm="gn",
+                  mem=2, mem_ch=4, mz=True)
+    c.pm = None
+    with torch.no_grad():  # the head starts at zero: give the memory a say in the tendency
+        c.net.head.weight.normal_(0, 0.1)
+    return c.eval()
+
+
+def test_memory_kernel_keeps_one_memory_per_member(mcore):
+    from fpk.ensemble import rollout
+    K = PhysicsKernel(mcore, KernelConfig(n_centres=4, hidden=8, blocks=(1,)))
+    B, M = 2, 3
+    xd = torch.randn(B, 66, H, W)
+    hist = torch.randn(B, 2, 66, H, W)
+    doy = torch.tensor([30, 31])
+    # forward: the centres perturb a copy of the memory, the memory itself is the observed one
+    K.start(xd, doy, hist)
+    m_ref = mcore.m.clone()
+    c, h, _, phi0 = K(xd, doy, None, observe=False)
+    assert c.shape == (B, 4, 66, H, W) and torch.equal(mcore.m, m_ref) and torch.equal(mcore.fc, phi0)
+    assert float((c[:, 0] - c[:, 1]).abs().max()) > 0  # the cloud is a cloud
+    # a 3-day ensemble: every member carries its own memory, updated once a day with its own state
+    K.start(xd, doy, hist)
+    m_ic = mcore.m.clone()
+    seen = []
+
+    def step(x, d, tn):
+        y0, _, _, _ = K.sample(x, d, tn, torch.Generator().manual_seed(int(d[0])))
+        seen.append(mcore.m.clone())
+        return mcore.finish(y0, tn)
+    ens, hk = rollout(step, xd, doy, torch.zeros(B, 3, H, W), M, 3, kernel=K, start=K.start, hist=hist)
+    assert ens.shape == (B, M, 3, 66, H, W) and hk.shape == (B, M, 3, 66, H, W)
+    assert seen[0].shape[0] == B * M
+    # day 1: the members' memories are the IC's after the IC was remembered (all members alike)
+    K.start(xd, doy, hist)
+    mcore.remember(xd)
+    assert torch.allclose(seen[0], mcore.m.repeat_interleave(M, 0), atol=1e-6)
+    assert not torch.allclose(seen[0], m_ic.repeat_interleave(M, 0))
+    # day 2: the members differ (each saw its own state and innovation)
+    assert float((seen[1].view(B, M, -1)[:, 0] - seen[1].view(B, M, -1)[:, 1]).abs().max()) > 0
+    # the memory cloud's spread is learned
+    K.start(xd, doy, hist)
+    c, h, _, _ = K(xd, doy, None)
+    K.nll(c, h, xd, torch.ones(1, 1, H, 1)).backward()
+    assert K.eps_m_raw.grad is not None and float(K.eps_m_raw.grad.abs().sum()) > 0
+
+
+def test_memory_flow_reads_the_memory(mcore):
+    K = PhysicsKernel(mcore, KernelConfig(n_centres=2, hidden=8, blocks=(1,)))
+    Fm = KernelFlow(K, FlowConfig(hidden=8, blocks=(1,), steps=2))
+    xd, doy = torch.randn(2, 66, H, W), torch.tensor([3, 4])
+    K.start(xd, doy, torch.randn(2, 2, 66, H, W))
+    z0, cond = Fm.source(xd, doy, None)
+    assert torch.equal(cond[:, -K.mem_ch:], mcore.m)
+
+
+def test_crps_torch_matches_numpy():
+    from fpk.ensemble import crps_torch
+    rng = np.random.default_rng(2)
+    ens, obs = rng.normal(size=(3, 6, 5)), rng.normal(size=(3, 5))
+    got = crps_torch(torch.from_numpy(ens), torch.from_numpy(obs)).numpy()
+    assert np.allclose(got, fair_crps(ens, obs))
+
+
+def test_pairs_history_and_days():
+    from fpk.data import Pairs
+    arr = np.arange(20, dtype=np.float32)[:, None, None, None] * np.ones((1, 67, 2, 3), np.float32)
+    P = Pairs({2000: arr}, seed=0, hist=3, ahead=4)
+    for _ in range(20):
+        x, y, d, tn, h = P(5)
+        assert y.shape == (5, 4, 67, 2, 3) and h.shape == (5, 3, 67, 2, 3) and tn.shape == (5, 4, 2, 3)
+        i = d.numpy()
+        assert np.all(i + 4 <= 19)
+        assert np.allclose(y[:, :, 0, 0, 0].numpy(), i[:, None] + np.arange(1, 5))
+        assert np.allclose(h[:, :, 0, 0, 0].numpy(), np.maximum(i[:, None] + np.arange(-3, 0), 0))

@@ -53,8 +53,8 @@ class KernelFlow(nn.Module):
             p.requires_grad_(False)
         core = kernel.core
         n_g = core.gscale.shape[1] if kernel.gfeat else 0
-        # z_tau, x, G(x), (Phi(x) - x) / s, log h, static, time of year, tau
-        c_in = 66 + 66 + n_g + 66 + 66 + core.static.shape[0] + 4 + 4
+        # z_tau, x, G(x), (Phi(x) - x) / s, log h, static, time of year, tau (+ the memory m of a memory core)
+        c_in = 66 + 66 + n_g + 66 + 66 + core.static.shape[0] + 4 + 4 + kernel.mem_ch
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
 
     def train(self, mode: bool = True):
@@ -75,24 +75,27 @@ class KernelFlow(nn.Module):
         parts = [xd] + ([g] if g is not None else []) + [self.kernel.tend(xd, phi0), torch.log(h),
                                                          self.kernel.core.static.expand(B, -1, -1, -1),
                                                          time_features(doy.float() * 24.0, H, W)]
+        if self.kernel.mem:
+            parts.append(self.kernel.memory())
         return torch.cat(parts, 1)
 
     def velocity(self, z, tau, cond):
         H, W = z.shape[-2:]
         return self.net(torch.cat([z, cond, tau_features(tau, H, W)], 1)) * self.keep
 
-    def source(self, xd, doy, tisr, gen=None):
-        """(z0, cond): a draw of the source in increment units, and the conditioning of the velocity."""
+    def source(self, xd, doy, tisr, gen=None, observe: bool = True):
+        """(z0, cond): a draw of the source in increment units, and the conditioning of the velocity.
+        ``observe``: x enters the memory of a memory core first (once a day)."""
         with torch.no_grad():
-            y0, h, g, phi0 = self.kernel.sample(xd, doy, tisr, gen)
+            y0, h, g, phi0 = self.kernel.sample(xd, doy, tisr, gen, observe=observe)
             if self.cfg.source == "gauss":
                 z0 = smooth_noise(tuple(xd.shape), xd, gen) * self.keep
             else:
                 z0 = (y0 - xd) / self.s * self.keep
             return z0, self.cond(xd, g, phi0, h, doy)
 
-    def loss(self, xd, yd, doy, tisr, w, gen=None) -> torch.Tensor:
-        z0, cond = self.source(xd, doy, tisr, gen)
+    def loss(self, xd, yd, doy, tisr, w, gen=None, observe: bool = True) -> torch.Tensor:
+        z0, cond = self.source(xd, doy, tisr, gen, observe)
         z1 = (yd - xd) / self.s * self.keep
         B = xd.shape[0]
         tau = torch.rand(B, generator=gen).to(xd)
@@ -103,11 +106,11 @@ class KernelFlow(nn.Module):
         sq = (v - (z1 - z0)) ** 2
         return (sq * m).sum() / m.expand_as(sq).sum()
 
-    @torch.no_grad()
-    def sample(self, xd, doy, tisr, gen=None, steps: Optional[int] = None, flow: bool = True):
+    def draw(self, xd, doy, tisr, gen=None, steps: Optional[int] = None, flow: bool = True, observe: bool = True):
         """One draw of the next day per row of xd: the kernel draw transported by the learned flow (Heun);
-        ``flow=False``: the kernel draw itself. Returns (y (B, 66, H, W), z0 the source draw)."""
-        z, cond = self.source(xd, doy, tisr, gen)
+        ``flow=False``: the kernel draw itself. Differentiable in the velocity net (rollout fine-tuning).
+        Returns (y (B, 66, H, W), z0 the source draw)."""
+        z, cond = self.source(xd, doy, tisr, gen, observe)
         z0 = z
         if flow:
             n = steps or self.cfg.steps
@@ -119,3 +122,7 @@ class KernelFlow(nn.Module):
                 z = z + 0.5 * dt * (k1 + k2)
         y = xd + self.s * z
         return self.kernel.core.finish(y, tisr), z0
+
+    @torch.no_grad()
+    def sample(self, xd, doy, tisr, gen=None, steps: Optional[int] = None, flow: bool = True, observe: bool = True):
+        return self.draw(xd, doy, tisr, gen, steps, flow, observe)

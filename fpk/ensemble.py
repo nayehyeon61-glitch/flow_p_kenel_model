@@ -39,20 +39,25 @@ def dyn_index(name: str) -> int:
 
 @torch.no_grad()
 def rollout(step: Callable, xd0: torch.Tensor, doy0: torch.Tensor, tisr: torch.Tensor, members: int,
-            leads: int, kernel=None, gen=None):
+            leads: int, kernel=None, gen=None, hist: Optional[torch.Tensor] = None, start: Optional[Callable] = None):
     """``step(xd, doy, tisr_next) -> xd_next`` for a batch of member states. xd0 (B, 66, H, W), tisr (B, L, H, W).
-    Returns states (B, M, L, 66, H, W) and, with ``kernel``, its entropy per member and lead (B, M, L, 66, H, W)
-    averaged later (float32, kept on the grid for the maps)."""
+    ``start(xd0, doy0, hist, members)``: starts the trajectories (a memory core's memory from the W days before the
+    IC, hist (B, W, 66, H, W)). Returns states (B, M, L, 66, H, W) and, with ``kernel``, its entropy per member and
+    lead (B, M, L, 66, H, W). The kernel's entropy of day L is taken after the day's step, with the memory that
+    step used (no second memory update)."""
     B = xd0.shape[0]
+    if start is not None:
+        start(xd0, doy0, hist, members)
     x = xd0.repeat_interleave(members, 0)
     doy = doy0.repeat_interleave(members, 0)
     out, hk = [], []
     for L in range(leads):
         tn = tisr[:, L].repeat_interleave(members, 0)
+        xn = step(x, doy + L, tn)
         if kernel is not None:
-            c, h, _, _ = kernel(x, doy + L, tn, n=2, gen=gen)
+            c, h, _, _ = kernel(x, doy + L, tn, n=2, gen=gen, observe=False)
             hk.append(kernel.entropy(c, h).view(B, members, *x.shape[1:]))
-        x = step(x, doy + L, tn)
+        x = xn
         out.append(x.view(B, members, *x.shape[1:]))
     y = torch.stack(out, 2)
     return y, (torch.stack(hk, 2) if hk else None)
@@ -71,6 +76,15 @@ def fair_crps(ens: np.ndarray, obs: np.ndarray) -> np.ndarray:
     i = np.arange(1, M + 1).reshape((1, M) + (1,) * (ens.ndim - 2))
     e2 = ((2 * i - M - 1) * s).sum(1) / (M * (M - 1)) if M > 1 else 0.0
     return e1 - e2
+
+
+def crps_torch(ens: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+    """Fair CRPS (B, ...) of an ensemble (B, M, ...) vs obs (B, ...), differentiable (rollout fine-tuning)."""
+    M = ens.shape[1]
+    e1 = (ens - obs[:, None]).abs().mean(1)
+    s, _ = torch.sort(ens, 1)
+    i = torch.arange(1, M + 1, device=ens.device, dtype=ens.dtype).view((1, M) + (1,) * (ens.dim() - 2))
+    return e1 - ((2 * i - M - 1) * s).sum(1) / (M * (M - 1))
 
 
 class Scorer:
