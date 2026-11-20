@@ -215,3 +215,21 @@ def test_entropy_deviation_kernel(which, request):
     assert D.r_bias.grad is not None and D.h_raw.grad is not None and float(D.h_raw.grad.abs().sum()) > 0
     with torch.no_grad():
         D.r_bias.zero_()
+
+
+def test_antithetic_pairs_are_scored_without_bias():
+    """A calibrated ensemble of P antithetic pairs around the true mean: CRPS = the Gaussian's, spread / skill = 1,
+    IGN = H (the statistics of M independent members would say 6 % better CRPS and spread / skill 1.13)."""
+    from fpk.ensemble import Scorer, crps_pairs
+    rng = np.random.default_rng(3)
+    B, P, L, Hh, Ww = 60, 4, 1, 8, 16
+    d = rng.normal(size=(B, P, L, 66, Hh, Ww))
+    ens = np.concatenate([d, -d], 1)
+    truth = rng.normal(size=(B, L, 66, Hh, Ww))
+    assert abs(crps_pairs(ens[:, :, 0], truth[:, 0]).mean() - 1 / math.sqrt(math.pi)) < 0.005
+    assert abs(fair_crps(ens[:, :, 0], truth[:, 0]).mean() - 1 / math.sqrt(math.pi)) > 0.02
+    sc = Scorer(L, np.ones(Hh), np.ones(67), np.ones(67), pairs=P)
+    sc.update(ens, truth)
+    out = sc.summary()
+    assert abs(out["spread_skill"][0] - 1.0) < 0.01
+    assert abs(out["ign"][0] - out["entropy"][0]) < 0.02

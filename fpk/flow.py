@@ -83,10 +83,11 @@ class KernelFlow(nn.Module):
         H, W = z.shape[-2:]
         return self.net(torch.cat([z, cond, tau_features(tau, H, W)], 1)) * self.keep
 
-    def source(self, xd, doy, tisr, gen=None, observe: bool = True):
+    def source(self, xd, doy, tisr, gen=None, observe: bool = True, grad: bool = False):
         """(z0, cond): a draw of the source in increment units, and the conditioning of the velocity.
-        ``observe``: x enters the memory of a memory core first (once a day)."""
-        with torch.no_grad():
+        ``observe``: x enters the memory of a memory core first (once a day). ``grad``: keep the dependence of
+        the draw and the conditioning on x (the equation's Jacobian; rollout tuning through the core)."""
+        with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
             y0, h, g, phi0 = self.kernel.sample(xd, doy, tisr, gen, observe=observe)
             if self.cfg.source == "gauss":
                 z0 = smooth_noise(tuple(xd.shape), xd, gen) * self.keep
@@ -100,17 +101,18 @@ class KernelFlow(nn.Module):
         B = xd.shape[0]
         tau = torch.rand(B, generator=gen).to(xd)
         t = tau.view(B, 1, 1, 1)
-        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * torch.randn_like(z0) * self.keep
+        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * torch.randn(z0.shape, generator=gen).to(z0) * self.keep
         v = self.velocity(zt, tau, cond)
         m = self.keep * w
         sq = (v - (z1 - z0)) ** 2
         return (sq * m).sum() / m.expand_as(sq).sum()
 
-    def draw(self, xd, doy, tisr, gen=None, steps: Optional[int] = None, flow: bool = True, observe: bool = True):
+    def draw(self, xd, doy, tisr, gen=None, steps: Optional[int] = None, flow: bool = True, observe: bool = True,
+             grad: bool = False):
         """One draw of the next day per row of xd: the kernel draw transported by the learned flow (Heun);
         ``flow=False``: the kernel draw itself. Differentiable in the velocity net (rollout fine-tuning).
         Returns (y (B, 66, H, W), z0 the source draw)."""
-        z, cond = self.source(xd, doy, tisr, gen, observe)
+        z, cond = self.source(xd, doy, tisr, gen, observe, grad)
         z0 = z
         if flow:
             n = steps or self.cfg.steps

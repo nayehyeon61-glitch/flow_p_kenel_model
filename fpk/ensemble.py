@@ -87,12 +87,32 @@ def crps_torch(ens: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
     return e1 - ((2 * i - M - 1) * s).sum(1) / (M * (M - 1))
 
 
+def crps_pairs(ens: np.ndarray, obs: np.ndarray) -> np.ndarray:
+    """CRPS of an ensemble of P antithetic pairs, ens (B, 2 P, ...) = [mean + d_1..d_P, mean - d_1..d_P] with
+    independent d_p. E|X - X'| of two independent draws is estimated from the pairs of members that are NOT
+    partners (a member and its mirror image are not independent: |x - x'| = 2 |d|), so the estimate is unbiased
+    as fair_crps is for independent members."""
+    M = ens.shape[1]
+    P = M // 2
+    e1 = np.abs(ens - obs[:, None]).mean(1)
+    s = np.sort(ens, axis=1)
+    i = np.arange(1, M + 1).reshape((1, M) + (1,) * (ens.ndim - 2))
+    tot = 2 * ((2 * i - M - 1) * s).sum(1)                       # sum over ordered pairs i != j of |x_i - x_j|
+    partner = 2 * np.abs(ens[:, :P] - ens[:, P:]).sum(1)
+    return e1 - (tot - partner) / (2 * M * (M - 2))
+
+
 class Scorer:
     """Accumulates per-lead scores over batches of ICs. All fields in normalized units (z-score), entropy in units
     of s; physical RMSE for KEY_VARS."""
 
-    def __init__(self, leads: int, w: np.ndarray, inc: np.ndarray, std: np.ndarray):
-        self.L, self.w = leads, w
+    def __init__(self, leads: int, w: np.ndarray, inc: np.ndarray, std: np.ndarray, pairs: int = 0):
+        """``pairs`` = P > 0: the ensemble is P antithetic pairs around a known mean (fpk.devkernel), members
+        ordered [mean + d_p, mean - d_p]. The mean then has no sampling error and there are P independent draws,
+        so the finite-ensemble statistics differ from those of M independent members: variance about the known
+        mean (no M / (M - 1), no sqrt((M + 1) / M) in spread / skill), the error term of IGN scaled by
+        (P - 2) / P (E[1 / var] of P squares), CRPS from the non-partner pairs (crps_pairs)."""
+        self.L, self.w, self.pairs = leads, w, int(pairs)
         self.s = inc[DYN].astype(np.float64)        # (66,)
         self.std = std[DYN].astype(np.float64)
         self.acc: Dict[str, List[np.ndarray]] = {}
@@ -124,16 +144,21 @@ class Scorer:
             self.add("act", act)
             self.add("terms", np.stack([(mf - mo) ** 2, vo * (1 - r ** 2), vo * (act - r) ** 2], -1))
         if M > 1:
-            var = ens.var(1, ddof=1)                                                    # (B, L, 66, H, W)
+            P = self.pairs
+            var = ((ens - mu[:, None]) ** 2).mean(1) if P else ens.var(1, ddof=1)       # (B, L, 66, H, W)
             self.add("var", area_mean(var, w))
             v = np.maximum(var / self.s[None, None, :, None, None] ** 2, 1e-4)
             e2 = (mu - truth) ** 2 / self.s[None, None, :, None, None] ** 2
             H = 0.5 * (LOG2PI + 1 + np.log(v))
             self.add("H", area_mean(H, w))                                              # (B, L, 66)
-            c = M * (M - 3) / ((M + 1) * (M - 1)) if M > 3 else 1.0
+            if P:
+                c = (P - 2) / P if P > 2 else 1.0
+            else:
+                c = M * (M - 3) / ((M + 1) * (M - 1)) if M > 3 else 1.0
             self.add("IGN", area_mean(0.5 * (LOG2PI + np.log(v)) + c * e2 / (2 * v), w))
             self.add("logerr", area_mean(0.5 * np.log(np.maximum(e2, 1e-8)), w))
-            crps = np.stack([fair_crps(ens[:, :, l], truth[:, l]) for l in range(ens.shape[2])], 1)  # (B, L, 66, H, W)
+            fc = crps_pairs if P else fair_crps
+            crps = np.stack([fc(ens[:, :, l], truth[:, l]) for l in range(ens.shape[2])], 1)  # (B, L, 66, H, W)
             self.add("crps", area_mean(crps, w))
         else:
             self.add("crps", area_mean(np.abs(mu - truth), w))
@@ -159,7 +184,7 @@ class Scorer:
         if "var" in cat:
             spread = np.sqrt(cat["var"].mean(0))
             out["spread"] = spread[:, sc].mean(1).tolist()
-            corr = np.sqrt((self.M + 1) / self.M)  # 1 = calibrated
+            corr = 1.0 if self.pairs else np.sqrt((self.M + 1) / self.M)  # 1 = calibrated
             out["spread_skill"] = (corr * spread[:, sc] / rmse[:, sc]).mean(1).tolist()
             out["spread_skill_vars"] = {v: (corr * spread[:, dyn_index(v)] / rmse[:, dyn_index(v)]).tolist()
                                         for v in KEY_VARS}

@@ -283,8 +283,11 @@ def cmd_tune(a, rest):
     the flow with --flow-tag), and the fair CRPS of every day against the data (units of s, area-weighted) is
     minimized, plus lam x the one-day loss the model was fitted with (kernel NLL / flow-matching loss) as an anchor.
     The state is detached between days (the gradient of a day reaches its own draw only) unless --through: then the
-    gradient of a day's score goes back through the states of the days before it (the members' error growth is
-    seen by the earlier draws). The days follow the curriculum --days. A memory core's memory runs along each member as in the forecast."""
+    gradient of a day's score goes back through the states of the days before it. For the kernel that includes the
+    equation's Jacobian (the members' error growth is seen by the earlier draws). For the flow the next day's source
+    draw and conditioning are taken without gradient by default, so the state Jacobian is the identity (a day's
+    correction is credited as if it were carried unchanged to the later days); --through-core keeps the equation's
+    Jacobian there too (the memory of a backward pass through the core on every day). The days follow --days. A memory core's memory runs along each member as in the forecast."""
     torch.manual_seed(a.seed)
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
@@ -311,12 +314,12 @@ def cmd_tune(a, rest):
 
     def draw(xm, d, tn, obs, gen=None):
         if Fm is not None:
-            return Fm.draw(xm, d, tn, gen, steps=a.steps, observe=obs)[0]
+            return Fm.draw(xm, d, tn, gen, steps=a.steps, observe=obs, grad=a.through_core)[0]
         return K.core.finish(K.sample(xm, d, tn, gen, observe=obs)[0], tn)
 
-    def anchor(xd, yd, doy, tn):
+    def anchor(xd, yd, doy, tn, gen=None):
         if Fm is not None:
-            return Fm.loss(xd, yd, doy, tn, w)
+            return Fm.loss(xd, yd, doy, tn, w, gen)
         c, h, _, _ = K(xd, doy, tn)
         return K.nll(c, h, yd, w)
 
@@ -325,7 +328,7 @@ def cmd_tune(a, rest):
         xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
         B = xd.shape[0]
         K.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev))
-        an = anchor(xd, yd[:, 0], doy, tns[:, 0])  # x enters the memory here, before it is copied to the members
+        an = anchor(xd, yd[:, 0], doy, tns[:, 0], gen)  # x enters the memory here, before it is copied to the members
         if train and a.lam > 0:
             (a.lam * an).backward()
         K.tile(M)
@@ -411,7 +414,7 @@ def cmd_score(a, rest):
         else:
             Fm = load_flow(a, K, arm)
             step, m = (lambda x, d, tn, Fm=Fm: Fm.sample(x, d, tn, g, steps=a.steps)[0]), M
-        sc = Scorer(L, w, cl.inc, cl.std)
+        sc = Scorer(L, w, cl.inc, cl.std, pairs=Dk.cfg.pairs if Dk is not None else 0)
         t0 = time.time()
         for i in range(0, len(ics), a.ic_batch):
             j = ics[i:i + a.ic_batch]
@@ -505,6 +508,8 @@ def main(argv=None):
     t.add_argument("--lam", type=float, default=0.5, help="weight of the one-day loss (anchor)")
     t.add_argument("--steps", type=int, default=6)
     t.add_argument("--through", action="store_true", help="gradient through the states of the rollout (no detach)")
+    t.add_argument("--through-core", action="store_true",
+                   help="flow, with --through: also the equation's Jacobian of the next day's source and conditioning")
     t.add_argument("--val-batches", type=int, default=4)
     t.add_argument("--log-every", type=int, default=50)
     s = sub.add_parser("score")
