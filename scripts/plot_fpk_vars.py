@@ -20,7 +20,7 @@ from eval_fpk_vars import NAME as NAME0  # noqa: E402
 ARMS = ["core", "kernel", "flow_gauss", "flow"]
 NAME = dict(NAME0, core="core (결정론)", kernel="물리 kernel 단독", flow_gauss="FM, Gaussian source",
             flow="FM, 물리 kernel source")
-DET = {"core", "core_m"}  # deterministic arms: no spread
+DET = {"core", "core_m", "coreL"}  # deterministic arms: no spread
 LONG = {"z500": "500 hPa 지위", "z850": "850 hPa 지위", "t850": "850 hPa 기온", "t2m": "2 m 기온", "msl": "해면기압",
         "u850": "850 hPa 동서바람", "v850": "850 hPa 남북바람", "wind850": "850 hPa 바람 벡터",
         "u250": "250 hPa 동서바람", "v250": "250 hPa 남북바람", "wind250": "250 hPa 바람 벡터"}

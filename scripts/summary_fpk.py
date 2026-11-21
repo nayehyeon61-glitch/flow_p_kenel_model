@@ -16,7 +16,13 @@ ROWS = [("core (결정론)", "score_det", "core"), ("메모리 core (결정론)"
         ("사슬 kernel, 10일 sequence 학습 (메모리 core)", "score_devk_seq_m", "devk_seq_m"),
         ("편차 kernel source FM", "score_devflow", "devflow"),
         ("편차 FM, Gaussian source", "score_devflow_gauss", "devflow_gauss"),
-        ("편차 kernel source FM (메모리 core)", "score_devflow_m", "devflow_m")]
+        ("편차 kernel source FM (메모리 core)", "score_devflow_m", "devflow_m"),
+        ("16년 메모리 core (결정론)", "score_devk_mL", "core"),
+        ("entropy 편차 kernel (16년 core)", "score_devk_mL", "devk_mL"),
+        ("사슬 kernel, sequence 학습 (16년 core)", "score_devk_seq_mL", "devk_seq_mL"),
+        ("+ 띠별 entropy", "score_devk_band", "devk_band"),
+        ("+ 띠별 entropy, 구면조화 noise, 초기 편차 스펙트럼", "score_devk_band_sph", "devk_band_sph"),
+        ("+ 잔차 부호 제약, 전체 에너지 제약", "score_devk_band_sph_en", "devk_band_sph_en")]
 KEYS = [("nrmse", "앙상블 평균 nRMSE (낮을수록 좋음)"), ("crps", "CRPS (낮을수록 좋음)"),
         ("spread_skill", "spread / skill (1 = 보정됨)"), ("entropy_error_corr", "entropy–오차 상관 (높을수록 좋음)")]
 
