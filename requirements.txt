@@ -1,0 +1,16 @@
+numpy
+torch
+netCDF4
+xarray
+zarr
+fsspec
+aiohttp
+scipy
+pandas
+matplotlib
+pytest
+properscoring
+torchcfm==1.0.7
+torchdiffeq
+git+https://github.com/patrick-kidger/torchcubicspline.git
+koreanize-matplotlib
