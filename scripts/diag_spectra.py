@@ -87,6 +87,9 @@ def main():
     for key in sp:
         out[key] = dict(all=band(sp[key][:, kk].mean(1)).tolist(), **{v: band(sp[key][:, c]).tolist() for v, c in zip(VARS, ci)})
         out[key + "_deg"] = dict(all=sp[key][:, kk].mean(1).tolist(), **{v: sp[key][:, c].tolist() for v, c in zip(VARS, ci)})
+    # spread / error per band (sqrt of the power ratio): the judge of the scale allocation, 0.8-1.25 in every band
+    out["band_ratio"] = {v: (np.sqrt(np.array(out["dev"][v]) / np.maximum(np.array(out["err"][v]), 1e-12))).tolist()
+                         for v in out["dev"]}
     json.dump(out, open(a.json, "w"))
     f = lambda v: " ".join(f"{x:6.3f}" for x in v)  # noqa: E731
     print("bands (degrees):", out["meta"]["bands"])
@@ -96,7 +99,8 @@ def main():
             if q >= L:
                 continue
             print(f"  lead {q + 1:2d}  err {f(out['err'][v][q])}\n           dev {f(out['dev'][v][q])}"
-                  f"\n           eq  {f(out['eq'][v][q])}\n           new {f(out['new'][v][q])}")
+                  f"\n           eq  {f(out['eq'][v][q])}\n           new {f(out['new'][v][q])}"
+                  f"\n         ratio {f(out['band_ratio'][v][q])}")
 
 
 if __name__ == "__main__":

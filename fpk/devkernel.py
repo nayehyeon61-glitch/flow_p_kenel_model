@@ -75,6 +75,8 @@ class DevConfig:
     #                           (r_plus = 1/2 log(1 + Q / <p^2>)), the learned residual only removes (r_minus)
     band_scale: bool = False  # entropy by scale: the deviations are rescaled per Littlewood-Paley band of degrees,
     #                           channel and lead, exp(g[lead, c, j]) (starts at 1); H is then the size of the result
+    e0_spec: str = ""         # the initial deviations' degree spectrum: "" = smooth_noise; a json of
+    #                           diag_spectra.py: its 1-day error spectrum (err_deg, all channels), unit variance
     noise: str = "smooth"     # the new part's field: "smooth" (3 x 3 mean of white noise) or "sphere": spherical
     #                           harmonics with a learned amplitude per Littlewood-Paley band and channel (starts as
     #                           the isotropic copy of "smooth") and an AR(1) correlation in time per band
@@ -96,13 +98,17 @@ class EntropyDeviationKernel(nn.Module):
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))  # zero head: r = bias
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
-        if cfg.noise == "sphere" or cfg.band_scale:
+        if cfg.noise == "sphere" or cfg.band_scale or cfg.e0_spec:
             H = int(core.static.shape[-2])
             lat = [-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]  # the data's equiangular grid, south to north
             self.sht = SHT(lat)
             bj, nb = bands(self.sht.L)
             self.register_buffer("band_of", bj)
             self.n_bands = nb
+        if cfg.e0_spec:
+            import json
+            sp = torch.tensor(json.load(open(cfg.e0_spec))["err_deg"]["all"][0], dtype=torch.float32)
+            self.register_buffer("e0_amp", (sp / sp.sum()).clamp(min=0).sqrt())  # (L,), unit total variance
         if cfg.band_scale:
             self.g_band = nn.Parameter(torch.zeros(10, 66, nb))  # log scale per lead (day 1..10), channel, band
         if cfg.noise == "sphere":
@@ -173,7 +179,11 @@ class EntropyDeviationKernel(nn.Module):
             self.core.reset(hist, doy.float() * 24.0, xd)
         B, P = xd.shape[0], self.cfg.pairs
         self._xi = None
-        return self.cfg.eps0 * smooth_noise((B, P) + tuple(xd.shape[1:]), xd, gen) * self.keep.unsqueeze(0)
+        if self.cfg.e0_spec:  # shaped like the 1-day error: the variance where the error grows from, not at l 16-31
+            z = self.sht.noise(self.e0_amp.to(xd), (B, P, xd.shape[1]), gen)
+        else:
+            z = smooth_noise((B, P) + tuple(xd.shape[1:]), xd, gen)
+        return self.cfg.eps0 * z * self.keep.unsqueeze(0)
 
     def _equation(self, xbar, e, doy, tisr):
         """The mean's day and the deviations carried by the equation: (Phi(xbar), p (B, P, 66, H, W), G(xbar)).

@@ -208,7 +208,8 @@ def cmd_devk(a, rest):
     dev = torch.device(a.device)
     Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth,
                                                cloud_mean=a.cloud_mean, correct=a.correct, noise=a.noise,
-                                               r_dissip=a.r_dissip, band_scale=a.band_scale)).to(dev)
+                                               r_dissip=a.r_dissip, band_scale=a.band_scale,
+                                               e0_spec=a.e0_spec)).to(dev)
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
         miss = Dk.load_state_dict(ck["state"], strict=False)
@@ -635,6 +636,7 @@ def main(argv=None):
     d.add_argument("--energy-weight", type=float, default=0.0,
                    help="penalty on members whose daily change of total energy leaves the mean's by > k sigma")
     d.add_argument("--energy-k", type=float, default=1.0)
+    d.add_argument("--e0-spec", default="", help="diag_spectra json: initial deviations shaped like its 1-day error")
     d.add_argument("--band-scale", action="store_true", help="entropy by scale: band-wise rescaling of the deviations")
     d.add_argument("--band-weight", type=float, default=0.0, help="weight of the band-wise log score (needs the SHT)")
     d.add_argument("--r-dissip", action="store_true", help="the learned residual r <= 0 (noise makes the positive part)")

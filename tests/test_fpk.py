@@ -350,3 +350,17 @@ def test_band_scale_starts_as_the_kernel_and_learns_from_the_band_score(core):
     x1, e1, H1, _ = Bk.day(xd, e, doy, tis[:, 0], 0)
     Bk.band_ign(e1, x1.detach(), x1.detach() + 0.5 * Bk.s).backward()
     assert Bk.g_band.grad is not None and float(Bk.g_band.grad[0].abs().sum()) > 0
+
+
+def test_initial_deviations_follow_the_given_spectrum(core, tmp_path):
+    import json
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    sp = [0.0] * H
+    sp[2] = 1.0
+    f = tmp_path / "d.json"
+    f.write_text(json.dumps({"err_deg": {"all": [sp]}}))
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), eps0=1.0, e0_spec=str(f)))
+    e = Dk.start(torch.zeros(20, 66, H, W), torch.zeros(20, dtype=torch.long), gen=torch.Generator().manual_seed(0))
+    k = Dk.keep.reshape(-1) > 0
+    spec = Dk.sht.spectrum(e[:, :, k]).mean((0, 1, 2))
+    assert int(spec.argmax()) == 2 and abs(float(spec.sum()) - 1.0) < 0.15
