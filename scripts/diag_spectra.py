@@ -90,11 +90,18 @@ def main():
     # spread / error per band (sqrt of the power ratio): the judge of the scale allocation, 0.8-1.25 in every band
     out["band_ratio"] = {v: (np.sqrt(np.array(out["dev"][v]) / np.maximum(np.array(out["err"][v]), 1e-12))).tolist()
                          for v in out["dev"]}
+    # the Bures-Wasserstein distance by band between the spread and the error (diagonal Gaussians per mode):
+    # W2^2 = sum_j n_j (sigma_j - sqrt(S_j))^2, sigma_j^2 = spread power / n_j, S_j = error power / n_j
+    nj = np.array([sum(2 * l + 1 for l in range(lo, hi + 1)) for lo, hi in out["meta"]["bands"]], dtype=float)
+    out["w2_band"] = {v: (nj * (np.sqrt(np.array(out["dev"][v]) / nj) - np.sqrt(np.array(out["err"][v]) / nj)) ** 2).tolist()
+                      for v in out["dev"]}
+    out["w2"] = {v: np.sum(out["w2_band"][v], -1).tolist() for v in out["dev"]}
     json.dump(out, open(a.json, "w"))
     f = lambda v: " ".join(f"{x:6.3f}" for x in v)  # noqa: E731
     print("bands (degrees):", out["meta"]["bands"])
     for v in ("all",) + VARS:
-        print(f"== {v}: rho_eq at leads 1/5/10 = {f([out['rho_eq'][v][q] for q in (0, 4, 9) if q < L])}")
+        print(f"== {v}: rho_eq at leads 1/5/10 = {f([out['rho_eq'][v][q] for q in (0, 4, 9) if q < L])}"
+              f"   Bures-W2^2 = {f([out['w2'][v][q] for q in (0, 4, 9) if q < L])}")
         for q in (0, 4, 9):
             if q >= L:
                 continue
