@@ -28,8 +28,9 @@ NAME = {"climatology": "기후값", "persistence": "지속성", "core": "core", 
         "core_m": "메모리 core", "kernel_m": "메모리 kernel", "flow_m": "메모리 FM", "flow_mt": "메모리 FM + rollout",
         "devk": "entropy 편차 kernel", "devk_m": "entropy 편차 kernel (메모리)", "devflow": "편차 kernel FM",
         "devflow_gauss": "편차 FM, Gaussian source", "devflow_m": "편차 kernel FM (메모리)",
-        "devflow_gauss_m": "편차 FM, Gaussian (메모리)"}
-PAIRS = {"devk", "devk_m"}  # arms of antithetic pairs: no finite-member factor in spread / skill
+        "devflow_gauss_m": "편차 FM, Gaussian (메모리)", "devk_seq_m": "사슬 kernel, sequence 학습 (메모리)",
+        "devk_mL": "entropy 편차 kernel (16년 core)", "devk_seq_mL": "사슬 kernel, sequence 학습 (16년 core)"}
+PAIRS = {"devk", "devk_m", "devk_seq_m", "devk_mL", "devk_seq_mL"}  # arms of antithetic pairs: no finite-member factor in spread / skill
 UNIT = {"z": "m²/s²", "t": "K", "u": "m/s", "v": "m/s", "w": "m/s", "m": "Pa"}
 
 

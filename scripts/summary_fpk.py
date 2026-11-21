@@ -13,6 +13,7 @@ ROWS = [("core (결정론)", "score_det", "core"), ("메모리 core (결정론)"
         ("메모리 kernel", "score_m_kernel", "kernel"), ("메모리 FM", "score_m_flow", "flow_m"),
         ("메모리 FM + rollout 미세조정", "score_m_flow", "flow_mt"),
         ("entropy 편차 kernel", "score_devk", "devk"), ("entropy 편차 kernel (메모리 core)", "score_devk_m", "devk_m"),
+        ("사슬 kernel, 10일 sequence 학습 (메모리 core)", "score_devk_seq_m", "devk_seq_m"),
         ("편차 kernel source FM", "score_devflow", "devflow"),
         ("편차 FM, Gaussian source", "score_devflow_gauss", "devflow_gauss"),
         ("편차 kernel source FM (메모리 core)", "score_devflow_m", "devflow_m")]
