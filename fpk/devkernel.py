@@ -71,6 +71,8 @@ class DevConfig:
     d_max: float = 0.25       # the mean's correction of one day is at most d_max x the cloud's size exp(H)
     r_dissip: bool = False    # r = -softplus(-u) <= 0: the noise spectrum makes all the positive production
     #                           (r_plus = 1/2 log(1 + Q / <p^2>)), the learned residual only removes (r_minus)
+    band_scale: bool = False  # entropy by scale: the deviations are rescaled per Littlewood-Paley band of degrees,
+    #                           channel and lead, exp(g[lead, c, j]) (starts at 1); H is then the size of the result
     noise: str = "smooth"     # the new part's field: "smooth" (3 x 3 mean of white noise) or "sphere": spherical
     #                           harmonics with a learned amplitude per Littlewood-Paley band and channel (starts as
     #                           the isotropic copy of "smooth") and an AR(1) correlation in time per band
@@ -92,12 +94,16 @@ class EntropyDeviationKernel(nn.Module):
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))  # zero head: r = bias
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
-        if cfg.noise == "sphere":
+        if cfg.noise == "sphere" or cfg.band_scale:
             H = int(core.static.shape[-2])
             lat = [-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]  # the data's equiangular grid, south to north
             self.sht = SHT(lat)
             bj, nb = bands(self.sht.L)
             self.register_buffer("band_of", bj)
+            self.n_bands = nb
+        if cfg.band_scale:
+            self.g_band = nn.Parameter(torch.zeros(10, 66, nb))  # log scale per lead (day 1..10), channel, band
+        if cfg.noise == "sphere":
             # the degree spectrum of smooth_noise (unit variance): the start of the band amplitudes
             with torch.no_grad():
                 z = smooth_noise((512, 1, H, 2 * H), self.sht.syn, torch.Generator().manual_seed(0))
@@ -265,11 +271,17 @@ class EntropyDeviationKernel(nn.Module):
             if self.mem:
                 self.core.fc = phi0.detach()  # the corrected mean is the forecast the memory's innovation refers to
         e_next = q * torch.exp(r)[:, None]
+        Hn = lq + r
+        if self.cfg.band_scale:
+            # the identity plus the band-wise change, so the start is exactly the kernel without it
+            fac = torch.expm1(self.g_band[min(lead, 9)])[:, self.band_of]          # (66, L)
+            e_next = e_next + self.sht.synthesis(self.sht.analysis(e_next) * fac[:, :, None]) * self.keep.unsqueeze(0)
+            Hn = self.size(e_next)
         # the parts of the day (diagnostics): the day's production H_(L+1) - H_L split into the equation's stretching
         # 1/2 log <p^2> - H_L, the noise's 1/2 log <q^2> - 1/2 log <p^2> (>= 0) and the learned residual r
         lp = self.size(p)
         self.last = dict(p=p, hxi=q - p, r=r, prod=((lp - le).detach(), (lq - lp).detach(), r.detach()))
-        return phi0, e_next, lq + r, (lq - le, r)
+        return phi0, e_next, Hn, (lq - le, r)
 
     def ign(self, H, xbar, truth, w):
         """The Gaussian log score of the truth around the mean with entropy H (without 1/2 log 2 pi), area-weighted,
@@ -279,6 +291,21 @@ class EntropyDeviationKernel(nn.Module):
         m = self.keep * w
         n = m.expand_as(v).sum()
         return (v * m).sum() / n, (H * m).sum() / n
+
+    def band_ign(self, e, xbar, truth):
+        """The Gaussian log score by scale: per channel and band j of degrees, the error's power E_j against the
+        deviations' power V_j (mean over the pairs), over the band's n_j coefficients,
+        n_j (1/2 log (V_j / n_j) + E_j / (2 V_j)) / sum_j n_j, averaged over the channels (tisr excluded).
+        Its minimum is V_j = E_j: the spread in every band the size of the error there."""
+        bj = self.band_of
+        n = torch.stack([(2 * torch.arange(self.sht.L, device=bj.device)[bj == b] + 1).sum()
+                         for b in range(self.n_bands)]).to(e)
+        band = lambda t: torch.stack([t[..., bj == b].sum(-1) for b in range(self.n_bands)], -1)  # noqa: E731
+        V = band(self.sht.spectrum(e).mean(1)).clamp(min=1e-10)                    # (B, 66, nb)
+        E = band(self.sht.spectrum((truth - xbar) / self.s))
+        v = (n * (0.5 * torch.log(V / n) + E / (2 * V))).sum(-1) / n.sum()          # (B, 66)
+        k = self.keep.reshape(-1) > 0
+        return v[:, k].mean()
 
     @staticmethod
     def members(xbar, e, s):

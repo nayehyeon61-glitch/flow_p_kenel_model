@@ -207,7 +207,7 @@ def cmd_devk(a, rest):
     dev = torch.device(a.device)
     Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth,
                                                cloud_mean=a.cloud_mean, correct=a.correct, noise=a.noise,
-                                               r_dissip=a.r_dissip)).to(dev)
+                                               r_dissip=a.r_dissip, band_scale=a.band_scale)).to(dev)
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
         miss = Dk.load_state_dict(ck["state"], strict=False)
@@ -236,8 +236,10 @@ def cmd_devk(a, rest):
         xb, ign, ent, prod, rm, es, vs = xd, [], [], [], [], [], []
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            e = e.detach()
             i, h_ = Dk.ign(H, xb, yd[:, k], w)
+            if a.band_weight:  # on the deviations before the detach: the band scales learn from it
+                i = i + a.band_weight * Dk.band_ign(e, xb.detach(), yd[:, k])
+            e = e.detach()
             es.append((xb - yd[:, k]) / Dk.s)
             vs.append(torch.exp(2 * H))
             rm.append(float((((xb - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()))
@@ -613,6 +615,8 @@ def main(argv=None):
     d.add_argument("--cloud-mean", action="store_true", help="the mean = the average of the equation over the cloud")
     d.add_argument("--correct", action="store_true",
                    help="chained kernel p(x_t | x_(t-1)): correct the mean (G of the new state) and the entropy at x_t")
+    d.add_argument("--band-scale", action="store_true", help="entropy by scale: band-wise rescaling of the deviations")
+    d.add_argument("--band-weight", type=float, default=0.0, help="weight of the band-wise log score (needs the SHT)")
     d.add_argument("--r-dissip", action="store_true", help="the learned residual r <= 0 (noise makes the positive part)")
     d.add_argument("--noise", default="smooth", choices=["smooth", "sphere"],
                    help="the new part's field: 3 x 3 smoothed, or spherical harmonics with learned band amplitudes + AR(1)")
