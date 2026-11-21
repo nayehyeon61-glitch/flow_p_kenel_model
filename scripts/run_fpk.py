@@ -521,7 +521,7 @@ def cmd_tune(a, rest):
 def cmd_score(a, rest):
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
-    K = load_kernel(a, core, a.kernel_tag) if any(not x.startswith("dev") and x != "persistence" for x in a.arms) \
+    K = load_kernel(a, core, a.kernel_tag) if any(not x.startswith("dev") and x not in ("persistence", "core") for x in a.arms) \
         else PhysicsKernel(core)
     te = D.load(pa, [a.test_year])[a.test_year]
     L, M = a.leads, a.members
