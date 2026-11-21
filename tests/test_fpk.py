@@ -364,3 +364,14 @@ def test_initial_deviations_follow_the_given_spectrum(core, tmp_path):
     k = Dk.keep.reshape(-1) > 0
     spec = Dk.sht.spectrum(e[:, :, k]).mean((0, 1, 2))
     assert int(spec.argmax()) == 2 and abs(float(spec.sum()) - 1.0) < 0.15
+
+
+def test_noise_composed_with_the_equation(core):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    torch.manual_seed(0)
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, noise_pre=True))
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 1, H, W)
+    e = torch.zeros(2, 2, 66, H, W)                      # no deviations: the day's spread is all M (h xi)
+    x1, e1, H1, _ = Dk.day(xd, e, doy, tis[:, 0], 0)
+    assert float(e1.abs().mean()) > 0 and torch.isfinite(H1).all()
+    assert float(Dk.last["hxi"].abs().max()) < 1e-6     # nothing is added after the equation

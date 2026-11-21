@@ -75,6 +75,9 @@ class DevConfig:
     #                           (r_plus = 1/2 log(1 + Q / <p^2>)), the learned residual only removes (r_minus)
     band_scale: bool = False  # entropy by scale: the deviations are rescaled per Littlewood-Paley band of degrees,
     #                           channel and lead, exp(g[lead, c, j]) (starts at 1); H is then the size of the result
+    noise_pre: bool = False   # the new part composed with the equation: the Gaussian field is added to the deviations
+    #                           BEFORE the equation's day, e_in = e + h xi, so the day's new variance is M (h xi): it
+    #                           lies in the region the equation reaches (balanced, on the equation's scales)
     e0_spec: str = ""         # the initial deviations' degree spectrum: "" = smooth_noise; a json of
     #                           diag_spectra.py: its 1-day error spectrum (err_deg, all channels), unit variance
     noise: str = "smooth"     # the new part's field: "smooth" (3 x 3 mean of white noise) or "sphere": spherical
@@ -248,10 +251,17 @@ class EntropyDeviationKernel(nn.Module):
         the variance of the next day in units of s^2; parts = (stretch, r): the day's entropy production split
         into the equation's stretching 1/2 log <p^2> / <e^2> (+ the new part) and the learned residual."""
         B, _, Hh, Ww = xbar.shape
-        phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
+        xi = self.new_noise(tuple(e.shape), xbar, gen) * self.keep.unsqueeze(0)
+        if self.cfg.noise_pre:
+            # K_phys o G: the noise goes through the equation with the deviations (linear part M (e + h xi)); the
+            # gradient to h and to the noise amplitudes goes through the straight-through copy of the injected part
+            inj = self.h().unsqueeze(0) * xi
+            phi0, p, g, shift = self._equation(xbar, e + inj.detach(), doy, tisr)
+            q = p + (inj - inj.detach())
+        else:
+            phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
+            q = p + self.h().unsqueeze(0) * xi
         g = None if g is None else g.detach()
-        xi = self.new_noise(tuple(p.shape), xbar, gen) * self.keep.unsqueeze(0)
-        q = p + self.h().unsqueeze(0) * xi
         le, lq = self.size(e), self.size(q)
         tend = ((phi0 - xbar) / self.s * self.keep).detach()
         parts = [xbar] + ([g] if g is not None else []) + [tend, le.detach(), lq.detach(),
