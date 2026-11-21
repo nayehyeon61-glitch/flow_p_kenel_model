@@ -73,6 +73,16 @@ python scripts/run_fpk.py flow --source gauss --tag flow_gauss
 python scripts/run_fpk.py score --arms persistence core kernel flow flow_gauss --kernel-entropy
 python scripts/report_fpk.py runs/fpk/score.json --out docs/results
 python -m pytest -q tests
+
+# 7~9절: 메모리 core, rollout 미세조정, entropy 편차 kernel, 편차 kernel source FM
+python scripts/run_fpk.py core --core-tag core_gngmz8 --iters 2000 -- --core-mem 8 --core-mz --curriculum 1 2 3 4 6 8 --resume
+python scripts/run_fpk.py kernel --core-tag core_gngmz8 --tag kernel_m --iters 600
+python scripts/run_fpk.py flow --core-tag core_gngmz8 --kernel-tag kernel_m --tag flow_m --iters 2500
+python scripts/run_fpk.py tune --core-tag core_gngmz8 --kernel-tag kernel_m --flow-tag flow_m --tag flow_mt --days 2 3 3 3 --batch 1 --steps 3 --through --lr 1e-4 --iters 320
+python scripts/run_fpk.py devk --tag devk                         # --core-tag core_gngmz8 --tag devk_m
+python scripts/run_fpk.py devflow --dev-tag devk --tag devflow    # --source gauss --tag devflow_gauss
+python scripts/run_fpk.py score --arms devk devflow devflow_gauss --score-tag score_dev
+python scripts/summary_fpk.py; python scripts/eval_fpk_vars.py ...; python scripts/plot_fpk_vars.py ...
 ```
 
 PG-CFM 에서 이미 학습한 core 를 쓰려면 `runs/kaitend/<tag>.pt` 와 같은 폴더의 `stats.npz` 를 `--out` 폴더에 두고 `--core-tag <tag>` 를 줍니다(plain core 만).
@@ -132,3 +142,85 @@ PG-CFM 에서 이미 학습한 core 를 쓰려면 `runs/kaitend/<tag>.pt` 와 �
 5. entropy-오차 상관은 변수별로도 물리 kernel 쪽이 10일까지 유지됩니다(z500 10일: kernel 0.54, FM 물리 kernel 0.40, FM Gaussian 0.01).
 
 3번이 다음 실험의 근거입니다: 3일의 정보 손실은 rollout 학습과 기억으로, 10일의 진폭·과대 퍼짐은 평균/편차 분리와 entropy 로 크기를 정하는 편차 kernel 로 겨냥합니다.
+
+## 7. 메모리 항의 kernel 화와 rollout 확장
+
+**메모리 core.** `core_gngmz8`: ConvGRU 기억 m(24채널, 8일 teacher forcing, Mori-Zwanzig innovation), rollout curriculum 1·2·3·4·6·8일, 2000 iteration. 결정론 10일 nRMSE 0.551 → 0.517 (3일은 0.354 → 0.360 으로 비슷).
+
+**메모리 kernel.** kernel 합을 상태와 기억의 구름으로 넓혔습니다 (`fpk/kernel.py`):
+
+    K(x, m, y) = (1/N) Σ_k N( y ; Φ(x + ε s δ_k ; m + ε_m δ'_k) , diag (s h(x, G, m))² )
+
+member 마다 자기 기억을 가집니다. `start` 가 IC 앞 8일로 기억을 채우고, 매일 `observe` 가 그 member 의 상태로 한 번 갱신하며, 기억이 보는 innovation 은 "member 상태 − 방정식의 예보 Φ(x; m)" 입니다. ε_m 은 기억 채널마다 학습됩니다(0.1 → 0.076). 폭 h 와 flow 의 조건도 m 을 읽습니다.
+
+**rollout 미세조정.** `run_fpk.py tune`: member M 개를 D 일 돌리며 매일의 fair CRPS(s 단위) + λ × 하루 loss 를 줄입니다. `--through` 는 뒤 날의 점수가 앞 날의 상태를 거쳐 되돌아가게 합니다(flow 는 기본적으로 상태 Jacobian 을 항등으로 두고, `--through-core` 가 방정식의 Jacobian 까지 포함).
+
+결과:
+
+- kernel 의 rollout 미세조정은 효과가 1 % 안팎입니다(6일 CRPS 0.726 → 0.718). kernel 의 자유도는 ε 과 h 뿐입니다.
+- flow 의 rollout 미세조정(2~3일)은 10일 CRPS 0.313 → 0.293, 앙상블 평균 nRMSE 0.629 → 0.596 이고, 학습에 쓰지 않은 4~10일에도 이득이 유지됩니다.
+- 메모리 kernel 자체의 이득은 작습니다(10일 CRPS 0.306 → 0.299). 메모리 + flow + rollout 은 10일 CRPS 0.285, 1일 0.097(전체 중 최저), entropy–오차 상관 0.57~0.65.
+- 과한 퍼짐은 남습니다(10일 spread / skill 1.29). member 가 각자 noise 가 든 궤적을 도는 구조의 성질입니다.
+
+## 8. entropy 로 편차를 만드는 kernel
+
+`fpk/devkernel.py`. 평균과 편차를 나누고, 편차의 크기를 entropy 예산으로 정합니다.
+
+    평균      x̄_(L+1) = Φ(x̄_L)                              core 의 궤적 (기억 포함)
+    member    x_L = x̄_L ± s e_L                              대칭 쌍 P 개
+    방향      p = [Φ(x̄ + s e) − Φ(x̄ − s e)] / (2 s)           방정식이 편차를 실어 나름 (kernel 의 섭동 쌍)
+    새 부분   q = p + h ξ                                     방정식이 정하지 않는 부분
+    크기      e_(L+1) = q · exp(r)
+    entropy   H_(L+1) = ½ log⟨q²⟩ + r(x̄, G, m, …)             = 방정식의 늘림 + 학습된 잔차
+
+하루 entropy 생산은 H_(L+1) − H_L = (방정식의 늘림률) + (잔차 r) 입니다. 학습은 여러 날 rollout 에서 평균 둘레의 Gaussian log score, IGN = H + err² / (2 e^{2H}) 를 줄이는 것이고, 최소점이 보정된 entropy(E[IGN] = H)입니다. core 는 고정이고 core 를 통한 gradient 는 없어서 학습이 가볍습니다.
+
+읽은 것:
+
+- 학습된 늘림률은 1일 0.53 → 10일 0.08 nats 로 줄고, 잔차는 3일부터 음수(−0.04 ~ −0.08)입니다. 방정식만으로는 구름이 조금 과하게 커지고 학습된 항이 깎습니다.
+- **평균은 core 그대로**(쌍의 평균 = x̄), **spread / skill 1.00~1.07**(메모리 core 위 1.00~1.05), **entropy–오차 상관 0.61~0.66**.
+- 10일 CRPS 0.285(plain core), **0.268(메모리 core)**: 처음 구조(0.313)보다 14 % 낮습니다. 1일은 0.105~0.108 로 FM(0.097~0.099)이 낫습니다.
+
+채점: member 가 대칭 쌍이면 평균에 표본 오차가 없고 독립 표본은 P 개입니다. 독립 member 공식으로 채점하면 CRPS 가 6 % 유리하고 spread / skill 이 1.13 으로 나옵니다(코드 검토에서 발견). `Scorer(pairs=P)` 가 알려진 평균 둘레의 분산, 짝이 아닌 쌍으로 만든 CRPS(`crps_pairs`), P 에 맞는 IGN 보정을 씁니다. 표의 수치는 고친 뒤의 값입니다.
+
+## 9. 편차 kernel 을 source 로 하는 flow matching
+
+`fpk/devflow.py`. 편차 kernel 이 만든 분포를 FM 의 source 로 둡니다(예측 퍼짐 σ = e^H 단위).
+
+    source  z0 = e_L           편차 kernel 의 draw
+    target  z1 = (x_L − x̄_L) / s
+    v_θ(z_τ, τ | x̄_L, G(x̄_L), H_L, 선행, 계절)        0 시작: 학습 전에는 kernel 과 같음
+
+대조 `gauss`: 같은 크기(σ)의 매끄러운 Gaussian noise 를 source 로 둡니다. 방정식의 방향은 없고 entropy 의 크기만 있습니다.
+
+결과 (plain core 위, 독립 member 8개):
+
+- CRPS 가 5일 이후 더 내려갑니다: 5 / 7 / 10일 0.227 / 0.258 / 0.285 → 0.221 / 0.245 / 0.267. 1~3일은 같습니다.
+- 앙상블 평균 nRMSE 는 0.227 / 0.381 / 0.467 / 0.518 / 0.559 로 core 보다 높습니다. 대부분 독립 member 8개의 표본 오차입니다(1일 0.211 × √(1 + 1/8) = 0.224).
+- spread / skill 이 1.10~1.20 으로 다시 넓어집니다.
+- **65채널 평균으로는 Gaussian source 대조와 차이가 없습니다**(10일 CRPS 0.267 대 0.268). 변수별로는 지위·기압·기온의 긴 선행에서 물리 source 가 낫고(10일 CRPS: z500 359 대 372 m²/s², msl 325 대 339 Pa, t850 1.77 대 1.81 K), 바람은 같습니다.
+
+해석: 이 구성에서 물리는 이미 평균(core 궤적)과 크기(entropy H)로 들어가 있고, 두 FM 이 그것을 똑같이 조건으로 받습니다. source 의 방향 구조가 더하는 것은 큰 규모의 질량장에 한정됩니다. 5절에서 Gaussian source 가 entropy–오차 상관을 잃었던 것과 달리 여기서는 대조도 0.6~0.7 을 유지하는데, 퍼짐의 크기가 물리 entropy 에서 오기 때문입니다.
+
+## 10. 전체 비교와 다음 단계
+
+전체 표는 [results/summary.md](results/summary.md), 변수별 표와 그래프는 [results/vars.md](results/vars.md), `results/vars.html` 입니다.
+
+| 10일 (65채널 평균) | 앙상블 평균 nRMSE | CRPS | spread / skill | entropy–오차 상관 |
+| --- | ---: | ---: | ---: | ---: |
+| core (결정론) | 0.551 | 0.397 | | |
+| 메모리 core (결정론) | 0.517 | 0.372 | | |
+| FM, 물리 kernel source (처음 구조) | 0.629 | 0.313 | 1.27 | 0.41 |
+| FM + rollout 미세조정 | 0.596 | 0.293 | 1.30 | 0.47 |
+| 메모리 FM + rollout 미세조정 | 0.581 | 0.285 | 1.29 | 0.61 |
+| entropy 편차 kernel | 0.551 | 0.285 | 1.07 | 0.65 |
+| entropy 편차 kernel (메모리 core) | 0.517 | 0.268 | 1.05 | 0.65 |
+| 편차 kernel source FM | 0.559 | 0.267 | 1.20 | 0.71 |
+| 편차 FM, Gaussian source | 0.565 | 0.268 | 1.21 | 0.64 |
+
+다음 단계:
+
+1. 편차 kernel source FM 을 메모리 core 위에서(`devflow_m`), 그리고 대칭 쌍을 유지하는 transport(홀함수 velocity)로 평균을 core 에 고정.
+2. 편차 FM 의 넓어진 퍼짐: 학습 target 을 평균의 오차 하나로 두는 대신 rollout CRPS 로 미세조정.
+3. 폭의 공간 구조: 격자점별 h ξ 를 neural operator 의 적분 kernel ∫κ(x, x′) ξ(x′) dx′ (FNO / SFNO) 로 교체. 3일차 손실이 종관 규모의 정보 항이라는 6절의 결과가 근거입니다.
+4. 1~3일: FM 의 1일 CRPS(0.097)와 편차 kernel 의 긴 선행을 합치는 구성.

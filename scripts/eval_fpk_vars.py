@@ -77,8 +77,9 @@ def per_var(R, names, std, arm, ref, c, k):
         i = ix[0]
         if "acc" in R[arm]:
             e["acc"], e["act"] = R[arm]["acc"][..., i].mean(0), R[arm]["act"][..., i].mean(0)
-        if "var" in R[arm]:
+        if "crps" in R[arm]:
             e["crps"] = R[arm]["crps"][..., i].mean(0) * std[i]
+        if "var" in R[arm]:
             e["spread"] = np.sqrt(R[arm]["var"][..., i].mean(0)) * std[i]
             e["H"] = R[arm]["H"][..., i].mean(0)
             e["corr"] = np.array([np.corrcoef(R[arm]["H"][:, l, i], R[arm]["logerr"][:, l, i])[0, 1]
