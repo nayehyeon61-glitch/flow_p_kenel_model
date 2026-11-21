@@ -299,3 +299,20 @@ def test_gradient_through_the_chain_reaches_an_earlier_correction(mcore):
     g = grad_of_day2(2)
     assert g is not None and float(g.abs().sum()) > 0
     assert all(p.grad is None for p in mcore.parameters())  # the equation's weights stay fixed
+
+
+def test_spherical_harmonics_roundtrip_parseval_and_isotropic_noise():
+    import numpy as np
+    from fpk.sphere import SHT
+    lat = np.linspace(-90 + 2.8125, 90 - 2.8125, 32)
+    S = SHT(lat)
+    torch.manual_seed(0)
+    c = torch.complex(torch.randn(2, 32, 32), torch.randn(2, 32, 32)) * torch.tril(torch.ones(32, 32))
+    c[..., 0] = torch.complex(c[..., 0].real, torch.zeros(2, 32))
+    assert torch.allclose(S.analysis(S.synthesis(c)), c, atol=1e-4)  # exact for band-limited fields
+    amp = torch.zeros(32)
+    amp[6] = 1.0
+    n = S.noise(amp, (1000,), torch.Generator().manual_seed(1))
+    v = n.pow(2).mean((0, 2))
+    assert abs(float(v.mean()) - 1.0) < 0.05 and float(v.max() / v.min()) < 1.15  # unit variance, isotropic
+    assert int(S.spectrum(n).mean(0).argmax()) == 6

@@ -222,6 +222,7 @@ class EntropyDeviationKernel(nn.Module):
             if self.mem:
                 self.core.fc = phi0.detach()  # the corrected mean is the forecast the memory's innovation refers to
         e_next = q * torch.exp(r)[:, None]
+        self.last = dict(p=p, hxi=q - p, r=r)  # the parts of the day (diagnostics)
         return phi0, e_next, lq + r, (lq - le, r)
 
     def ign(self, H, xbar, truth, w):
