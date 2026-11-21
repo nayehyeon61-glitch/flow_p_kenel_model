@@ -35,6 +35,7 @@ def main():
     p.add_argument("--ics", type=int, default=24)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--leads", type=int, default=10)
+    p.add_argument("--flow-tag", default="", help="a deviation flow on --dev-tag: its members instead of the kernel's")
     p.add_argument("--json", default="docs/results/diag_spectra.json")
     a = p.parse_args()
     a.cloud_mean = False
@@ -42,6 +43,11 @@ def main():
         torch.set_num_threads(a.threads)
     pa, cl, core = R.load_core(a)
     Dk = R.load_devk(a, core, a.dev_tag)
+    Fm = R.load_devflow(a, core, a.flow_tag) if a.flow_tag else None
+    if Fm is not None:
+        Dk = Fm.dk
+    path = np.zeros((a.leads, 2))
+    es = np.zeros((a.leads, 3))  # band-weighted energy score: E|X - y|, 1/2 E|X - X'|, their difference
     S = SHT(cl.lat)
     va = D.load(pa, [a.val_year])[a.val_year]
     names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
@@ -52,6 +58,13 @@ def main():
     ics = np.linspace(8, len(va) - L - 1, a.ics).astype(int)
     w = D.area_weights(cl.lat)
     sums = {k: torch.zeros(L, 66, S.L) for k in ("err", "dev", "new", "eq")}
+    bj0, nb0 = bands(S.L)
+    band_pw = lambda f: torch.stack([S.spectrum(f)[..., bj0 == b].sum(-1) for b in range(nb0)], -1)  # noqa: E731
+    with torch.no_grad():  # the climatological band power of the day-to-day anomaly (units of s), per channel
+        an = torch.from_numpy(va[::7][:, dyn]) - torch.from_numpy(va[:, dyn]).mean(0, keepdim=True)
+        cpw = band_pw(an / Dk.s).mean(0).clamp(min=1e-8)                                    # (66, nb)
+        nj0 = torch.tensor([float((2 * torch.arange(S.L)[bj0 == b] + 1).sum()) for b in range(nb0)])
+        wES = (1.0 / (nj0 * cpw / nj0.sum())) * (Dk.keep.reshape(-1, 1) > 0) / 65.0 / nb0   # (66, nb)
     rho = torch.zeros(L, 66, 2)
     g = torch.Generator().manual_seed(7)
     n = 0
@@ -66,10 +79,23 @@ def main():
             e = Dk.start(x, doy, hist, g)
             for k in range(L):
                 x, e, H, _ = Dk.day(x, e, doy + k, tis[:, k], k, g)
+                dev = e                                                   # the members' offsets, units of s
+                if Fm is not None:
+                    dev = Fm.transport(e, Fm.cond(x, H, doy + k + 1, k + 1), H, g)
+                    path[k] += np.array(Fm.last_path) * len(j)
+                # the energy score in the band-weighted norm |f|_w^2 = sum_c sum_j w_cj |P_j f_c|^2, w = 1 / (the
+                # error's own band power of that lead is not known beforehand: the climatological band power c_cj)
+                mem = dev if Fm is not None else torch.cat([e, -e], 1)
+                er = ((truth[:, k] - x) / Dk.s)[:, None]
+                nrm = lambda f: (band_pw(f) * wES).sum((-1, -2)).sqrt()  # noqa: E731  (B, M)
+                d1 = nrm(mem - er).mean(1)
+                M = mem.shape[1]
+                d2 = sum(nrm(mem - mem.roll(q, 1)).mean(1) for q in range(1, M)) / (M - 1)
+                es[k] += np.array([float(d1.sum()), float(0.5 * d2.sum()), float((d1 - 0.5 * d2).sum())])
                 er = torch.exp(Dk.last["r"])[:, None]
                 eq, new = Dk.last["p"] * er, Dk.last["hxi"] * er          # (B, P, 66, H, W)
                 sums["err"][k] += S.spectrum((truth[:, k] - x) / Dk.s).sum(0)
-                sums["dev"][k] += S.spectrum(e).mean(1).sum(0)
+                sums["dev"][k] += S.spectrum(dev).mean(1).sum(0)
                 sums["eq"][k] += S.spectrum(eq).mean(1).sum(0)
                 sums["new"][k] += S.spectrum(new).mean(1).sum(0)
                 rho[k, :, 0] += (eq.pow(2) * w).mean((1, 3, 4)).sum(0)
@@ -96,8 +122,14 @@ def main():
     out["w2_band"] = {v: (nj * (np.sqrt(np.array(out["dev"][v]) / nj) - np.sqrt(np.array(out["err"][v]) / nj)) ** 2).tolist()
                       for v in out["dev"]}
     out["w2"] = {v: np.sum(out["w2_band"][v], -1).tolist() for v in out["dev"]}
-    json.dump(out, open(a.json, "w"))
     f = lambda v: " ".join(f"{x:6.3f}" for x in v)  # noqa: E731
+    out["energy_score"] = (es[:, 2] / n).tolist()
+    out["energy_score_parts"] = (es[:, :2] / n).tolist()
+    if Fm is not None:
+        out["path_kinetic_over_displacement"] = (path[:, 0] / np.maximum(path[:, 1], 1e-12)).tolist()
+        print("path kinetic / displacement at leads 1/5/10:", f([out["path_kinetic_over_displacement"][q] for q in (0, 4, 9) if q < L]))
+    print("band-weighted energy score at leads 1/5/10:", " ".join(f"{out['energy_score'][q]:.4f}" for q in (0, 4, 9) if q < L))
+    json.dump(out, open(a.json, "w"))
     print("bands (degrees):", out["meta"]["bands"])
     for v in ("all",) + VARS:
         print(f"== {v}: rho_eq at leads 1/5/10 = {f([out['rho_eq'][v][q] for q in (0, 4, 9) if q < L])}"

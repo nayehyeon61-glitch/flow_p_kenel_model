@@ -111,11 +111,18 @@ class DeviationFlow(nn.Module):
         c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
         n = steps or self.cfg.steps
         dt = 1.0 / n
+        z0, kin = z, 0.0
         for i in range(n):
             t = torch.full((z.shape[0],), i * dt, device=z.device)
             k1 = self.velocity(z, t, c, sig)
             k2 = self.velocity(z + dt * k1, t + dt, c, sig)
-            z = z + 0.5 * dt * (k1 + k2)
+            v = 0.5 * (k1 + k2)
+            kin = kin + dt * (v / sig).pow(2).mean()
+            z = z + dt * v
+        # how straight the paths are (Benamou-Brenier): the kinetic energy int |v|^2 dtau over the squared
+        # displacement |T(z) - z|^2 (units of sigma); 1 = straight lines at constant speed, the OT geodesic
+        disp = ((z - z0) / sig).pow(2).mean()
+        self.last_path = (float(kin), float(disp))
         return z.view(B, P, *z.shape[1:])
 
     @torch.no_grad()
