@@ -38,6 +38,8 @@ day-L state still tells about the truth: the unpredictable part of the mean is r
 """
 
 import math
+
+import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
@@ -323,3 +325,27 @@ class EntropyDeviationKernel(nn.Module):
             out.append(self.members(x, e, self.s))
             ent.append(H + HALF_LOG_2PIE)
         return torch.stack(out, 2), torch.stack(ent, 1)
+
+
+class TotalEnergy:
+    """The dry total energy per unit mass of a state, area- and level-mean: c_p T + 1/2 (u^2 + v^2) over the 13
+    pressure levels (J/kg), from the z-scored dynamic channels (66). The functional of the physical entropy
+    constraint (design, step 8): the day's change of the energy of a member should stay near the mean's."""
+
+    CP = 1004.0
+
+    def __init__(self, names, mean, std, lat):
+        dyn = [n for n in names if n != "tisr"] if len(names) == 67 else list(names)
+        idx = lambda pre: [i for i, n in enumerate(dyn) if n[0] == pre and n[1:].isdigit()]  # noqa: E731
+        self.t, self.u, self.v = idx("t"), idx("u"), idx("v")
+        keep = [i for i, n in enumerate(names) if n != "tisr"] if len(names) == 67 else list(range(len(names)))
+        m, s = np.asarray(mean)[keep], np.asarray(std)[keep]
+        self.m, self.s = torch.tensor(m, dtype=torch.float32), torch.tensor(s, dtype=torch.float32)
+        w = np.cos(np.deg2rad(np.asarray(lat)))
+        self.w = torch.tensor(w / w.mean(), dtype=torch.float32).view(-1, 1)
+
+    def __call__(self, x):
+        """x (..., 66, H, W) z-scored -> (...,) J/kg."""
+        phys = lambda i: x[..., i, :, :] * self.s[i, None, None] + self.m[i, None, None]  # noqa: E731
+        e = self.CP * phys(self.t) + 0.5 * (phys(self.u) ** 2 + phys(self.v) ** 2)
+        return (e * self.w).mean((-1, -2, -3))

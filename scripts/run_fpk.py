@@ -28,7 +28,8 @@ from fpk.env import DYN, TISR, contract, pgfm_args, rkt  # noqa: E402
 from fpk.ensemble import Scorer, crps_torch, rollout  # noqa: E402
 from fpk.flow import FlowConfig, KernelFlow  # noqa: E402
 from fpk.devflow import DevFlowConfig, DeviationFlow  # noqa: E402
-from fpk.devkernel import DevConfig, EntropyDeviationKernel  # noqa: E402
+from fpk.devkernel import DevConfig, EntropyDeviationKernel, TotalEnergy  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 from fpk.kernel import KernelConfig, PhysicsKernel  # noqa: E402
 from pgcfm.kai_tend import core_step  # noqa: E402
 
@@ -213,11 +214,19 @@ def cmd_devk(a, rest):
         miss = Dk.load_state_dict(ck["state"], strict=False)
         assert not miss.unexpected_keys, miss
     Dk.through = a.through
+    if a.energy_weight:
+        names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
+        TE = TotalEnergy(names, cl.mean, cl.std, cl.lat)
     W, Dmax = int(getattr(core, "mem", 0)), max(a.days)
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
     tr, vr = D.Pairs(years, a.seed, hist=W, ahead=Dmax), D.Pairs(va, a.seed + 1, hist=W, ahead=Dmax)
     w = D.area_weights(cl.lat).to(dev)
+    if a.energy_weight:  # the spread of the data's daily change of total energy (training years)
+        ey = np.concatenate([years[y][:, DYN] for y in sorted(years)[-2:]])
+        et = TE(torch.from_numpy(ey).float())
+        sig_E = float((et[1:] - et[:-1]).std())
+        log(dict(total_energy_daily_change_std=round(sig_E, 3)))
     params = [p_ for p_ in Dk.parameters() if p_.requires_grad]
     cn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_.startswith("cnet.")]
     rest_ = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and not n_.startswith("cnet.")]
@@ -234,11 +243,19 @@ def cmd_devk(a, rest):
         xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
         e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
         xb, ign, ent, prod, rm, es, vs = xd, [], [], [], [], [], []
+        xprev = xd
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
             i, h_ = Dk.ign(H, xb, yd[:, k], w)
             if a.band_weight:  # on the deviations before the detach: the band scales learn from it
                 i = i + a.band_weight * Dk.band_ign(e, xb.detach(), yd[:, k])
+            if a.energy_weight:
+                # the physical constraint: a member's change of total energy over the day stays within k sigma of
+                # the mean's (sigma = the spread of the data's daily change of energy, measured once)
+                xm = Dk.members(xb.detach(), e, Dk.s)                                   # (B, 2P, 66, H, W)
+                dE = (TE(xm) - TE(xprev[:, None])) - (TE(xb.detach()) - TE(xprev))[:, None]
+                i = i + a.energy_weight * F.relu(dE.abs() / sig_E - a.energy_k).pow(2).mean()
+            xprev = xb.detach()
             e = e.detach()
             es.append((xb - yd[:, k]) / Dk.s)
             vs.append(torch.exp(2 * H))
@@ -615,6 +632,9 @@ def main(argv=None):
     d.add_argument("--cloud-mean", action="store_true", help="the mean = the average of the equation over the cloud")
     d.add_argument("--correct", action="store_true",
                    help="chained kernel p(x_t | x_(t-1)): correct the mean (G of the new state) and the entropy at x_t")
+    d.add_argument("--energy-weight", type=float, default=0.0,
+                   help="penalty on members whose daily change of total energy leaves the mean's by > k sigma")
+    d.add_argument("--energy-k", type=float, default=1.0)
     d.add_argument("--band-scale", action="store_true", help="entropy by scale: band-wise rescaling of the deviations")
     d.add_argument("--band-weight", type=float, default=0.0, help="weight of the band-wise log score (needs the SHT)")
     d.add_argument("--r-dissip", action="store_true", help="the learned residual r <= 0 (noise makes the positive part)")
