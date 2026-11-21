@@ -250,3 +250,25 @@ def test_deviation_flow_starts_as_the_kernel(core):
     loss = Fm.loss(e1.detach(), xb, xb + 0.2, Fm.cond(xb, H1.detach(), doy + 1, 1), H1.detach(), torch.ones(1, 1, H, 1))
     loss.backward()
     assert all(p.grad is None for p in D.parameters()) and any(p.grad is not None for p in Fm.net.parameters())
+
+
+@pytest.mark.parametrize("which", ["core", "mcore"])
+def test_correction_kernel_starts_as_the_chain_and_learns_the_mean(which, request):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    c = request.getfixturevalue(which)
+    W_ = int(getattr(c, "mem", 0))
+    torch.manual_seed(0)
+    A = EntropyDeviationKernel(c, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3))
+    Bk = EntropyDeviationKernel(c, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, correct=True))
+    Bk.load_state_dict({k: v for k, v in A.state_dict().items()}, strict=False)
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 3, H, W)
+    hist = torch.randn(2, W_, 66, H, W) if W_ else None
+    a, ha = A.rollout(xd, doy, tis, 3, hist, torch.Generator().manual_seed(4))
+    b, hb = Bk.rollout(xd, doy, tis, 3, hist, torch.Generator().manual_seed(4))
+    assert torch.allclose(a, b, atol=1e-5) and torch.allclose(ha, hb, atol=1e-5)  # zero head: the uncorrected chain
+    e = Bk.start(xd, doy, hist)
+    xb, e1, H1, _ = Bk.day(xd, e, doy, tis[:, 0], 0)
+    ign, _ = Bk.ign(H1, xb, xb.detach() + 0.3 * Bk.s, torch.ones(1, 1, H, 1))
+    ign.backward()
+    g = Bk.cnet.head.weight.grad if hasattr(Bk.cnet, "head") else [p for p in Bk.cnet.parameters()][-2].grad
+    assert g is not None and g[:66].abs().sum() > 0 and g[66:].abs().sum() > 0  # the mean and the entropy both learn

@@ -205,7 +205,12 @@ def cmd_devk(a, rest):
     torch.manual_seed(a.seed)
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
-    Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth)).to(dev)
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth,
+                                               cloud_mean=a.cloud_mean, correct=a.correct)).to(dev)
+    if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
+        ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
+        miss = Dk.load_state_dict(ck["state"], strict=False)
+        assert not miss.unexpected_keys, miss
     W, Dmax = int(getattr(core, "mem", 0)), max(a.days)
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
@@ -223,16 +228,18 @@ def cmd_devk(a, rest):
             ys, tns = ys[:, None], tns[:, None]
         xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
         e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
-        xb, ign, ent, prod = xd, [], [], []
+        xb, ign, ent, prod, rm = xd, [], [], [], []
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
             e = e.detach()
             i, h_ = Dk.ign(H, xb, yd[:, k], w)
+            rm.append(float((((xb - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()))
+            xb = xb.detach()  # every link is fitted on the chain's own states; no gradient through the core
             ign.append(i)
             ent.append(float(h_))
             m = Dk.keep * w
             prod.append((float((st * m).sum() / m.expand_as(st).sum()), float((r * m).sum() / m.expand_as(r).sum())))
-        return ign, ent, prod
+        return ign, ent, prod, rm
 
     def val():
         Dk.eval()
@@ -243,14 +250,19 @@ def cmd_devk(a, rest):
         ign = np.mean([[float(v) for v in q[0]] for q in r], 0)
         ent = np.mean([q[1] for q in r], 0)
         # calibrated: IGN - H = 1/2 (E[err^2] = variance); > 1/2 = too sure, < 1/2 = too wide
-        return [round(float(v), 3) for v in ign], [round(float(v), 3) for v in ign - ent]
+        mse = np.sqrt(np.mean([q[3] for q in r], 0))  # RMSE of the mean in units of s
+        return [round(float(v), 3) for v in ign], [round(float(v), 3) for v in ign - ent], [round(float(v), 3) for v in mse]
+
+    def save():
+        state = {k: v for k, v in Dk.state_dict().items() if not k.startswith("core.")}
+        torch.save(dict(state=state, cfg=Dk.cfg.__dict__, core_tag=a.core_tag), os.path.join(a.out, f"{a.tag}.pt"))
 
     t0 = time.time()
-    i0, g0 = val()
-    log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0)))
+    i0, g0, m0 = val()
+    log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0)))
     for it in range(1, a.iters + 1):
         days = a.days[min(len(a.days) - 1, (it - 1) * len(a.days) // a.iters)]
-        ign, ent, prod = run(tr(a.batch), days)
+        ign, ent, prod, _ = run(tr(a.batch), days)
         loss = sum(ign) / days
         opt.zero_grad()
         loss.backward()
@@ -258,12 +270,12 @@ def cmd_devk(a, rest):
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
-            vi, vg = val()
-            log(dict(it=it, days=days, ign=round(float(loss), 4), val_ign=vi, val_ign_minus_H=vg,
+            vi, vg, vm = val()
+            save()
+            log(dict(it=it, days=days, ign=round(float(loss), 4), val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
                      stretch=[round(p_[0], 3) for p_ in prod], r=[round(p_[1], 3) for p_ in prod],
                      h=round(float(Dk.h().mean()), 4), sec=round(time.time() - t0)))
-    state = {k: v for k, v in Dk.state_dict().items() if not k.startswith("core.")}
-    torch.save(dict(state=state, cfg=Dk.cfg.__dict__, core_tag=a.core_tag), os.path.join(a.out, f"{a.tag}.pt"))
+    save()
 
 
 def load_devk(a, core, tag):
@@ -272,6 +284,8 @@ def load_devk(a, core, tag):
         raise SystemExit(f"deviation kernel {tag} was fitted on core {ck['core_tag']}, not --core-tag {a.core_tag}")
     cfg = ck["cfg"]
     cfg["blocks"] = tuple(cfg["blocks"])
+    if getattr(a, "cloud_mean", False):  # diagnostic: a kernel fitted on the core's trajectory, scored with the cloud's mean
+        cfg["cloud_mean"] = True
     Dk = EntropyDeviationKernel(core, DevConfig(**cfg))
     miss = Dk.load_state_dict(ck["state"], strict=False)
     assert not miss.unexpected_keys and all(k.startswith("core.") for k in miss.missing_keys), miss
@@ -574,6 +588,10 @@ def main(argv=None):
     d.add_argument("--pairs", type=int, default=4)
     d.add_argument("--eps0", type=float, default=0.25)
     d.add_argument("--smooth", type=int, default=5)
+    d.add_argument("--cloud-mean", action="store_true", help="the mean = the average of the equation over the cloud")
+    d.add_argument("--correct", action="store_true",
+                   help="chained kernel p(x_t | x_(t-1)): correct the mean (G of the new state) and the entropy at x_t")
+    d.add_argument("--init", default="", help="start from this fitted deviation kernel")
     d.add_argument("--hidden", type=int, default=32)
     d.add_argument("--iters", type=int, default=800)
     d.add_argument("--batch", type=int, default=4)
@@ -623,6 +641,7 @@ def main(argv=None):
     s.add_argument("--max-ics", type=int, default=0)
     s.add_argument("--ic-batch", type=int, default=4)
     s.add_argument("--steps", type=int, default=6)
+    s.add_argument("--cloud-mean", action="store_true", help="devk arms: the cloud's mean (also for a kernel fitted without)")
     s.add_argument("--kernel-entropy", action="store_true", help="also the kernel's entropy along every trajectory")
     a, rest = p.parse_known_args(argv)
     rest = [r for r in rest if r != "--"]

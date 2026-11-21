@@ -4,7 +4,8 @@ The physical kernel of fpk.kernel lets every member run its own noisy trajectory
 deterministic core and the spread overshoots at long leads (docs/design_ko.md, sections 5 and 6). Here the two jobs
 are separated:
 
-    mean        xbar_(L+1) = Phi(xbar_L)                     the tendency core's own trajectory (with its memory)
+    mean        xbar_(L+1) = Phi(xbar_L)                     the tendency core's own trajectory (with its memory);
+                                                             ``cloud_mean``: the average of Phi over the members
     members     x^m_L = xbar_L +- s e^p_L                    P antithetic pairs of deviations e (units of s)
 
     direction   p^p = [Phi(xbar + s e^p) - Phi(xbar - s e^p)] / (2 s)        the equation carries the deviations:
@@ -27,6 +28,13 @@ Training: the Gaussian log score (IGN) of the data around the mean with the pred
 on every day of a rollout. Its minimum is the calibrated entropy, E[IGN] = H: the spread is the size of the actual
 error of the mean, so the long-lead overshoot is penalized directly. The core is frozen and no gradient goes through
 it (r and h are the trained parts, the deviations are detached between days).
+
+``correct``: the chain of transition kernels p(x_t | x_(t-1)) trained as a 10-day sequence. Every link is
+    transport   the equation's day of the mean and of the deviations (above)
+    correction  at the new x_t: mean += s exp(H) delta(x_t, G(x_t), cloud shift, m, ...), H += r2(...)
+and the sum of the days' log scores is the log likelihood of the sequence under the chain's Gaussian marginals. The
+links see the states the chain itself produced (not the data's), so the correction learns what the equation's
+day-L state still tells about the truth: the unpredictable part of the mean is removed and goes to the entropy.
 """
 
 import math
@@ -56,6 +64,9 @@ class DevConfig:
     r_max: float = 2.0        # |r| <= r_max (a day cannot change the size by more than e^r_max)
     hidden: int = 32
     blocks: tuple = (2, 2)
+    cloud_mean: bool = False  # the mean = the average of the equation over the cloud (not the core's one trajectory)
+    correct: bool = False     # the chained kernel p(x_t | x_(t-1)): at the new x_t a correction of the mean from the
+    #                           primitive-equation terms G(x_t) and a correction of the entropy (sequence training)
 
 
 class EntropyDeviationKernel(nn.Module):
@@ -73,6 +84,13 @@ class EntropyDeviationKernel(nn.Module):
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))  # zero head: r = bias
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
+        if cfg.correct:
+            # at the new state: x_t, G(x_t), the cloud's shift of the mean (mean of Phi over the members - Phi(xbar),
+            # the equation's own nonlinear correction), the day's tendency, log size before / after, the entropy
+            # H, static, time, lead, m. Out: delta (mean, units of the cloud's size exp(H)) and r2 (entropy); zero
+            # head, so the chain starts as the uncorrected kernel
+            c2 = 66 + n_g + 66 + 66 + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch
+            self.cnet = stateless_norm(Net(c2, 132, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -137,8 +155,16 @@ class EntropyDeviationKernel(nn.Module):
         else:
             y = core_step(core, xs, rep(doy), rep(tisr))
         y = y.view(B, n, *xbar.shape[1:])
+        shift = (y.mean(1) - phi0) / self.s * self.keep
+        if self.cfg.cloud_mean:
+            # xbar_(L+1) = (1 / 2P) sum_p [Phi(xbar + s e_p) + Phi(xbar - s e_p)]: the mean of the kernel sum. Where the
+            # equation is nonlinear over the cloud (the scales the cloud has decorrelated) this differs from
+            # Phi(xbar): the unpredictable part is averaged out by the equation itself, not by the core's training
+            phi0 = y.mean(1)
+            if self.mem:
+                core.fc = phi0
         p = (y[:, :P] - y[:, P:]) / (2 * self.s.unsqueeze(0)) * self.keep.unsqueeze(0)
-        return phi0, p, g
+        return phi0, p, g, shift
 
     def day(self, xbar, e, doy, tisr, lead: int, gen=None):
         """One day. xbar (B, 66, H, W) the mean, e (B, P, 66, H, W) the deviations of the day, ``lead`` = days since
@@ -146,7 +172,7 @@ class EntropyDeviationKernel(nn.Module):
         the variance of the next day in units of s^2; parts = (stretch, r): the day's entropy production split
         into the equation's stretching 1/2 log <p^2> / <e^2> (+ the new part) and the learned residual."""
         B, _, Hh, Ww = xbar.shape
-        phi0, p, g = self._equation(xbar, e, doy, tisr)
+        phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
         xi = smooth_noise(tuple(p.shape), xbar, gen) * self.keep.unsqueeze(0)
         q = p + self.h().unsqueeze(0) * xi
         le, lq = self.size(e), self.size(q)
@@ -158,6 +184,21 @@ class EntropyDeviationKernel(nn.Module):
         if self.mem:
             parts.append(self.core.m)
         r = self.cfg.r_max * torch.tanh((self.net(torch.cat(parts, 1)) + self.r_bias) / self.cfg.r_max) * self.keep
+        if self.cfg.correct:
+            # the correction kernel at the new x_t: the primitive-equation terms of the new state move the mean,
+            # and the entropy is corrected once more there
+            H0 = (lq + r).detach()
+            new = [phi0] + ([self.core.features(phi0).detach()] if self.gfeat else []) + [
+                shift, tend, le.detach(), lq.detach(), H0, self.core.static.expand(B, -1, -1, -1),
+                time_features((doy.float() + 1.0) * 24.0, Hh, Ww), xbar.new_full((B, 1, Hh, Ww), (lead + 1) / 10.0)]
+            if self.mem:
+                new.append(self.core.m)
+            out = self.cnet(torch.cat(new, 1))
+            delta = out[:, :66] * torch.exp(H0).clamp(max=20.0) * self.keep
+            r = r + self.cfg.r_max * torch.tanh(out[:, 66:] / self.cfg.r_max) * self.keep
+            phi0 = phi0 + self.s * delta
+            if self.mem:
+                self.core.fc = phi0.detach()  # the corrected mean is the forecast the memory's innovation refers to
         e_next = q * torch.exp(r)[:, None]
         return phi0, e_next, lq + r, (lq - le, r)
 
