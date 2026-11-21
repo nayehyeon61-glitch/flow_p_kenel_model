@@ -47,7 +47,7 @@ import torch.nn.functional as F
 
 from .env import time_features
 from .env import PGFM  # noqa: F401  (sys.path)
-from .kernel import ADV_STATE, smooth_noise
+from .kernel import ADV_STATE, MEM_STATE, smooth_noise
 from pgcfm.core import Net  # noqa: E402
 from pgcfm.kai_tend import core_step, stateless_norm  # noqa: E402
 from pgcfm.seqdct import _NetCfg  # noqa: E402
@@ -74,6 +74,7 @@ class EntropyDeviationKernel(nn.Module):
     def __init__(self, core, cfg: DevConfig = DevConfig()):
         super().__init__()
         self.core, self.cfg = core, cfg
+        self.through = 0  # training: days of the gradient through the mean's path of the equation (0 = none)
         for p in core.parameters():
             p.requires_grad_(False)
         self.gfeat = bool(getattr(core.cfg, "gfeat", False))
@@ -127,17 +128,34 @@ class EntropyDeviationKernel(nn.Module):
         B, P = xd.shape[0], self.cfg.pairs
         return self.cfg.eps0 * smooth_noise((B, P) + tuple(xd.shape[1:]), xd, gen) * self.keep.unsqueeze(0)
 
-    @torch.no_grad()
     def _equation(self, xbar, e, doy, tisr):
-        """The mean's day and the deviations carried by the equation: (Phi(xbar), p (B, P, 66, H, W), G(xbar))."""
+        """The mean's day and the deviations carried by the equation: (Phi(xbar), p (B, P, 66, H, W), G(xbar)).
+        ``self.through``: the mean's own day keeps its graph (the core's weights are frozen, the gradient goes to
+        xbar and the memory), so a correction of day t is scored by the days after it."""
         B, P = e.shape[:2]
         core, hours = self.core, doy.float() * 24.0
-        if self.mem:
-            core.remember(xbar)
-            core.started = True
-            phi0 = core._advance(xbar, hours, tisr)
-        else:
-            phi0 = core_step(core, xbar, doy, tisr)
+        with torch.set_grad_enabled(bool(self.through) and torch.is_grad_enabled()):
+            if self.mem:
+                core.remember(xbar)
+                core.started = True
+                phi0 = core._advance(xbar, hours, tisr)
+            else:
+                phi0 = core_step(core, xbar, doy, tisr)
+        with torch.no_grad():
+            out = self._cloud(xbar.detach(), e, doy, tisr, phi0)
+        return (out[3] if self.cfg.cloud_mean else phi0,) + out[:3]
+
+    def detach_state(self):
+        """Cut the graph of the mean's memory (between the windows of the gradient)."""
+        for k in MEM_STATE:
+            v = getattr(self.core, k, None)
+            if torch.is_tensor(v):
+                setattr(self.core, k, v.detach())
+
+    def _cloud(self, xbar, e, doy, tisr, phi0):
+        B, P = e.shape[:2]
+        core, hours = self.core, doy.float() * 24.0
+        phi0 = phi0.detach()
         g = core.features(xbar) if self.gfeat else None
         n = 2 * P
         xs = (xbar[:, None] + self.s.unsqueeze(0) * torch.cat([e, -e], 1)).flatten(0, 1)
@@ -165,7 +183,7 @@ class EntropyDeviationKernel(nn.Module):
             if self.mem:
                 core.fc = phi0
         p = (y[:, :P] - y[:, P:]) / (2 * self.s.unsqueeze(0)) * self.keep.unsqueeze(0)
-        return phi0, p, g, shift
+        return p, g, shift, phi0
 
     def day(self, xbar, e, doy, tisr, lead: int, gen=None):
         """One day. xbar (B, 66, H, W) the mean, e (B, P, 66, H, W) the deviations of the day, ``lead`` = days since
@@ -174,6 +192,7 @@ class EntropyDeviationKernel(nn.Module):
         into the equation's stretching 1/2 log <p^2> / <e^2> (+ the new part) and the learned residual."""
         B, _, Hh, Ww = xbar.shape
         phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
+        g = None if g is None else g.detach()
         xi = smooth_noise(tuple(p.shape), xbar, gen) * self.keep.unsqueeze(0)
         q = p + self.h().unsqueeze(0) * xi
         le, lq = self.size(e), self.size(q)

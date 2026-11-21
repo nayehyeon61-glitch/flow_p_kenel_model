@@ -211,6 +211,7 @@ def cmd_devk(a, rest):
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
         miss = Dk.load_state_dict(ck["state"], strict=False)
         assert not miss.unexpected_keys, miss
+    Dk.through = a.through
     W, Dmax = int(getattr(core, "mem", 0)), max(a.days)
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
@@ -231,18 +232,27 @@ def cmd_devk(a, rest):
             ys, tns = ys[:, None], tns[:, None]
         xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
         e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
-        xb, ign, ent, prod, rm = xd, [], [], [], []
+        xb, ign, ent, prod, rm, es, vs = xd, [], [], [], [], [], []
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
             e = e.detach()
             i, h_ = Dk.ign(H, xb, yd[:, k], w)
+            es.append((xb - yd[:, k]) / Dk.s)
+            vs.append(torch.exp(2 * H))
             rm.append(float((((xb - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()))
-            xb = xb.detach()  # every link is fitted on the chain's own states; no gradient through the core
+            if not a.through or (k + 1) % a.through == 0:
+                xb = xb.detach()  # the window of the gradient through the chain ends (--through 0: every day)
+                Dk.detach_state()
             ign.append(i)
             ent.append(float(h_))
             m = Dk.keep * w
             prod.append((float((st * m).sum() / m.expand_as(st).sum()), float((r * m).sum() / m.expand_as(r).sum())))
-        return ign, ent, prod, rm
+        # the sequence term: the error of the mean of the whole sequence (what piles up with one sign over the days;
+        # the days' own scores see it as independent errors), in units of the sequence's mean variance
+        m = Dk.keep * w
+        eb, vb = torch.stack(es, 1).mean(1), torch.stack(vs, 1).mean(1).detach()
+        seq = (eb.pow(2) / vb * m).sum() / m.expand_as(eb).sum()
+        return ign, ent, prod, rm, seq
 
     def val():
         Dk.eval()
@@ -254,33 +264,35 @@ def cmd_devk(a, rest):
         ent = np.mean([q[1] for q in r], 0)
         # calibrated: IGN - H = 1/2 (E[err^2] = variance); > 1/2 = too sure, < 1/2 = too wide
         mse = np.sqrt(np.mean([q[3] for q in r], 0))  # RMSE of the mean in units of s
-        return [round(float(v), 3) for v in ign], [round(float(v), 3) for v in ign - ent], [round(float(v), 3) for v in mse]
+        return ([round(float(v), 3) for v in ign], [round(float(v), 3) for v in ign - ent],
+                [round(float(v), 3) for v in mse], round(float(np.mean([float(q[4]) for q in r])), 4))
 
     def save():
         state = {k: v for k, v in Dk.state_dict().items() if not k.startswith("core.")}
         torch.save(dict(state=state, cfg=Dk.cfg.__dict__, core_tag=a.core_tag), os.path.join(a.out, f"{a.tag}.pt"))
 
     t0 = time.time()
-    i0, g0, m0 = val()
-    log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0)))
-    best = sum(i0) if a.init else float("inf")
+    i0, g0, m0, s0 = val()
+    log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0, seq=s0)))
+    score = lambda vi_, vs_: sum(vi_) / len(vi_) + a.seq_weight * vs_  # noqa: E731
+    best = score(i0, s0) if a.init else float("inf")
     if a.init:
         save()
     for it in range(1, a.iters + 1):
         days = a.days[min(len(a.days) - 1, (it - 1) * len(a.days) // a.iters)]
-        ign, ent, prod, _ = run(tr(a.batch), days)
-        loss = sum(ign) / days
+        ign, ent, prod, _, seq = run(tr(a.batch), days)
+        loss = sum(ign) / days + a.seq_weight * seq
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
-            vi, vg, vm = val()
-            if sum(vi) < best:  # the checkpoint is the best validation log score of the sequence
-                best = sum(vi)
+            vi, vg, vm, vs_ = val()
+            if score(vi, vs_) < best:  # the checkpoint is the best validation loss of the sequence
+                best = score(vi, vs_)
                 save()
-            log(dict(it=it, days=days, ign=round(float(loss), 4), best=round(best, 3), val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
+            log(dict(it=it, days=days, ign=round(float(loss), 4), best=round(best, 4), val_seq=vs_, val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
                      stretch=[round(p_[0], 3) for p_ in prod], r=[round(p_[1], 3) for p_ in prod],
                      h=round(float(Dk.h().mean()), 4), sec=round(time.time() - t0)))
 
@@ -599,6 +611,10 @@ def main(argv=None):
     d.add_argument("--correct", action="store_true",
                    help="chained kernel p(x_t | x_(t-1)): correct the mean (G of the new state) and the entropy at x_t")
     d.add_argument("--init", default="", help="start from this fitted deviation kernel")
+    d.add_argument("--through", type=int, default=0,
+                   help="days of the gradient through the mean's path of the chain (a correction answers for later days)")
+    d.add_argument("--seq-weight", type=float, default=0.0,
+                   help="weight of the sequence term: the squared error of the sequence's mean over its mean variance")
     d.add_argument("--lr-correct", type=float, default=0.0, help="learning rate of the correction net (0 = --lr)")
     d.add_argument("--hidden", type=int, default=32)
     d.add_argument("--iters", type=int, default=800)

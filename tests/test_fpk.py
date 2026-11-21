@@ -272,3 +272,30 @@ def test_correction_kernel_starts_as_the_chain_and_learns_the_mean(which, reques
     ign.backward()
     g = Bk.cnet.head.weight.grad if hasattr(Bk.cnet, "head") else [p for p in Bk.cnet.parameters()][-2].grad
     assert g is not None and g[:66].abs().sum() > 0 and g[66:].abs().sum() > 0  # the mean and the entropy both learn
+
+
+def test_gradient_through_the_chain_reaches_an_earlier_correction(mcore):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    torch.manual_seed(0)
+    Dk = EntropyDeviationKernel(mcore, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, correct=True))
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 2, H, W)
+    hist = torch.randn(2, int(mcore.mem), 66, H, W)
+
+    def grad_of_day2(through):
+        Dk.through = through
+        Dk.zero_grad()
+        e = Dk.start(xd, doy, hist)
+        x1, e1, _, _ = Dk.day(xd, e, doy, tis[:, 0], 0)
+        probe = torch.zeros_like(x1, requires_grad=True)  # a correction of day 1
+        x1 = x1 + probe
+        if not through:
+            x1 = x1.detach()
+            Dk.detach_state()
+        x2, _, H2, _ = Dk.day(x1, e1.detach(), doy + 1, tis[:, 1], 1)
+        Dk.ign(H2, x2, x2.detach() + 0.3 * Dk.s, torch.ones(1, 1, H, 1))[0].backward()
+        return probe.grad
+
+    assert grad_of_day2(0) is None
+    g = grad_of_day2(2)
+    assert g is not None and float(g.abs().sum()) > 0
+    assert all(p.grad is None for p in mcore.parameters())  # the equation's weights stay fixed
