@@ -316,3 +316,21 @@ def test_spherical_harmonics_roundtrip_parseval_and_isotropic_noise():
     v = n.pow(2).mean((0, 2))
     assert abs(float(v.mean()) - 1.0) < 0.05 and float(v.max() / v.min()) < 1.15  # unit variance, isotropic
     assert int(S.spectrum(n).mean(0).argmax()) == 6
+
+
+def test_sphere_noise_starts_like_the_smooth_noise_and_learns(core):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, noise="sphere"))
+    xi = Dk.new_noise((50, 2, 66, H, W), torch.zeros(1), torch.Generator().manual_seed(0))
+    assert abs(float(xi.pow(2).mean()) - 1.0) < 0.1                     # unit variance like smooth_noise
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 2, H, W)
+    with torch.no_grad():
+        Dk.rho_raw.fill_(2.0)
+    e = Dk.start(xd, doy)
+    x1, e1, H1, _ = Dk.day(xd, e, doy, tis[:, 0], 0)
+    xi1 = Dk._xi.clone()
+    x2, e2, H2, _ = Dk.day(x1, e1, doy + 1, tis[:, 1], 1)
+    c = float((Dk._xi * xi1).mean() / (xi1.pow(2).mean().sqrt() * Dk._xi.pow(2).mean().sqrt()))
+    assert c > 0.8                                                       # AR(1) with rho = tanh(2) = 0.96
+    Dk.ign(H2, x2, x2.detach() + 0.3 * Dk.s, torch.ones(1, 1, H, 1))[0].backward()
+    assert Dk.a_log.grad is not None and float(Dk.a_log.grad.abs().sum()) > 0

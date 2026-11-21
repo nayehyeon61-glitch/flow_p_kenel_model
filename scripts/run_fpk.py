@@ -206,7 +206,8 @@ def cmd_devk(a, rest):
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
     Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth,
-                                               cloud_mean=a.cloud_mean, correct=a.correct)).to(dev)
+                                               cloud_mean=a.cloud_mean, correct=a.correct, noise=a.noise,
+                                               r_dissip=a.r_dissip)).to(dev)
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
         miss = Dk.load_state_dict(ck["state"], strict=False)
@@ -246,7 +247,8 @@ def cmd_devk(a, rest):
             ign.append(i)
             ent.append(float(h_))
             m = Dk.keep * w
-            prod.append((float((st * m).sum() / m.expand_as(st).sum()), float((r * m).sum() / m.expand_as(r).sum())))
+            pe, pn, pr = Dk.last["prod"]
+            prod.append(tuple(float((t * m).sum() / m.expand_as(t).sum()) for t in (pe, pn, pr)))
         # the sequence term: the error of the mean of the whole sequence (what piles up with one sign over the days;
         # the days' own scores see it as independent errors), in units of the sequence's mean variance
         m = Dk.keep * w
@@ -293,7 +295,8 @@ def cmd_devk(a, rest):
                 best = score(vi, vs_)
                 save()
             log(dict(it=it, days=days, ign=round(float(loss), 4), best=round(best, 4), val_seq=vs_, val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
-                     stretch=[round(p_[0], 3) for p_ in prod], r=[round(p_[1], 3) for p_ in prod],
+                     prod_eq=[round(p_[0], 3) for p_ in prod], prod_noise=[round(p_[1], 3) for p_ in prod],
+                     r=[round(p_[2], 3) for p_ in prod],
                      h=round(float(Dk.h().mean()), 4), sec=round(time.time() - t0)))
 
 
@@ -610,6 +613,9 @@ def main(argv=None):
     d.add_argument("--cloud-mean", action="store_true", help="the mean = the average of the equation over the cloud")
     d.add_argument("--correct", action="store_true",
                    help="chained kernel p(x_t | x_(t-1)): correct the mean (G of the new state) and the entropy at x_t")
+    d.add_argument("--r-dissip", action="store_true", help="the learned residual r <= 0 (noise makes the positive part)")
+    d.add_argument("--noise", default="smooth", choices=["smooth", "sphere"],
+                   help="the new part's field: 3 x 3 smoothed, or spherical harmonics with learned band amplitudes + AR(1)")
     d.add_argument("--init", default="", help="start from this fitted deviation kernel")
     d.add_argument("--through", type=int, default=0,
                    help="days of the gradient through the mean's path of the chain (a correction answers for later days)")

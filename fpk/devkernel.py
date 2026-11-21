@@ -48,6 +48,7 @@ import torch.nn.functional as F
 from .env import time_features
 from .env import PGFM  # noqa: F401  (sys.path)
 from .kernel import ADV_STATE, MEM_STATE, smooth_noise
+from .sphere import SHT, bands
 from pgcfm.core import Net  # noqa: E402
 from pgcfm.kai_tend import core_step, stateless_norm  # noqa: E402
 from pgcfm.seqdct import _NetCfg  # noqa: E402
@@ -68,6 +69,11 @@ class DevConfig:
     correct: bool = False     # the chained kernel p(x_t | x_(t-1)): at the new x_t a correction of the mean from the
     #                           primitive-equation terms G(x_t) and a correction of the entropy (sequence training)
     d_max: float = 0.25       # the mean's correction of one day is at most d_max x the cloud's size exp(H)
+    r_dissip: bool = False    # r = -softplus(-u) <= 0: the noise spectrum makes all the positive production
+    #                           (r_plus = 1/2 log(1 + Q / <p^2>)), the learned residual only removes (r_minus)
+    noise: str = "smooth"     # the new part's field: "smooth" (3 x 3 mean of white noise) or "sphere": spherical
+    #                           harmonics with a learned amplitude per Littlewood-Paley band and channel (starts as
+    #                           the isotropic copy of "smooth") and an AR(1) correlation in time per band
 
 
 class EntropyDeviationKernel(nn.Module):
@@ -86,6 +92,20 @@ class EntropyDeviationKernel(nn.Module):
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))  # zero head: r = bias
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
+        if cfg.noise == "sphere":
+            H = int(core.static.shape[-2])
+            lat = [-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]  # the data's equiangular grid, south to north
+            self.sht = SHT(lat)
+            bj, nb = bands(self.sht.L)
+            self.register_buffer("band_of", bj)
+            # the degree spectrum of smooth_noise (unit variance): the start of the band amplitudes
+            with torch.no_grad():
+                z = smooth_noise((512, 1, H, 2 * H), self.sht.syn, torch.Generator().manual_seed(0))
+                base = self.sht.spectrum(z).mean(0).squeeze(0)
+            self.register_buffer("base_amp", base.clamp(min=1e-12).sqrt())  # (L,)
+            self.a_log = nn.Parameter(torch.zeros(66, nb))      # log amplitude per channel and band
+            self.rho_raw = nn.Parameter(torch.zeros(nb))         # AR(1) in time per band, rho = tanh(raw)
+        self._xi = None
         if cfg.correct:
             # at the new state: x_t, G(x_t), the cloud's shift of the mean (mean of Phi over the members - Phi(xbar),
             # the equation's own nonlinear correction), the day's tendency, log size before / after, the entropy
@@ -119,6 +139,24 @@ class EntropyDeviationKernel(nn.Module):
             v = F.avg_pool2d(F.pad(F.pad(v, (r, r, 0, 0), mode="circular"), (0, 0, r, r), mode="reflect"), k, 1)
         return 0.5 * torch.log(v + 1e-8)
 
+    def amp(self):
+        """(66, L): the new part's amplitude per channel and degree (sphere noise)."""
+        return torch.exp(self.a_log)[:, self.band_of] * self.base_amp
+
+    def new_noise(self, shape, like, gen=None):
+        """The new part's unit field xi (shape (B, P, 66, H, W)); sphere noise keeps its last draw for the AR(1)."""
+        if self.cfg.noise != "sphere":
+            return smooth_noise(shape, like, gen)
+        eta = self.sht.noise(self.amp(), tuple(shape[:2]) + (66,), gen)  # differentiable in the amplitudes
+        if self._xi is None or self._xi.shape != eta.shape:
+            xi = eta
+        else:  # band by band: xi_t = rho xi_(t-1) + sqrt(1 - rho^2) eta_t, done in spectral space
+            rho = torch.tanh(self.rho_raw)[self.band_of]                      # (L,)
+            cp, ce = self.sht.analysis(self._xi), self.sht.analysis(eta)
+            xi = self.sht.synthesis(rho[:, None] * cp + torch.sqrt(1 - rho ** 2)[:, None] * ce)
+        self._xi = xi.detach()
+        return xi
+
     @torch.no_grad()
     def start(self, xd, doy, hist=None, gen=None):
         """The trajectory starts at x (B, 66, H, W): the mean's memory (memory core) and the initial deviations
@@ -126,6 +164,7 @@ class EntropyDeviationKernel(nn.Module):
         if self.mem:
             self.core.reset(hist, doy.float() * 24.0, xd)
         B, P = xd.shape[0], self.cfg.pairs
+        self._xi = None
         return self.cfg.eps0 * smooth_noise((B, P) + tuple(xd.shape[1:]), xd, gen) * self.keep.unsqueeze(0)
 
     def _equation(self, xbar, e, doy, tisr):
@@ -193,7 +232,7 @@ class EntropyDeviationKernel(nn.Module):
         B, _, Hh, Ww = xbar.shape
         phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
         g = None if g is None else g.detach()
-        xi = smooth_noise(tuple(p.shape), xbar, gen) * self.keep.unsqueeze(0)
+        xi = self.new_noise(tuple(p.shape), xbar, gen) * self.keep.unsqueeze(0)
         q = p + self.h().unsqueeze(0) * xi
         le, lq = self.size(e), self.size(q)
         tend = ((phi0 - xbar) / self.s * self.keep).detach()
@@ -203,7 +242,11 @@ class EntropyDeviationKernel(nn.Module):
                                                            xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
         if self.mem:
             parts.append(self.core.m)
-        r = self.cfg.r_max * torch.tanh((self.net(torch.cat(parts, 1)) + self.r_bias) / self.cfg.r_max) * self.keep
+        u = self.net(torch.cat(parts, 1)) + self.r_bias
+        if self.cfg.r_dissip:
+            r = -self.cfg.r_max * torch.tanh(F.softplus(-u) / self.cfg.r_max) * self.keep
+        else:
+            r = self.cfg.r_max * torch.tanh(u / self.cfg.r_max) * self.keep
         if self.cfg.correct:
             # the correction kernel at the new x_t: the primitive-equation terms of the new state move the mean,
             # and the entropy is corrected once more there
@@ -222,7 +265,10 @@ class EntropyDeviationKernel(nn.Module):
             if self.mem:
                 self.core.fc = phi0.detach()  # the corrected mean is the forecast the memory's innovation refers to
         e_next = q * torch.exp(r)[:, None]
-        self.last = dict(p=p, hxi=q - p, r=r)  # the parts of the day (diagnostics)
+        # the parts of the day (diagnostics): the day's production H_(L+1) - H_L split into the equation's stretching
+        # 1/2 log <p^2> - H_L, the noise's 1/2 log <q^2> - 1/2 log <p^2> (>= 0) and the learned residual r
+        lp = self.size(p)
+        self.last = dict(p=p, hxi=q - p, r=r, prod=((lp - le).detach(), (lq - lp).detach(), r.detach()))
         return phi0, e_next, lq + r, (lq - le, r)
 
     def ign(self, H, xbar, truth, w):
