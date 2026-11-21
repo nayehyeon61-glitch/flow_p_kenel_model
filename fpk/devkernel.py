@@ -67,6 +67,7 @@ class DevConfig:
     cloud_mean: bool = False  # the mean = the average of the equation over the cloud (not the core's one trajectory)
     correct: bool = False     # the chained kernel p(x_t | x_(t-1)): at the new x_t a correction of the mean from the
     #                           primitive-equation terms G(x_t) and a correction of the entropy (sequence training)
+    d_max: float = 0.25       # the mean's correction of one day is at most d_max x the cloud's size exp(H)
 
 
 class EntropyDeviationKernel(nn.Module):
@@ -194,7 +195,9 @@ class EntropyDeviationKernel(nn.Module):
             if self.mem:
                 new.append(self.core.m)
             out = self.cnet(torch.cat(new, 1))
-            delta = out[:, :66] * torch.exp(H0).clamp(max=20.0) * self.keep
+            # bounded: the corrected x_t goes back into the equation, so an unbounded correction compounds over
+            # the chain (first run: day-10 RMSE 1.50 -> 1.71 s after 150 iterations)
+            delta = self.cfg.d_max * torch.tanh(out[:, :66] / self.cfg.d_max) * torch.exp(H0).clamp(max=20.0) * self.keep
             r = r + self.cfg.r_max * torch.tanh(out[:, 66:] / self.cfg.r_max) * self.keep
             phi0 = phi0 + self.s * delta
             if self.mem:

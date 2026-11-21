@@ -217,7 +217,10 @@ def cmd_devk(a, rest):
     tr, vr = D.Pairs(years, a.seed, hist=W, ahead=Dmax), D.Pairs(va, a.seed + 1, hist=W, ahead=Dmax)
     w = D.area_weights(cl.lat).to(dev)
     params = [p_ for p_ in Dk.parameters() if p_.requires_grad]
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
+    cn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_.startswith("cnet.")]
+    rest_ = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and not n_.startswith("cnet.")]
+    opt = torch.optim.AdamW([dict(params=rest_, lr=a.lr)] + ([dict(params=cn, lr=a.lr_correct or a.lr)] if cn else []),
+                            weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
@@ -260,6 +263,9 @@ def cmd_devk(a, rest):
     t0 = time.time()
     i0, g0, m0 = val()
     log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0)))
+    best = sum(i0) if a.init else float("inf")
+    if a.init:
+        save()
     for it in range(1, a.iters + 1):
         days = a.days[min(len(a.days) - 1, (it - 1) * len(a.days) // a.iters)]
         ign, ent, prod, _ = run(tr(a.batch), days)
@@ -271,11 +277,12 @@ def cmd_devk(a, rest):
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
             vi, vg, vm = val()
-            save()
-            log(dict(it=it, days=days, ign=round(float(loss), 4), val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
+            if sum(vi) < best:  # the checkpoint is the best validation log score of the sequence
+                best = sum(vi)
+                save()
+            log(dict(it=it, days=days, ign=round(float(loss), 4), best=round(best, 3), val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
                      stretch=[round(p_[0], 3) for p_ in prod], r=[round(p_[1], 3) for p_ in prod],
                      h=round(float(Dk.h().mean()), 4), sec=round(time.time() - t0)))
-    save()
 
 
 def load_devk(a, core, tag):
@@ -592,6 +599,7 @@ def main(argv=None):
     d.add_argument("--correct", action="store_true",
                    help="chained kernel p(x_t | x_(t-1)): correct the mean (G of the new state) and the entropy at x_t")
     d.add_argument("--init", default="", help="start from this fitted deviation kernel")
+    d.add_argument("--lr-correct", type=float, default=0.0, help="learning rate of the correction net (0 = --lr)")
     d.add_argument("--hidden", type=int, default=32)
     d.add_argument("--iters", type=int, default=800)
     d.add_argument("--batch", type=int, default=4)
