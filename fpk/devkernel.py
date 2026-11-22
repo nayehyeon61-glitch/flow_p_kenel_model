@@ -419,9 +419,11 @@ class EntropyDeviationKernel(nn.Module):
             # K_phys o G: the noise goes through the equation with the deviations (linear part M (e + h xi)); the
             # gradient to h and to the noise amplitudes goes through the straight-through copy of the injected part
             inj = hxi
-            phi0, p, g, shift = self._equation(xbar, e + inj.detach(), doy, tisr)
+            zin = e + inj.detach()
+            phi0, p, g, shift = self._equation(xbar, zin, doy, tisr)
             q = p + (inj - inj.detach())
         else:
+            zin = e
             phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
             q = p + hxi
         if self.cfg.noise_mult > 0:
@@ -472,7 +474,10 @@ class EntropyDeviationKernel(nn.Module):
         # the parts of the day (diagnostics): the day's production H_(L+1) - H_L split into the equation's stretching
         # 1/2 log <p^2> - H_L, the noise's 1/2 log <q^2> - 1/2 log <p^2> (>= 0) and the learned residual r
         lp = self.size(p)
-        self.last = dict(p=p, hxi=q - p, r=r, prod=((lp - le).detach(), (lq - lp).detach(), r.detach()))
+        # zin: the deviations that entered the equation (e, or e + h xi when the noise is composed with it), p = the
+        # equation's day of zin: fpk.coreflow starts a day from zin and takes e_next - p as the rest of the kernel's day
+        self.last = dict(p=p, hxi=q - p, r=r, prod=((lp - le).detach(), (lq - lp).detach(), r.detach()),
+                         zin=zin.detach())
         return phi0, e_next, Hn, (lq - le, r)
 
     def ign(self, H, xbar, truth, w):

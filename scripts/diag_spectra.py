@@ -46,7 +46,7 @@ def main():
     Fm = R.load_devflow(a, core, a.flow_tag) if a.flow_tag else None
     if Fm is not None:
         Dk = Fm.dk
-    path = np.zeros((a.leads, 2))
+    path, split = np.zeros((a.leads, 2)), np.zeros((a.leads, 2))
     es = np.zeros((a.leads, 3))  # band-weighted energy score: E|X - y|, 1/2 E|X - X'|, their difference
     S = SHT(cl.lat)
     va = D.load(pa, [a.val_year])[a.val_year]
@@ -78,11 +78,14 @@ def main():
         with torch.no_grad():
             e = Dk.start(x, doy, hist, g)
             for k in range(L):
+                xp = x
                 x, e, H, _ = Dk.day(x, e, doy + k, tis[:, k], k, g)
                 dev = e                                                   # the members' offsets, units of s
                 if Fm is not None:
-                    dev = Fm.transport(e, Fm.cond(x, H, doy + k + 1, k + 1), H, g)
+                    dev = Fm.day_transport(xp, x, e, H, doy, tis[:, k], k, g)
                     path[k] += np.array(Fm.last_path) * len(j)
+                    if getattr(Fm, "last_split", None) is not None:      # the core's flow: core / learned growth
+                        split[k] += np.array(Fm.last_split) * len(j)
                 # the energy score in the band-weighted norm |f|_w^2 = sum_c sum_j w_cj |P_j f_c|^2, w = 1 / (the
                 # error's own band power of that lead is not known beforehand: the climatological band power c_cj)
                 mem = dev if Fm is not None else torch.cat([e, -e], 1)
@@ -127,6 +130,9 @@ def main():
     out["energy_score_parts"] = (es[:, :2] / n).tolist()
     if Fm is not None:
         out["path_kinetic_over_displacement"] = (path[:, 0] / np.maximum(path[:, 1], 1e-12)).tolist()
+        if getattr(Fm, "last_split", None) is not None:
+            out["day_growth_core_learned"] = (split / n).tolist()   # 1/2 log variance of the day, units of sigma
+            print("day's growth (core, learned) at leads 1/5/10:", [f(split[q] / n) for q in (0, 4, 9) if q < L])
         print("path kinetic / displacement at leads 1/5/10:", f([out["path_kinetic_over_displacement"][q] for q in (0, 4, 9) if q < L]))
     print("band-weighted energy score at leads 1/5/10:", " ".join(f"{out['energy_score'][q]:.4f}" for q in (0, 4, 9) if q < L))
     json.dump(out, open(a.json, "w"))

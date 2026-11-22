@@ -43,6 +43,12 @@ class DevFlowConfig:
     sigma_min: float = 0.02
     steps: int = 6
     source: str = "kernel"   # kernel | gauss
+    path: str = "line"       # line: the straight line in a pseudo time (this class); core: the tendency core's own
+    #                          flow over the physical day as the path (fpk.coreflow.CoreFlow, built by build_flow)
+    core_steps: int = 4      # path = core: the steps of the day's grid t_k = k / N, each one Heun step of the core's
+    #                          tendency over 1 / N day; 0 = the core's own substeps (its trained solver)
+    core_sub: int = 0        # path = core: 0 = one Euler step of the learned part a grid step (the network sees z_k);
+    #                          M >= 1 = the learned part of a grid step is a line flow after the core's step, M Heun steps
 
 
 class DeviationFlow(nn.Module):
@@ -125,6 +131,19 @@ class DeviationFlow(nn.Module):
         self.last_path = (float(kin), float(disp))
         return z.view(B, P, *z.shape[1:])
 
+    # ---- one day of the kernel -> its loss / its members: the calls a trainer or a rollout makes right after
+    # ``dk.day`` (x0 the mean before the day, xb the mean after it, e and H what the day returned, doy0 the IC's day
+    # of year, tisr the day's forcing, lead = days since the IC of the day's start). The same for every path.
+    def day_loss(self, x0, xb, e, H, truth, doy0, tisr, lead: int, w, gen=None, sel=None):
+        """The flow-matching loss of the day; ``sel``: the indices of the kernel's pairs used as source draws."""
+        es = e if sel is None else e[:, sel]
+        return self.loss(es, xb, truth, self.cond(xb, H, doy0 + lead + 1, lead + 1), H, w, gen)
+
+    @torch.no_grad()
+    def day_transport(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, steps: Optional[int] = None):
+        """The members' deviations of the day (B, P, 66, H, W), units of s around xb."""
+        return self.transport(e, self.cond(xb, H, doy0 + lead + 1, lead + 1), H, gen, steps)
+
     @torch.no_grad()
     def rollout(self, xd0, doy0, tisr, leads: int, hist=None, gen=None, steps: Optional[int] = None):
         """Members (B, P, L, 66, H, W) = xbar_L + s T(e^p_L) (P independent members, P = the kernel's pairs) and the
@@ -133,8 +152,9 @@ class DeviationFlow(nn.Module):
         e = dk.start(xd0, doy0, hist, gen)
         x, out, ent = xd0, [], []
         for L in range(leads):
+            x0 = x
             x, e, H, _ = dk.day(x, e, doy0 + L, tisr[:, L], L, gen)
-            z = self.transport(e, self.cond(x, H, doy0 + L + 1, L + 1), H, gen, steps)
+            z = self.day_transport(x0, x, e, H, doy0, tisr[:, L], L, gen, steps)
             out.append(x[:, None] + dk.s.unsqueeze(0) * z)
             ent.append(H + HALF_LOG_2PIE)
         return torch.stack(out, 2), torch.stack(ent, 1)

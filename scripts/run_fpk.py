@@ -27,7 +27,8 @@ from fpk import data as D  # noqa: E402
 from fpk.env import DYN, TISR, contract, pgfm_args, rkt  # noqa: E402
 from fpk.ensemble import Scorer, crps_torch, rollout  # noqa: E402
 from fpk.flow import FlowConfig, KernelFlow  # noqa: E402
-from fpk.devflow import DevFlowConfig, DeviationFlow  # noqa: E402
+from fpk.devflow import DevFlowConfig, DeviationFlow  # noqa: E402,F401
+from fpk.coreflow import build_flow  # noqa: E402
 from fpk.devkernel import DevConfig, EntropyDeviationKernel, TotalEnergy  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from fpk.kernel import KernelConfig, PhysicsKernel  # noqa: E402
@@ -357,7 +358,8 @@ def cmd_devflow(a, rest):
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
     Dk = load_devk(a, core, a.dev_tag)
-    Fm = DeviationFlow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps)).to(dev)
+    Fm = build_flow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps, path=a.path,
+                                      core_steps=a.core_steps, core_sub=a.core_sub)).to(dev)
     W = int(getattr(core, "mem", 0))
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
@@ -370,7 +372,10 @@ def cmd_devflow(a, rest):
     vx = [vr(a.batch) for _ in range(a.val_batches)]
 
     def save():
-        torch.save(dict(state=Fm.net.state_dict(), cfg=Fm.cfg.__dict__, dev_tag=a.dev_tag, core_tag=a.core_tag),
+        cfg = dict(Fm.cfg.__dict__)
+        if cfg["path"] == "line":  # the straight line's checkpoint as it always was (the path's keys only with a path)
+            cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+        torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, dev_tag=a.dev_tag, core_tag=a.core_tag),
                    os.path.join(a.out, f"{a.tag}.pt"))
 
     def run(batch, gen=None, train=False):
@@ -382,10 +387,11 @@ def cmd_devflow(a, rest):
             e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
         xb, out = xd, []
         for k in range(a.days):
+            x0 = xb
             with torch.no_grad():
                 xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            es = e[:, torch.randperm(e.shape[1], generator=gen)[:a.sources]] if train else e
-            lk = Fm.loss(es, xb, yd[:, k], Fm.cond(xb, H, doy + k + 1, k + 1), H, w, gen)
+            sel = torch.randperm(e.shape[1], generator=gen)[:a.sources] if train else None
+            lk = Fm.day_loss(x0, xb, e, H, yd[:, k], doy, tns[:, k], k, w, gen, sel)
             if train:  # a lead's graph is freed before the next one (ten leads at once did not fit the memory)
                 (lk / a.days).backward()
             out.append(float(lk))
@@ -400,7 +406,7 @@ def cmd_devflow(a, rest):
         return [round(float(v), 4) for v in r]
 
     t0 = time.time()
-    log(dict(devflow_val_start=val(), source=a.source))
+    log(dict(devflow_val_start=val(), source=a.source, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub))))
     for it in range(1, a.iters + 1):
         opt.zero_grad()
         loss = sum(run(tr(a.batch), train=True)) / a.days
@@ -422,7 +428,7 @@ def load_devflow(a, core, tag, pairs=0):
         Dk.cfg.pairs = pairs  # independent members of the forecast (the kernel's parameters do not depend on P)
     cfg = ck["cfg"]
     cfg["blocks"] = tuple(cfg["blocks"])
-    Fm = DeviationFlow(Dk, DevFlowConfig(**cfg))
+    Fm = build_flow(Dk, DevFlowConfig(**cfg))  # the checkpoint's path: the straight line (no key) or the core's flow
     Fm.net.load_state_dict(ck["state"])
     return Fm.to(a.device).eval()
 
@@ -695,6 +701,16 @@ def main(argv=None):
     df.add_argument("--lr", type=float, default=5e-4)
     df.add_argument("--hidden", type=int, default=64)
     df.add_argument("--steps", type=int, default=6)
+    df.add_argument("--path", default="line", choices=["line", "core"],
+                    help="line: the straight line in a pseudo time; core: the tendency core's flow over the day "
+                         "(fpk.coreflow), the network adds the residual on the day's grid")
+    df.add_argument("--core-steps", type=int, default=4,
+                    help="--path core: steps of the day's grid (Heun steps of the core's tendency over 1/N day); "
+                         "0 = the core's own substeps (the kernel's day itself: zero head = the kernel)")
+    df.add_argument("--core-sub", type=int, default=0,
+                    help="--path core: 0 = one Euler step of the learned part per grid step (under-dispersed: a perfect "
+                         "network gives 0.72 of the spread at 4 steps, a point at 1); M >= 1 = the learned part of each "
+                         "grid step is a line flow after the core's step, M Heun steps (2 M network calls)")
     df.add_argument("--val-batches", type=int, default=4)
     df.add_argument("--log-every", type=int, default=50)
     t = sub.add_parser("tune")

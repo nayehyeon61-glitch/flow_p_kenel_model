@@ -858,3 +858,451 @@ def test_conservation_diagnostic(mcore):
     assert torch.allclose(memb.mean(1), mn, atol=1e-4) and torch.allclose(mn, det, atol=1e-4)
     ch = C.daily_change(inv, memb)
     assert all(ch[k].shape == (2, 4, 3) and torch.isfinite(ch[k]).all() for k in C.KEYS)
+
+
+# ------------------------------------------------------------------------------- the core's flow as the path
+def _core_flow(mcore, N, source="kernel", pairs=3, sigma_min=0.0, sub=0, r_bias=0.3, **kw):
+    from fpk.coreflow import build_flow
+    from fpk.devflow import DevFlowConfig
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    Dk = EntropyDeviationKernel(mcore, DevConfig(pairs=pairs, hidden=8, blocks=(1,), smooth=3, **kw))
+    with torch.no_grad():
+        Dk.r_bias.fill_(r_bias)                           # the day's end exp(r) is part of what is tested
+        if kw.get("band_scale"):
+            Dk.g_band.normal_(0, 0.3)
+    Fm = build_flow(Dk, DevFlowConfig(hidden=8, blocks=(1,), path="core", core_steps=N, source=source,
+                                      sigma_min=sigma_min, core_sub=sub))
+    return Dk, Fm
+
+
+def _mem_core(substeps):
+    torch.manual_seed(1)
+    lat = np.linspace(-78.75, 78.75, H)
+    lon = np.linspace(0, 360, W, endpoint=False)
+    st = static_features(lat, lon, np.random.rand(H, W).astype(np.float32), np.random.rand(H, W).astype(np.float32))
+    c = make_core(st, np.full(67, 0.3), np.zeros(67), np.ones(67), lat, hidden=8, blocks=(1,), norm="gn",
+                  mem=2, mem_ch=4, mz=True, substeps=substeps)
+    c.pm = None
+    with torch.no_grad():
+        c.net.head.weight.normal_(0, 0.1)
+    return c.eval()
+
+
+def _day_inputs():
+    g = torch.Generator().manual_seed(11)
+    return (torch.randn(2, 66, H, W, generator=g), torch.tensor([5, 6]), torch.randn(2, 3, H, W, generator=g),
+            torch.randn(2, 2, 66, H, W, generator=g))
+
+
+@pytest.mark.parametrize("kw", [dict(noise_pre=True), dict(), dict(band_scale=True), dict(noise_mult=0.3),
+                                dict(noise_pre=True, correct=True)])
+def test_core_flow_with_a_zero_head_is_the_kernels_day(mcore, kw):
+    """On the core's own solver (core_steps = 0: one Heun step a day on this core, as on the trained cores) the
+    zero-head members are the kernel's e' for every noise mode: the noise composed with the equation
+    (z_0 = e + h xi), the additive one (h xi added at the day's end, before exp(r)), band_scale, noise_mult."""
+    from fpk.coreflow import CoreFlow
+    xd, doy, tis, hist = _day_inputs()
+    Dk, Fm = _core_flow(mcore, 0, **kw)
+    assert isinstance(Fm, CoreFlow) and Fm.N == 1
+    ens, ent = Fm.rollout(xd, doy, tis, 3, hist=hist, gen=torch.Generator().manual_seed(4))
+    ref, ent2 = Dk.rollout(xd, doy, tis, 3, hist=hist, gen=torch.Generator().manual_seed(4))
+    assert ens.shape == (2, 3, 3, 66, H, W) and torch.equal(ent, ent2)
+    assert torch.allclose(ens, ref[:, :3], atol=1e-5)
+    assert Fm.last_path == (0.0, 0.0) and Fm.last_split[1] == 0.0 and Fm.last_split[0] != 0.0
+
+
+def test_core_flow_zero_head_on_a_finer_grid_is_the_kernel_to_second_order(mcore):
+    """The two approximations of a grid of 4 steps, on the fixtures: another solver step than the core's own
+    (one-step core, 4 steps: relative rms 1.5e-3 here) and the odd part around the mean path instead of the pair's
+    own midpoint (4-substep core on its own grid: 8e-5 here)."""
+    xd, doy, tis, hist = _day_inputs()
+    rel = []
+    for c in (mcore, _mem_core(4)):
+        Dk, Fm = _core_flow(c, 4, noise_pre=True)
+        ens, _ = Fm.rollout(xd, doy, tis, 3, hist=hist, gen=torch.Generator().manual_seed(4))
+        ref, _ = Dk.rollout(xd, doy, tis, 3, hist=hist, gen=torch.Generator().manual_seed(4))
+        dev = (ref[:, :3] - ref[:, 3:]) / 2
+        rel.append(float((ens - ref[:, :3]).pow(2).mean().sqrt() / dev.pow(2).mean().sqrt()))
+    assert 1e-5 < rel[0] < 1e-2 and rel[1] < 1e-3 and rel[1] < rel[0]
+
+
+def _one_day(Dk, lead=1, seed=3):
+    xd, doy, tis, hist = _day_inputs()
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        e = Dk.start(xd, doy, hist, g)
+        x = xd
+        for L in range(lead + 1):
+            x0 = x
+            x, e, Hn, _ = Dk.day(x, e, doy + L, tis[:, L], L, g)
+    return x0, x, e, Hn, doy, tis[:, lead], lead
+
+
+@pytest.mark.parametrize("kw,N,source,sub", [
+    (dict(noise_pre=True), 4, "kernel", 0), (dict(band_scale=True), 4, "kernel", 0), (dict(), 1, "kernel", 0),
+    (dict(noise_pre=True), 4, "gauss", 0), (dict(), 4, "kernel", 0), (dict(), 4, "kernel", 2),
+    (dict(noise_pre=True), 2, "kernel", 3)])
+def test_core_flow_target_is_exact_for_the_sampler(mcore, kw, N, source, sub):
+    """An oracle that returns the training target u*_k of the path's state (whatever the sampler's own state is)
+    takes the sampler from z_0 along the path onto z1: the target is the one of this sampler."""
+    Dk, Fm = _core_flow(mcore, N, source=source, sub=sub, **kw)
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    c = Fm.day_start(x0, e, Hn, doy, tisr, lead, torch.Generator().manual_seed(0))
+    z1 = 1.5 * torch.randn(c.z0.shape, generator=torch.Generator().manual_seed(1)) * Dk.keep
+    zc = Fm.zero_path(c)
+    full = lambda k: torch.full((c.z0.shape[0],), k)  # noqa: E731
+    seen = []
+
+    def oracle(z, k, tau):  # core_sub: the state after the core's step, on the line of the grid step at tau
+        zk, ut = Fm.target(c, zc, z1, full(k), tau=torch.full((c.z0.shape[0],), tau) if sub else None)
+        seen.append(float((z - zk).abs().max()))
+        return ut
+    out = Fm.run(c, oracle).flatten(0, 1)
+    assert max(seen) < 1e-4 and torch.allclose(out, z1, atol=1e-4)
+    assert float((zc[-1] - z1).abs().max()) > 1.0                          # ... and the zero head does not
+    # at k = 0 the target is the residual itself, later the core's stretching of the part already added is taken off
+    assert torch.allclose(Fm.target(c, zc, z1, full(0))[1], z1 - zc[-1], atol=1e-5)
+    if N > 1:
+        assert float((Fm.target(c, zc, z1, full(N - 1))[1] - (z1 - zc[-1])).abs().max()) > 1e-3
+    # the day's growth of 1/2 log variance is split into the core's and the learned part, and the two add up
+    var = lambda v: float(((v / c.sig) ** 2 * Dk.keep).sum() / Dk.keep.expand_as(v).sum())  # noqa: E731
+    assert abs(sum(Fm.last_split) - 0.5 * math.log(var(z1) / var(c.z0))) < 1e-4 and Fm.last_split[1] != 0
+    assert Fm.last_path[0] >= Fm.last_path[1] * (1 - 1e-5) > 0                # Cauchy-Schwarz: kinetic >= displacement
+
+
+def test_core_flow_loss_gradients_and_mixed_steps(mcore):
+    Dk, Fm = _core_flow(mcore, 4, sigma_min=0.02, noise_pre=True)
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    w = torch.ones(1, 1, H, 1)
+    truth = xb + 0.3 * torch.randn(xb.shape, generator=torch.Generator().manual_seed(2))
+    m_ref = mcore.m.clone()
+    loss = Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, torch.Generator().manual_seed(5), sel=torch.tensor([2, 0]))
+    assert torch.isfinite(loss) and float(loss) > 0 and torch.equal(mcore.m, m_ref)   # the core's memory is put back
+    loss.backward()
+    assert all(p.grad is None for p in Dk.parameters()) and all(p.grad is None for p in mcore.parameters())
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in Fm.net.parameters())
+    # zero head, no noise: the loss of given steps is the mean square of the targets in units of sigma, and at k = 0
+    # the target is the residual of the kernel's day, (z1 - e') / sigma
+    Dk, Fm = _core_flow(mcore, 4, noise_pre=True)
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    c = Fm.day_start(x0, e, Hn, doy, tisr, lead)
+    z1 = ((truth - xb) / Dk.s * Dk.keep)[c.bidx]
+    zc = Fm.zero_path(c)
+    k = torch.tensor([0, 1, 2, 3, 3, 0])
+    ut = Fm.target(c, zc, z1, k)[1]
+    want = float(((ut / c.sig) ** 2 * Dk.keep).sum() / Dk.keep.expand_as(ut).sum())
+    assert abs(float(Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, k=k)) - want) < 1e-5 * want
+    assert torch.allclose(ut[k == 0], (z1 - zc[-1])[k == 0], atol=1e-5)
+    for j in range(4):   # the rows of a mixed draw are the rows of the same step drawn for all
+        assert torch.allclose(ut[k == j], Fm.target(c, zc, z1, torch.full((6,), j))[1][k == j], atol=1e-6)
+    with pytest.raises(NotImplementedError):
+        Fm.transport(e, None, Hn)
+
+
+def test_core_flow_rollout_and_gauss_control(mcore):
+    xd, doy, tis, hist = _day_inputs()
+    out = {}
+    for source in ("kernel", "gauss"):
+        Dk, Fm = _core_flow(mcore, 4, source=source, noise_pre=True)
+        with torch.no_grad():   # a head that does something
+            torch.manual_seed(0)
+            [p.normal_(0, 0.05) for p in list(Fm.net.parameters())[-2:]]
+        ens, ent = Fm.rollout(xd, doy, tis, 3, hist=hist, gen=torch.Generator().manual_seed(4))
+        ref, ent2 = Dk.rollout(xd, doy, tis, 3, hist=hist, gen=torch.Generator().manual_seed(4))
+        assert ens.shape == (2, 3, 3, 66, H, W) and torch.isfinite(ens).all()
+        # the entropy is the kernel's (the control's own draws shift the kernel's random numbers after day 1)
+        assert torch.allclose(ent, ent2) if source == "kernel" else torch.allclose(ent[:, 0], ent2[:, 0])
+        assert all(math.isfinite(v) for v in Fm.last_path + Fm.last_split) and Fm.last_path[0] > 0
+        out[source] = (ens, ref)
+    # the kernel source without a learned part would be the kernel; the control starts from a Gaussian of the
+    # kernel's predicted size (its own draws), carried by the same core steps
+    assert float((out["kernel"][0] - out["kernel"][1][:, :3]).abs().max()) > 1e-3
+    assert float((out["gauss"][0] - out["kernel"][0]).abs().max()) > 1e-2
+    Dk, Fm = _core_flow(mcore, 1, source="gauss")
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    c = Fm.day_start(x0, e, Hn, doy, tisr, lead, torch.Generator().manual_seed(9))
+    want = smooth_noise(tuple(e.shape), e, torch.Generator().manual_seed(9)) * Dk.keep.unsqueeze(0) * Fm.sigma(Hn)[:, None]
+    assert torch.equal(c.z0, want.flatten(0, 1)) and c.add is None
+    assert torch.allclose(Fm.run(c).flatten(0, 1), Fm.S(0, x0, c.z0, c.bidx, c.hours, c.tisr), atol=1e-6)
+
+
+def test_deviation_flow_checkpoints_and_the_default_path(mcore, tmp_path):
+    """The loaders build the flow of the checkpoint's path; a checkpoint without the key (every one so far) and the
+    defaults are the straight line, whose day calls are the old calls bit for bit."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from types import SimpleNamespace
+    import run_fpk as R
+    from fpk.coreflow import CoreFlow, build_flow
+    from fpk.devflow import DevFlowConfig, DeviationFlow
+    xd, doy, tis, hist = _day_inputs()
+    a = SimpleNamespace(out=str(tmp_path), core_tag="c", device="cpu")
+    Dk, Fm = _core_flow(mcore, 4, noise_pre=True)
+    with torch.no_grad():
+        [p.normal_(0, 0.05) for p in list(Fm.net.parameters())[-2:]]
+    torch.save(dict(state={k: v for k, v in Dk.state_dict().items() if not k.startswith("core.")},
+                    cfg=dict(Dk.cfg.__dict__), core_tag="c"), tmp_path / "devk.pt")
+    torch.save(dict(state=Fm.net.state_dict(), cfg=dict(Fm.cfg.__dict__), dev_tag="devk", core_tag="c"),
+               tmp_path / "devflow_core.pt")
+    F2 = R.load_devflow(a, mcore, "devflow_core", pairs=2)
+    assert type(F2) is CoreFlow and F2.N == 4 and F2.cfg.path == "core" and F2.dk.cfg.pairs == 2
+    Fm.dk.cfg.pairs = 2
+    one = Fm.rollout(xd, doy, tis, 2, hist=hist, gen=torch.Generator().manual_seed(4))[0]
+    two = F2.rollout(xd, doy, tis, 2, hist=hist, gen=torch.Generator().manual_seed(4), steps=6)[0]
+    assert one.shape == (2, 2, 2, 66, H, W) and torch.equal(one, two)
+    # the straight line: defaults, the old checkpoint format (no path key), the day calls
+    assert DevFlowConfig().path == "line" and type(build_flow(Dk, DevFlowConfig(hidden=8, blocks=(1,)))) is DeviationFlow
+    Fl = DeviationFlow(Dk, DevFlowConfig(hidden=8, blocks=(1,), steps=2))
+    with torch.no_grad():
+        [p.normal_(0, 0.05) for p in list(Fl.net.parameters())[-2:]]
+    torch.save(dict(state=Fl.net.state_dict(), cfg=dict(hidden=8, blocks=[1], sigma_min=0.02, steps=2, source="kernel"),
+                    dev_tag="devk", core_tag="c"), tmp_path / "devflow_old.pt")
+    F3 = R.load_devflow(a, mcore, "devflow_old", pairs=2)
+    assert type(F3) is DeviationFlow and F3.cfg.path == "line"
+    got = F3.rollout(xd, doy, tis, 2, hist=hist, gen=torch.Generator().manual_seed(4))[0]
+    g = torch.Generator().manual_seed(4)          # the rollout as it was written before the day calls
+    with torch.no_grad():
+        e = Dk.start(xd, doy, hist, g)
+        x, old = xd, []
+        for L in range(2):
+            x, e, Hn, _ = Dk.day(x, e, doy + L, tis[:, L], L, g)
+            old.append(x[:, None] + Dk.s.unsqueeze(0) * Fl.transport(e, Fl.cond(x, Hn, doy + L + 1, L + 1), Hn, g, None))
+        w = torch.ones(1, 1, H, 1)
+        sel = torch.tensor([1])
+        l_old = Fl.loss(e[:, sel], x, x + 0.2, Fl.cond(x, Hn, doy + 2, 2), Hn, w, torch.Generator().manual_seed(8))
+        l_new = Fl.day_loss(xd, x, e, Hn, x + 0.2, doy, tis[:, 1], 1, w, torch.Generator().manual_seed(8), sel)
+    assert torch.equal(got, torch.stack(old, 2)) and torch.equal(l_old, l_new)
+    assert float((got - x[:, None, None]).abs().max()) > 0
+
+
+def _net_inputs(Fm, call):
+    """The inputs the flow's network saw during ``call()`` (one tensor per network call)."""
+    seen = []
+    h = Fm.net.register_forward_pre_hook(lambda m, a: seen.append(a[0].detach().clone()))
+    try:
+        out = call()
+    finally:
+        h.remove()
+    return seen, out
+
+
+@pytest.mark.parametrize("r_bias", [-0.5, 0.3])
+def test_core_flow_loss_is_on_the_scale_of_the_line_at_every_step(mcore, r_bias):
+    """The kernel's end of the day (exp(r)) must not rescale the residual already added: with a zero head the loss
+    of every grid step is about the line path's, (z1 - e')^2 / sigma^2, whatever r is (folded into the last step it
+    was x 4.7 at r = -0.5 and about 0 at r = +0.3)."""
+    from fpk.devflow import DevFlowConfig, DeviationFlow
+    w = torch.ones(1, 1, H, 1)
+    for kw in (dict(noise_pre=True), dict()):
+        Dk, Fm = _core_flow(mcore, 4, r_bias=r_bias, **kw)
+        x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+        truth = xb + Dk.s * (torch.exp(Hn) * torch.randn(xb.shape, generator=torch.Generator().manual_seed(2)))
+        Fl = DeviationFlow(Dk, DevFlowConfig(hidden=8, blocks=(1,), sigma_min=0.0))
+        line = float(Fl.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, torch.Generator().manual_seed(0)))
+        per_k = [float(Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, k=torch.full((6,), j))) for j in range(4)]
+        assert abs(per_k[0] - line) < 0.01 * line and all(abs(v - line) < 0.05 * line for v in per_k), (line, per_k)
+        assert float(Dk.last["r"].abs().mean()) > 0.2
+
+
+def test_core_flow_conditioning_is_the_equation_at_the_intermediate_time(mcore):
+    """What the network is given at step k, in the loss and in the sampler: the mean path's state xbar(t_k) and its
+    G, the time of year and the lead advanced by t_k, t_k's features, the rows of the right IC."""
+    from fpk.flow import tau_features
+    N = 4
+    Dk, Fm = _core_flow(mcore, N, noise_pre=True)
+    with torch.no_grad():
+        [p.normal_(0, 0.05) for p in list(Fm.net.parameters())[-2:]]
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    hours = (doy + lead).float() * 24.0
+    xs = [x0]
+    with torch.no_grad():
+        for k in range(N - 1):                     # the core's own steps over 1 / N day, the memory of the day
+            xs.append(mcore.substep(xs[-1], hours, k, N))
+    want = [Fm.cond(xs[k], Hn, doy + lead + k / N, lead + k / N) for k in range(N)]
+    assert float((want[0] - want[1]).abs().max()) > 1e-3 and float((want[0][0] - want[0][1]).abs().max()) > 1e-3
+    assert float((xs[1] - x0).abs().max()) > 1e-4 and want[0].shape[1] > 66 + 66   # G(xbar) is among the channels
+    assert torch.allclose(want[2][:, -1], torch.full((2, H, W), (lead + 2 / N) / 10))
+    tf = lambda t, n: tau_features(torch.full((n,), t), H, W)  # noqa: E731
+    w, truth = torch.ones(1, 1, H, 1), xb + 0.3
+    sel = torch.tensor([2, 0])
+    bidx = torch.tensor([0, 0, 1, 1])
+    for j in range(N):
+        seen, _ = _net_inputs(Fm, lambda: Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, sel=sel, k=torch.full((4,), j)))
+        assert len(seen) == 1 and torch.allclose(seen[0][:, 66:-4], want[j][bidx], atol=1e-6)
+        assert torch.allclose(seen[0][:, -4:], tf(j / N, 4))
+    # mixed steps: every row its own step's conditioning
+    k = torch.tensor([3, 0, 1, 2])
+    seen, _ = _net_inputs(Fm, lambda: Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, sel=sel, k=k))
+    assert torch.allclose(seen[0][:, 66:-4], torch.stack([want[int(k[i])][bidx[i]] for i in range(4)]), atol=1e-6)
+    assert torch.allclose(seen[0][:, -4:], torch.cat([tf(int(q) / N, 1) for q in k]))
+    # the sampler: N calls, the same conditioning, and its state at step 0 is the source
+    b3 = torch.arange(2).repeat_interleave(3)
+    seen, z = _net_inputs(Fm, lambda: Fm.day_transport(x0, xb, e, Hn, doy, tisr, lead))
+    assert len(seen) == N
+    for j in range(N):
+        assert torch.allclose(seen[j][:, 66:-4], want[j][b3], atol=1e-6) and torch.allclose(seen[j][:, -4:], tf(j / N, 6))
+    sig = Fm.sigma(Hn)[b3]
+    assert torch.allclose(seen[0][:, :66] * sig, Dk.last["zin"].flatten(0, 1), atol=1e-5)
+    # core_sub = 2: Heun on the line of every grid step, times t_k + tau / N, the conditioning of t_k
+    Fm.cfg.core_sub = 2
+    seen, _ = _net_inputs(Fm, lambda: Fm.day_transport(x0, xb, e, Hn, doy, tisr, lead))
+    times = [float(q[0, -4, 0, 0]) for q in seen]
+    assert len(seen) == 4 * N and np.allclose(times, [(j + t) / N for j in range(N) for t in (0, .5, .5, 1)])
+    assert all(torch.allclose(seen[4 * j + i][:, 66:-4], want[j][b3], atol=1e-6) for j in range(N) for i in range(4))
+    r = Fm.day_rows(Fm.day_start(x0, e, Hn, doy, tisr, lead), xb, truth, k=torch.full((6,), 2), tau=torch.full((6,), 0.25))
+    seen, _ = _net_inputs(Fm, lambda: Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w, k=torch.full((6,), 2),
+                                                  tau=torch.full((6,), 0.25)))
+    assert torch.allclose(seen[0][:, -4:], tf(2.25 / N, 6)) and torch.allclose(seen[0][:, 66:-4], want[2][b3], atol=1e-6)
+    assert torch.allclose(seen[0][:, :66] * sig, r.z, atol=1e-5) and torch.allclose(r.t, torch.full((6,), 2.25 / N))
+
+
+@pytest.mark.parametrize("sub", [0, 2])
+def test_core_flow_sigma_min_noise(mcore, sub):
+    """sigma_min: noise of sigma_min sigma on the network's input. core_sub = 0: the target leads from the PERTURBED
+    z_k to the path's z_(k+1) (exact for the sampler from that state); core_sub >= 1: noise on the line of the grid
+    step, the target is the line's (as in DeviationFlow)."""
+    N = 4
+    Dk, Fm = _core_flow(mcore, N, sigma_min=0.05, sub=sub)
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    truth, w = xb + 0.3, torch.ones(1, 1, H, 1)
+    k, tau = torch.tensor([0, 1, 2, 3, 3, 0]), torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 0.5])
+    c = Fm.day_start(x0, e, Hn, doy, tisr, lead)
+    r = Fm.day_rows(c, xb, truth, torch.Generator().manual_seed(5), k, tau)
+    zc = Fm.zero_path(c)
+    clean, ut0 = Fm.target(c, zc, r.z1, k, tau=tau if sub else None)
+    kp = Dk.keep.expand_as(r.z) > 0
+    n = ((r.z - clean) / c.sig)[kp]
+    assert 0.04 < float(n.std()) < 0.06 and float((r.z - clean)[~kp].abs().max()) == 0
+    nxt = torch.stack([zc[int(q) + 1][i] + (int(q) + 1) / N * (r.z1 - zc[N])[i] for i, q in enumerate(k)])   # z_(k+1)^path
+    if sub:
+        assert torch.equal(r.ut, ut0)
+    else:
+        Tz = torch.stack([Fm.T(c, int(q), r.z[i:i + 1], torch.tensor([i]))[0] for i, q in enumerate(k)])
+        assert torch.allclose(Tz + r.ut / N, nxt, atol=1e-5) and float((r.ut - ut0).abs().max()) > 1e-3
+    # the loss: the network sees that perturbed state, and (zero head) the loss is the mean square of that target
+    seen, loss = _net_inputs(Fm, lambda: Fm.day_loss(x0, xb, e, Hn, truth, doy, tisr, lead, w,
+                                                     torch.Generator().manual_seed(5), k=k, tau=tau))
+    assert torch.allclose(seen[0][:, :66] * c.sig, r.z, atol=1e-5)
+    want = float(((r.ut / c.sig) ** 2 * Dk.keep).sum() / Dk.keep.expand_as(r.ut).sum())
+    assert abs(float(loss) - want) < 1e-5 * want
+
+
+@pytest.mark.parametrize("source", ["kernel", "gauss"])
+def test_core_flow_day_end_offset_and_source_rows(mcore, source):
+    """An additive kernel on a 4-step grid with selected pairs: the source rows are the selected pairs' deviations
+    that entered the equation, the offset b = e' - p of the same pairs enters once, after the LAST core step, and
+    the zero head is the kernel's e' up to the other solver step."""
+    N, sel = 4, torch.tensor([2, 0])
+    Dk, Fm = _core_flow(mcore, N, source=source)
+    x0, xb, e, Hn, doy, tisr, lead = _one_day(Dk)
+    c = Fm.day_start(x0, e, Hn, doy, tisr, lead, torch.Generator().manual_seed(3), sel)
+    assert c.z0.shape[0] == 4 and c.P == 2 and c.bidx.tolist() == [0, 0, 1, 1]
+    zc = Fm.zero_path(c)
+    chain = c.z0
+    for k in range(N):
+        chain = Fm.S(k, c.xs[k], chain, c.bidx, c.hours, c.tisr)
+    if source == "gauss":
+        assert c.add is None and torch.allclose(zc[N], chain, atol=1e-6)
+        return
+    b = (e - Dk.last["p"])[:, sel].flatten(0, 1)
+    assert float(Dk.last["hxi"].abs().max()) > 1e-2 and float((b[0] - b[1]).abs().max()) > 1e-2
+    assert torch.equal(c.z0, Dk.last["zin"][:, sel].flatten(0, 1)) and torch.equal(c.add, b)
+    assert torch.allclose(zc[N], chain + b, atol=1e-6)
+    for k in range(1, N):      # ... and not before the last step
+        assert torch.allclose(zc[k], Fm.S(k - 1, c.xs[k - 1], zc[k - 1], c.bidx, c.hours, c.tisr), atol=1e-6)
+    ek = e[:, sel].flatten(0, 1)
+    assert float((zc[N] - ek).pow(2).mean().sqrt() / ek.pow(2).mean().sqrt()) < 1e-2
+    # the rows of a selection are the rows of the full day
+    cf = Fm.day_start(x0, e, Hn, doy, tisr, lead)
+    full = Fm.zero_path(cf)[N].view(2, 3, 66, H, W)
+    assert torch.allclose(zc[N], full[:, sel].flatten(0, 1), atol=1e-6)
+
+
+def test_core_flow_one_euler_step_is_under_dispersed_and_the_sub_flow_is_not(core):
+    """Independent Gaussian source and target of one variance on a core with zero tendency (S_k = identity): the
+    optimum of the regression is u(z, t) = z (2 t - 1) / ((1 - t)^2 + t^2). One Euler step a grid point (core_sub = 0)
+    gives members with (1 - 1/4)(1 - 0.8/4)(1 + 0.8/4) = 0.72 of the target's spread at N = 4; the line flow of every
+    grid step (core_sub = 3, Heun) gives the target's spread."""
+    from fpk.coreflow import build_flow
+    from fpk.devflow import DevFlowConfig
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    N, P = 4, 48
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=P, hidden=8, blocks=(1,), smooth=3))
+    x0, Hn, doy = torch.randn(2, 66, H, W), torch.zeros(2, 66, H, W), torch.tensor([5, 6])
+    e = torch.zeros(2, P, 66, H, W)
+    z1 = (smooth_noise(tuple(e.shape), e, torch.Generator().manual_seed(1)) * Dk.keep.unsqueeze(0)).flatten(0, 1)
+    kp = Dk.keep.expand_as(z1) > 0
+    coef = lambda t: (2 * t - 1) / ((1 - t) ** 2 + t ** 2)  # noqa: E731
+    ratio = {}
+    for sub in (0, 3):
+        Fm = build_flow(Dk, DevFlowConfig(hidden=8, blocks=(1,), path="core", core_steps=N, source="gauss", core_sub=sub))
+        c = Fm.day_start(x0, e, Hn, doy, None, 0, torch.Generator().manual_seed(0))
+        zc = Fm.zero_path(c)
+        assert torch.allclose(zc[N], c.z0, atol=1e-6)
+        # the implementation's own target on its own path has that optimum (least squares of a pointwise slope)
+        for k, tau in ((1, 0.0), (3, 0.5 if sub else 0.0)):
+            zk, ut = Fm.target(c, zc, z1, torch.full((2 * P,), k), tau=torch.full((2 * P,), tau) if sub else None)
+            assert abs(float((ut[kp] * zk[kp]).sum() / (zk[kp] ** 2).sum()) - coef((k + tau) / N)) < 0.05
+        out = Fm.run(c, lambda z, k, tau: coef((k + tau) / N) * z).flatten(0, 1)
+        ratio[sub] = float(out[kp].std() / z1[kp].std())
+    assert 0.68 < ratio[0] < 0.76 and 0.96 < ratio[3] < 1.04, ratio
+
+
+@pytest.mark.parametrize("path,sub", [("core", 2), ("core", 0), ("line", 0)])
+def test_devflow_trainer_wiring(mcore, tmp_path, monkeypatch, capsys, path, sub):
+    """``devflow --path/--core-steps/--core-sub`` through the trainer itself: the flow it builds, the day calls it
+    makes (the mean BEFORE the day, the IC's day of year, the lead), and the checkpoint it writes and reloads."""
+    import json
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from types import SimpleNamespace
+    import run_fpk as R
+    from fpk.coreflow import CoreFlow
+    from fpk.devflow import DeviationFlow
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    Dk = EntropyDeviationKernel(mcore, DevConfig(pairs=3, hidden=8, blocks=(1,), smooth=3, noise_pre=True))
+    torch.save(dict(state={k: v for k, v in Dk.state_dict().items() if not k.startswith("core.")},
+                    cfg=dict(Dk.cfg.__dict__), core_tag="c"), tmp_path / "devk.pt")
+    rng = np.random.default_rng(0)
+    lat = np.linspace(-78.75, 78.75, H)
+    monkeypatch.setattr(R, "load_core", lambda a: (None, SimpleNamespace(lat=lat), mcore))
+    monkeypatch.setattr(R.D, "load", lambda pa, years: {y: rng.standard_normal((12, 67, H, W)).astype(np.float32) for y in years})
+    calls, built = [], []
+    real = R.build_flow
+
+    def build(dk, cfg):
+        Fm = real(dk, cfg)
+        inner = Fm.day_loss
+
+        def day_loss(x0, xb, e, Hn, truth, doy0, tisr, lead, w, gen=None, sel=None):
+            calls.append((x0, xb, doy0.clone(), lead, None if sel is None else len(sel), tisr, dk.core.fc.clone()))
+            return inner(x0, xb, e, Hn, truth, doy0, tisr, lead, w, gen, sel)
+        Fm.day_loss = day_loss
+        built.append(Fm)
+        return Fm
+    monkeypatch.setattr(R, "build_flow", build)
+    argv = ["devflow", "--out", str(tmp_path), "--core-tag", "c", "--tag", "t", "--dev-tag", "devk", "--days", "2",
+            "--iters", "1", "--batch", "2", "--sources", "1", "--val-batches", "1", "--hidden", "8", "--steps", "2"]
+    if path == "core":
+        argv += ["--path", "core", "--core-steps", "2", "--core-sub", str(sub)]
+    R.main(argv)
+    Fm = built[0]
+    assert type(Fm) is (CoreFlow if path == "core" else DeviationFlow) and Fm.cfg.path == path and Fm.cfg.core_sub == sub
+    assert path == "line" or Fm.N == 2
+    logs = [json.loads(q) for q in capsys.readouterr().out.strip().splitlines()]
+    assert all(math.isfinite(v) for q in logs for v in q.get("devflow_val_start", []) + q.get("val", []))
+    assert ("path" in logs[0]) == (path == "core")
+    # validation at the start (1 batch), the training iteration, the validation of the log: 2 leads each
+    assert [q[3] for q in calls] == [0, 1] * 3 and [q[4] for q in calls] == [None, None, 1, 1, None, None]
+    for a0, a1 in zip(calls[0::2], calls[1::2]):
+        assert torch.equal(a0[2], a1[2])                      # the IC's day of year at every lead
+        assert a1[0] is a0[1] and not torch.equal(a0[0], a0[1])  # the day starts from the mean before it
+        assert torch.equal(a0[1], a0[6]) and torch.equal(a1[1], a1[6])   # xb = the mean right after the kernel's day
+        assert a0[5].shape == (2, H, W) and not torch.equal(a0[5], a1[5])
+    ck = torch.load(tmp_path / "t.pt", weights_only=False)
+    if path == "core":
+        assert ck["cfg"]["path"] == "core" and ck["cfg"]["core_steps"] == 2 and ck["cfg"]["core_sub"] == sub
+    else:   # the straight line's checkpoint keeps the format it always had
+        assert sorted(ck["cfg"]) == ["blocks", "hidden", "sigma_min", "source", "steps"]
+    monkeypatch.setattr(R, "build_flow", real)
+    F2 = R.load_devflow(SimpleNamespace(out=str(tmp_path), core_tag="c", device="cpu"), mcore, "t")
+    assert type(F2) is type(Fm) and F2.cfg == Fm.cfg
+    assert all(torch.equal(a_, b_) for a_, b_ in zip(F2.net.state_dict().values(), Fm.net.state_dict().values()))
