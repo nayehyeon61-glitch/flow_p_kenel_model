@@ -28,6 +28,15 @@ Two uses of a trained flow (scripts/run_fpk.py):
     (``integrate(..., grad=True)``: the Heun steps as written, every network call in the graph), scored with the
     fair energy score of fpk.escore. ``ctx_rows``: the sampler on a part of the day's source rows, for a gradient
     taken a few rows at a time (the memory of the graph of those rows only).
+  * the kernel learns along (``devtune --kernel-lr``): the day's context with the graph of what the kernel gave it
+    (``day_ctx(..., grad=True)``: the source z0 = e_L, the conditioning's xbar_L and H_L; sigma = exp(sg(H)) stays
+    a constant, ``sigma``), so the members' energy score reaches the kernel's parameters through the sampler.
+
+The flow-matching loss never sends a gradient to the kernel (``loss`` detaches e, xbar and H). It is a regression
+of z1 - z0 on (z_tau, tau, conditioning), bounded below by E Var[z1 - z0 | z_tau, tau, c]; as a function of the
+SOURCE's parameters that bound, and the loss, fall with the source's spread and reach zero for a point source
+(z_tau = (1 - tau) m + tau z1 then determines z1): its gradient collapses the ensemble's source. The kernel is
+anchored by its own log score instead (``EntropyDeviationKernel.lead_loss``).
 """
 
 import math
@@ -79,16 +88,17 @@ class DeviationFlow(nn.Module):
         self.dk.eval()
         return self
 
-    @torch.no_grad()
-    def cond(self, xbar, H, doy, lead: int):
+    def cond(self, xbar, H, doy, lead: int, grad: bool = False):
         """The conditioning at a lead: xbar (B, 66, H, W) the mean of that day, H its predicted entropy field,
-        doy (B,) the day of year of that day, lead = days since the IC."""
+        doy (B,) the day of year of that day, lead = days since the IC. ``grad``: with the graph of xbar and H (the
+        kernel's gradient through what the flow reads; G(xbar) is the operator's, without gradient); else none."""
         B, _, Hh, Ww = xbar.shape
         core = self.dk.core
-        parts = [xbar] + ([core.features(xbar)] if self.dk.gfeat else []) + [
-            H * self.dk.keep, core.static.expand(B, -1, -1, -1), time_features(doy.float() * 24.0, Hh, Ww),
-            xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
-        return torch.cat(parts, 1)
+        with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
+            parts = [xbar] + ([core.features(xbar)] if self.dk.gfeat else []) + [
+                H * self.dk.keep, core.static.expand(B, -1, -1, -1), time_features(doy.float() * 24.0, Hh, Ww),
+                xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
+            return torch.cat(parts, 1)
 
     def source(self, e, gen=None, sig=None):
         """e (B, P, 66, H, W) the kernel's deviations -> the source draws. The control ``gauss``: smooth Gaussian
@@ -99,7 +109,8 @@ class DeviationFlow(nn.Module):
         return e
 
     def sigma(self, H):
-        """exp(H) (B, 66, H, W), 1 on tisr (no deviation there)."""
+        """exp(sg(H)) (B, 66, H, W), 1 on tisr (no deviation there): the unit of the network's input and output,
+        a constant of every gradient (also of the kernel's, ``day_ctx(..., grad=True)``)."""
         k = self.dk.keep
         return torch.exp(H.detach().clamp(-6.0, 6.0)) * k + (1 - k)
 
@@ -110,7 +121,10 @@ class DeviationFlow(nn.Module):
     def loss(self, e, xbar, truth, cond, H, w, gen=None, teacher=None):
         """Flow-matching loss of one lead: every one of the P deviations is a source draw for the same target.
         ``teacher`` (reflow): the target of a source row is the teacher's transported endpoint of that row,
-        z1 = T_teacher(z0) (its own steps, no gradient), in place of the data's deviation."""
+        z1 = T_teacher(z0) (its own steps, no gradient), in place of the data's deviation. The kernel's e, xbar and
+        H are detached: this loss trains the network only (for the source it is minimized by a collapsed source,
+        the module's docstring)."""
+        e, xbar, H = e.detach(), xbar.detach(), H.detach()
         B, P = e.shape[:2]
         z0 = self.source(e, gen, self.sigma(H)[:, None]).flatten(0, 1)
         z1 = ((truth - xbar) / self.dk.s * self.dk.keep).repeat_interleave(P, 0)
@@ -170,15 +184,18 @@ class DeviationFlow(nn.Module):
 
     # ---- the sampler in two calls (the same for every path): the day's source rows once, then any number of runs
     # from them (other step counts, another flow on the same rows, with or without the gradient)
-    @torch.no_grad()
-    def day_ctx(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, sel=None):
+    def day_ctx(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, sel=None, grad: bool = False):
         """The sampler's context of the day: the source rows z0 (R = B P', 66, H, W) of the kernel's pairs ``sel``
-        (None = all P; the +e of every antithetic pair, as in ``rollout``), their conditioning and sigma."""
-        es = e if sel is None else e[:, sel]
-        B, P = es.shape[:2]
-        sig = self.sigma(H)
-        return SimpleNamespace(B=B, P=P, z0=self.source(es, gen, sig[:, None]).flatten(0, 1), sig=sig.repeat_interleave(P, 0),
-                               cd=self.cond(xb, H, doy0 + lead + 1, lead + 1).repeat_interleave(P, 0))
+        (None = all P; the +e of every antithetic pair, as in ``rollout``), their conditioning and sigma.
+        ``grad``: with the graph of e, xb and H (the kernel learns from the members' score: z0 = e and the
+        conditioning's xbar and H carry it; sigma does not, and the Gaussian control's source has only sigma);
+        else no graph is built."""
+        with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
+            es = e if sel is None else e[:, sel]
+            B, P = es.shape[:2]
+            sig = self.sigma(H)
+            return SimpleNamespace(B=B, P=P, z0=self.source(es, gen, sig[:, None]).flatten(0, 1), sig=sig.repeat_interleave(P, 0),
+                                   cd=self.cond(xb, H, doy0 + lead + 1, lead + 1, grad).repeat_interleave(P, 0))
 
     def day_run(self, c, steps: Optional[int] = None, grad: bool = False):
         """The members' deviations (B, P', 66, H, W) from the context of ``day_ctx``; ``steps``, ``grad``: see

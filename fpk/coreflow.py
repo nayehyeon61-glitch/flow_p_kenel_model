@@ -162,34 +162,39 @@ class CoreFlow(DeviationFlow):
         return self.T(c, k, z.detach()) + (z - z.detach())
 
     # ---- one day
-    @torch.no_grad()
-    def day_start(self, x0, e, H, doy0, tisr, lead: int, gen=None, sel=None):
+    def day_start(self, x0, e, H, doy0, tisr, lead: int, gen=None, sel=None, grad: bool = False):
         """The day's context, right after ``dk.day`` (it reads the kernel's ``last`` and the core's memory of that
         day; e is what the day returned): the mean path, the source rows z0 (R = B P', 66, H, W) and the offset of
-        the kernel's day."""
+        the kernel's day. ``grad`` (the kernel learns from the members' score): with the graph of e in the offset
+        b = e - sg(p) and of H in the conditioning; the source rows (the deviations that ENTERED the day), the pairs'
+        p, the mean path and sigma stay constants. So d z_N / d (kernel) = d e' / d (kernel) through the offset,
+        added at the day's end, and the network's own dependence on H; else no graph is built."""
         dk = self.dk
         B = x0.shape[0]
-        sig = self.sigma(H)
-        if self.cfg.source == "gauss":
-            z0 = self.source(e if sel is None else e[:, sel], gen, sig[:, None])
-            add = None
-        else:
-            pick = lambda t: t.detach() if sel is None else t.detach()[:, sel]  # noqa: E731
-            z0, add = pick(dk.last["zin"]), pick(e - dk.last["p"]).flatten(0, 1)
-        P = z0.shape[1]
-        hours = (doy0 + lead).float() * 24.0
-        c = SimpleNamespace(B=B, P=P, lead=lead, hours=hours, tisr=tisr, add=add, H=H, z0=z0.flatten(0, 1),
-                            bidx=torch.arange(B, device=x0.device).repeat_interleave(P),
-                            doy=(doy0 + lead).float(), xs=self.mean_path(x0, hours, tisr), _cond={})
-        c.sig = sig[c.bidx]
+        with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
+            sig = self.sigma(H)
+            if self.cfg.source == "gauss":
+                z0 = self.source(e if sel is None else e[:, sel], gen, sig[:, None])
+                add = None
+            else:
+                pick = lambda t: t if sel is None else t[:, sel]  # noqa: E731
+                z0, add = pick(dk.last["zin"].detach()), pick(e - dk.last["p"].detach()).flatten(0, 1)
+            P = z0.shape[1]
+            hours = (doy0 + lead).float() * 24.0
+            c = SimpleNamespace(B=B, P=P, lead=lead, hours=hours, tisr=tisr, add=add, H=H, z0=z0.flatten(0, 1),
+                                bidx=torch.arange(B, device=x0.device).repeat_interleave(P), grad=grad,
+                                doy=(doy0 + lead).float(), xs=self.mean_path(x0, hours, tisr), _cond={})
+            c.sig = sig[c.bidx]
         return c
 
     def cond_k(self, c, k: int):
-        """The conditioning at t_k (B, C, H, W): the mean path's state and its G, the time advanced by t_k."""
-        if k not in c._cond:
+        """The conditioning at t_k (B, C, H, W): the mean path's state and its G, the time advanced by t_k (with
+        the graph of H for a context made with ``grad``)."""
+        g = bool(getattr(c, "grad", False)) and torch.is_grad_enabled()   # a pass without a graph keeps its own copy
+        if (k, g) not in c._cond:
             t = k / self.N
-            c._cond[k] = self.cond(c.xs[k], c.H, c.doy + t, c.lead + t)
-        return c._cond[k]
+            c._cond[(k, g)] = self.cond(c.xs[k], c.H, c.doy + t, c.lead + t, g)
+        return c._cond[(k, g)]
 
     @torch.no_grad()
     def zero_path(self, c):
@@ -309,9 +314,9 @@ class CoreFlow(DeviationFlow):
         """The members' deviations of the day (B, P, 66, H, W). ``steps`` is not used: the grid is the day's."""
         return self.run(self.day_start(x0, e, H, doy0, tisr, lead, gen), grad=grad)
 
-    def day_ctx(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, sel=None):
+    def day_ctx(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, sel=None, grad: bool = False):
         """The sampler's context of the day (``day_start``; xb is not used: the path starts from the day's start)."""
-        return self.day_start(x0, e, H, doy0, tisr, lead, gen, sel)
+        return self.day_start(x0, e, H, doy0, tisr, lead, gen, sel, grad)
 
     def day_run(self, c, steps: Optional[int] = None, grad: bool = False, jac: bool = False):
         """The members' deviations (B, P', 66, H, W) from the day's context. ``steps``: the Heun steps of the learned

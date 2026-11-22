@@ -56,6 +56,8 @@ def main():
     Dk = R.load_devk(a, core, a.dev_tag)
     Fm = R.load_devflow(a, core, a.flow_tag) if a.flow_tag else None
     if Fm is not None:
+        if Fm.meta["dev_tag"] != a.dev_tag:  # (a flow of devtune --kernel-lr is on its own tuned kernel)
+            raise SystemExit(f"--flow-tag {a.flow_tag} is on the kernel {Fm.meta['dev_tag']}, not --dev-tag {a.dev_tag}")
         Dk = Fm.dk
     path, split = np.zeros((a.leads, 2)), np.zeros((a.leads, 2))
     # band-weighted energy score (fpk.escore), sums over the ICs: E|X - y|, 1/2 E|X - X'| and their difference of

@@ -18,6 +18,15 @@ The deviation kernel and its flow (devk, devflow), and two uses of a trained dev
     # fine-tuning with the fair energy score of the members, through the sampler (2 steps of it by default; the
     # flow's own steps at the same memory: --steps 0 --chunk 2)
     python scripts/run_fpk.py devtune --flow-tag devflow_r1 --tag devflow_r1_es --norm grid
+
+Core and kernel learning along instead of frozen (both off by default):
+    # the core's weights in the kernel's training, through the mean's path of --through; the tuned core is a core
+    # checkpoint of its own (--core-out, default <core-tag>_<tag>) and the kernel is recorded on it
+    python scripts/run_fpk.py devk --init devk_x --tag devk_u --through 10 --core-lr 2e-5 --core-anchor 1.0 ...
+    python scripts/run_fpk.py score --core-tag core_gng_devk_u --arms devk_u
+    # the kernel's parameters in the flow's energy-score tuning; the tuned kernel (--kernel-out, default
+    # <the flow's kernel>_j) and the tuned flow on it are both written
+    python scripts/run_fpk.py devtune --flow-tag devflow --tag devflow_j --kernel-lr 1e-5 --kernel-lam 0.5
 """
 
 import argparse
@@ -207,12 +216,75 @@ def load_flow(a, K, tag):
     return Fm.to(a.device).eval()
 
 
+def own_output(path, tuned_from, key, tag):
+    """Refuse to write the tuned checkpoint ``path`` over anything but an earlier output of this very run: a file
+    that records the same source (tuned_from) and, under ``key`` (the saved options), the same --tag. An original
+    core or kernel records neither, so it is never overwritten."""
+    if not os.path.exists(path):
+        return
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if not (isinstance(ck, dict) and ck.get("tuned_from") == tuned_from and (ck.get(key) or {}).get("tag") == tag):
+        raise SystemExit(f"{path} exists and was not written by this run (tuned from {tuned_from}, --tag {tag}): "
+                         f"give another name or remove it")
+
+
+def save_atomic(*pairs):
+    """(object, path), ...: every file is written beside its place first and then put there, in the order given
+    (a failed write leaves all of them as they were; the files of a pair change together but for a kill between
+    the renames)."""
+    for obj, path in pairs:
+        torch.save(obj, path + ".tmp")
+    for _, path in pairs:
+        os.replace(path + ".tmp", path)
+
+
 # ---------------------------------------------------------------------------------------------------------- devk
 def cmd_devk(a, rest):
     """The entropy deviation kernel (fpk.devkernel): the mean runs the core's own trajectory for D days, the
     deviations are carried by the equation, and the entropy residual r (and the size h of the new part) is fitted
-    by the Gaussian log score of the data around the mean on every day (calibrated entropy: E[IGN] = H)."""
+    by the Gaussian log score of the data around the mean on every day (calibrated entropy: E[IGN] = H).
+
+    --core-lr LR > 0: the core is not frozen. Its trained weights theta (fpk.devkernel.core_weights: what the
+    core's own training optimizes; no buffer, statistic or scale of the physical terms) get the gradient of the
+    same loss through the mean's path of --through K (required: K >= 1), xbar_(L+1) = Phi_theta(xbar_L, m_L) with
+    the memory's update, for the K days of a window; the loss of the iteration is
+
+        sum_L loss_L / D + seq_weight x seq  +  W x sum((theta - theta0)^2) / sum(theta0^2)        (--core-anchor W)
+
+    theta0 = the core as loaded. What the core learns from: the mean's error in the log score and in the sequence
+    term, and what the kernel's networks read of the mean's state and memory. Not from the spread: the pairs
+    Phi(xbar +- s e) are evaluated without a graph, as are the physical terms G(x) and the memory's warm-up on the
+    days before the IC (a constant of the gradient, rebuilt with the current weights for every batch). The core
+    stays in eval mode (EntropyDeviationKernel.train). Its weights are an optimizer group of their own (lr LR,
+    weight decay 0, the cosine schedule of the other groups) with their own gradient clipping (norm 1): the
+    kernel's clipping is what it was. The anchor's gradient 2 W (theta - theta0) / sum(theta0^2) is added AFTER
+    that clip (the loss's gradient is cut to norm 1, the pull is not, so a large W does not take the loss's share).
+    Its size: it equals a clipped loss gradient at core_rel = |theta0| / (2 W), so on a core of |theta0|^2 ~ 800
+    W = 1 does nothing (core_rel 14) and W ~ 1e3 holds the core near 1 %; the low learning rate itself bounds the
+    drift to about the sum of the steps' learning rates a weight. Memory: with frozen weights the graph of the mean's path starts at the first
+    day whose input has a gradient (day 2 with --correct; without --correct there is none), now at day 1 of every
+    window; the weights' own gradients are one more tensor a weight.
+    Checkpoints, at every best validation: the tuned core <out>/<--core-out>.pt, the original core's checkpoint
+    with the trained weights replaced (the format build_core loads) plus tuned_from and the options (devk), and
+    the kernel with core_tag = --core-out (and core_from, train): score / diag_* / devflow --core-tag <--core-out>
+    take both, the original core is refused for this kernel and its file is never written. Logged with every
+    validation: core_rel = |theta - theta0| / |theta0|, core_anchor = W core_rel^2, core_grad = the norm of the
+    loss's gradient on the core's weights before the clip, core_pull = the norm of the anchor's gradient."""
     torch.manual_seed(a.seed)
+    if a.core_lr < 0 or (not a.core_lr > 0 and (a.core_anchor or a.core_out)):
+        raise SystemExit("--core-anchor / --core-out belong to --core-lr LR > 0 (the core is frozen without it)")
+    if a.fresh_best and not a.init:
+        raise SystemExit("--fresh-best belongs to --init (without it every checkpoint is a trained state)")
+    if a.core_lr > 0:
+        if a.through < 1:
+            raise SystemExit("--core-lr > 0 needs --through K >= 1: the core's weights learn from the gradient through "
+                             "the mean's path of the equation, and --through 0 cuts that path after every day")
+        a.core_out = a.core_out or f"{a.core_tag}_{a.tag}"
+        if a.core_out == a.core_tag:
+            raise SystemExit(f"--core-out {a.core_out} is the core's own tag: the original core is never overwritten")
+        if a.core_out in (a.tag, a.init):
+            raise SystemExit(f"--core-out {a.core_out} is the tag of a kernel of this run (--tag / --init): two files, two names")
+        own_output(os.path.join(a.out, f"{a.core_out}.pt"), a.core_tag, "devk", a.tag)
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
     Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth,
@@ -229,6 +301,8 @@ def cmd_devk(a, rest):
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
         miss, own = Dk.load_init(ck["state"])
         assert not miss.unexpected_keys, miss
+        if ck.get("core_tag") not in (None, a.core_tag):  # allowed (a start value), but never silently
+            log(dict(init=a.init, fitted_on_core=ck["core_tag"], this_core=a.core_tag))
         if own:  # the options of this run decide the fixed buffers of the balanced noise / fdt, not the checkpoint
             log(dict(init=a.init, buffers_of_this_run_kept=own))
     Dk.through = a.through
@@ -248,11 +322,25 @@ def cmd_devk(a, rest):
     params = [p_ for p_ in Dk.parameters() if p_.requires_grad]
     cn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_.startswith("cnet.")]
     rest_ = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and not n_.startswith("cnet.")]
-    opt = torch.optim.AdamW([dict(params=rest_, lr=a.lr)] + ([dict(params=cn, lr=a.lr_correct or a.lr)] if cn else []),
-                            weight_decay=1e-4)
+    cw, cpar, th0, n0, ck_core = {}, [], [], 1.0, None
+    if a.core_lr > 0:  # after the kernel's own lists: the core's weights are a group and a clipping of their own
+        ck_core = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
+        cw = Dk.train_core()
+        cpar = list(cw.values())
+        bad = [k for k, v in cw.items() if k not in ck_core["state"] or not torch.equal(ck_core["state"][k].to(v), v.detach())]
+        if bad:
+            raise SystemExit(f"--core-lr: the core in memory is not the checkpoint {a.core_tag}.pt (weights {bad[:4]} ...)")
+        th0 = [p_.detach().clone() for p_ in cpar]
+        n0 = float(sum(t.pow(2).sum() for t in th0))
+        log(dict(core_tuned=a.core_out, tuned_from=a.core_tag, core_weights=len(cpar), core_params=sum(p_.numel() for p_ in cpar),
+                 core_lr=a.core_lr, core_anchor=a.core_anchor, through=a.through))
+    opt = torch.optim.AdamW([dict(params=rest_, lr=a.lr)] + ([dict(params=cn, lr=a.lr_correct or a.lr)] if cn else [])
+                            + ([dict(params=cpar, lr=a.core_lr, weight_decay=0.0)] if cpar else []), weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
+    # sum((theta - theta0)^2) / sum(theta0^2) over the core's trained weights: the anchor's term, core_rel^2
+    core_d2 = lambda: sum((p_ - q).pow(2).sum() for p_, q in zip(cpar, th0)) / n0  # noqa: E731
 
     aux = {}  # of the last run: the fdt penalty of every day
 
@@ -267,13 +355,11 @@ def cmd_devk(a, rest):
         xprev = xd
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            i, h_ = Dk.ign(H, xb, yd[:, k], w)
-            if a.band_weight:  # on the deviations before the detach: the band scales learn from it
-                i = i + a.band_weight * Dk.band_ign(e, xb.detach(), yd[:, k])
+            i, h_ = Dk.lead_loss(H, xb, e, yd[:, k], w, a.band_weight)  # the band term on e before the detach
             if a.fdt_weight:  # the spread about the mean stays below the climate's variance, band by band
                 fd = Dk.fdt_penalty(e)
                 i = i + a.fdt_weight * fd
-                aux["fdt"].append(float(fd))
+                aux["fdt"].append(float(fd.detach()))
             if a.energy_weight:
                 # the physical constraint: a member's change of total energy over the day stays within k sigma of
                 # the mean's (sigma = the spread of the data's daily change of energy, measured once)
@@ -284,12 +370,12 @@ def cmd_devk(a, rest):
             e = e.detach()
             es.append((xb - yd[:, k]) / Dk.s)
             vs.append(torch.exp(2 * H))
-            rm.append(float((((xb - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()))
+            rm.append(float(((((xb - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()).detach()))
             if not a.through or (k + 1) % a.through == 0:
                 xb = xb.detach()  # the window of the gradient through the chain ends (--through 0: every day)
                 Dk.detach_state()
             ign.append(i)
-            ent.append(float(h_))
+            ent.append(float(h_.detach()))
             m = Dk.keep * w
             pe, pn, pr = Dk.last["prod"]
             prod.append(tuple(float((t * m).sum() / m.expand_as(t).sum()) for t in (pe, pn, pr)))
@@ -315,13 +401,25 @@ def cmd_devk(a, rest):
 
     def save():
         state = {k: v for k, v in Dk.state_dict().items() if not k.startswith("core.")}
-        torch.save(dict(state=state, cfg=Dk.cfg.__dict__, core_tag=a.core_tag), os.path.join(a.out, f"{a.tag}.pt"))
+        if not cw:
+            torch.save(dict(state=state, cfg=Dk.cfg.__dict__, core_tag=a.core_tag), os.path.join(a.out, f"{a.tag}.pt"))
+            return
+        # the tuned core first (a kernel never names a core that is not there): the original checkpoint's dict with
+        # the trained weights replaced, so build_core loads it as it loads the original
+        tuned = {**ck_core["state"], **{k: v.detach().cpu().clone() for k, v in cw.items()}}
+        save_atomic(({**ck_core, "state": tuned, "tuned_from": a.core_tag, "devk": dict(vars(a))},
+                     os.path.join(a.out, f"{a.core_out}.pt")),
+                    (dict(state=state, cfg=Dk.cfg.__dict__, core_tag=a.core_out, core_from=a.core_tag, train=dict(vars(a))),
+                     os.path.join(a.out, f"{a.tag}.pt")))
 
     t0 = time.time()
     i0, g0, m0, s0 = val()
     log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0, seq=s0)))
     score = lambda vi_, vs_: sum(vi_) / len(vi_) + a.seq_weight * vs_  # noqa: E731
-    best = score(i0, s0) if a.init else float("inf")
+    # --init: the start is a candidate checkpoint (a continued run never ends worse than it began), unless
+    # --fresh-best: a run whose options change the sampler or the loss (--fdt and its penalty, another noise) is not
+    # measured by the start's score, and with it as the bar its training can be discarded as a whole
+    best = score(i0, s0) if (a.init and not a.fresh_best) else float("inf")
     if a.init:
         save()
     for it in range(1, a.iters + 1):
@@ -332,6 +430,14 @@ def cmd_devk(a, rest):
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if cpar:  # on their own: the core's gradient does not change the clipping of the kernel's
+            cg = float(torch.nn.utils.clip_grad_norm_(cpar, 1.0))        # the loss's gradient before the clip
+            if a.core_anchor:  # the pull's gradient 2 W (theta - theta0) / sum(theta0^2), added after the clip: it
+                with torch.no_grad():  # is not cut with the loss's, and a large W does not take the loss's share
+                    for p_, q in zip(cpar, th0):
+                        if p_.grad is None:
+                            p_.grad = torch.zeros_like(p_)
+                        p_.grad.add_(p_ - q, alpha=2.0 * a.core_anchor / n0)
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
@@ -339,10 +445,15 @@ def cmd_devk(a, rest):
             if score(vi, vs_) < best:  # the checkpoint is the best validation loss of the sequence
                 best = score(vi, vs_)
                 save()
-            log(dict(it=it, days=days, ign=round(float(loss), 4), best=round(best, 4), val_seq=vs_, val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
+            d2 = float(core_d2().detach()) if cpar else 0.0
+            # core_grad: the norm of the loss's gradient on the core's weights before its clip (to 1); core_pull:
+            # the norm of the anchor's, 2 W core_rel / |theta0|. The anchor holds the core where the two are equal
+            ct = dict(core_rel=round(d2 ** 0.5, 6), core_anchor=round(a.core_anchor * d2, 6), core_grad=round(cg, 4),
+                      core_pull=round(2.0 * a.core_anchor * (d2 / n0) ** 0.5, 6)) if cpar else {}
+            log(dict(it=it, days=days, ign=round(float(loss.detach()), 4), best=round(best, 4), val_seq=vs_, val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
                      prod_eq=[round(p_[0], 3) for p_ in prod], prod_noise=[round(p_[1], 3) for p_ in prod],
                      r=[round(p_[2], 3) for p_ in prod],
-                     h=round(float(Dk.h().mean()), 4), **fdt, sec=round(time.time() - t0)))
+                     h=round(float(Dk.h().mean()), 4), **fdt, **ct, sec=round(time.time() - t0)))
 
 
 def load_devk(a, core, tag):
@@ -615,7 +726,39 @@ def cmd_devtune(a, rest):
     anchor); a val_es that falls less than val_es_tune, or a rising val_end_tune, shows the two drifting apart
     (--steps 0 --chunk R tunes through the validation's sampler at the memory of R rows). The checkpoint is the
     state of the best validation mean of ES_L / n_L with the VALIDATION sampler (the start included); it has the
-    format of the flow it came from (``load_devflow``, score --arms, diag_spectra --flow-tag) plus tuned_from."""
+    format of the flow it came from (``load_devflow``, score --arms, diag_spectra --flow-tag) plus tuned_from.
+
+    --kernel-lr LR > 0: the kernel is not frozen. Each lead's kernel day runs with the graph of the kernel's own
+    parameters phi (EntropyDeviationKernel.own_parameters; the core without gradient and the states detached
+    between the days, as ``devk`` without --through does), and the loss of the lead is
+
+        ES_L / n_L  +  lam x FM_L(theta; sg(kernel))  +  kernel_lam x K_L(phi)
+
+    ES_L: the members' score as above, now also a function of phi through everything the flow takes from the
+    kernel's day: the source z0 = e_L (core path: the day's-end offset e_L - sg(p), the source rows being the
+    deviations that entered the day), the conditioning's xbar_L and H_L, and the truth's deviation
+    (truth - xbar_L) / s, which moves with the corrected mean; sigma = exp(sg(H_L)), the network's unit, stays a
+    constant (DeviationFlow.sigma), and the core path's steps keep their straight-through Jacobian (--core-jac:
+    their own). FM_L: the flow-matching anchor of the network, with the kernel's e, xbar and H DETACHED. It must not
+    reach the kernel: as a function of the source it is minimized by a source without spread (fpk.devflow, the
+    module's docstring), so its gradient would collapse the ensemble. K_L = the log score of the lead of ``devk``
+    (lead_loss: IGN + band_weight x band_ign; band_weight from the options stored with the kernel (``tune`` or
+    ``train``) if there, else 0.5 for a kernel with band_scale and 0 without; --kernel-band-weight sets it): the
+    kernel's anchor. It is not the whole of devk's loss: the sequence term, the gradient through the mean's path
+    (--through), the fdt penalty and the energy constraint of the kernel's own training are not in it, and
+    nothing of them is logged here (score and diag_spectra of the tuned pair show them). The gradient is taken in two stages (the chain rule): the flow's part hangs on leaves of the
+    day's xbar, e and H, every backward pass of the score (also --chunk's) adds to their gradients g, and one
+    backward pass of kernel_lam K_L / D + <g, (xbar, e, H)> goes through the kernel's day. The kernel's parameters
+    are an optimizer group of their own (lr LR, weight decay 1e-4 as in devk) with their own clipping (norm 1); the
+    kernel stays in eval mode as in every flow training (its networks have no mode: GroupNorm, no Dropout). The
+    graph of a kernel day (its two small networks on the batch, the band transforms of the deviations) is not in
+    graph_gb.
+    Checkpoints (best validation): the tuned kernel <out>/<--kernel-out>.pt (default <the flow's kernel>_j: the
+    original kernel's checkpoint with the new state, plus tuned_from and tune; ``load_devk`` with the same core
+    tag) and the tuned flow with dev_tag = --kernel-out. Logged with every validation: val_kernel_ign and
+    val_kernel_H per lead (the kernel's Gaussian log score and mean entropy: IGN - H = 1/2 is calibrated; a falling
+    H with a rising IGN is a collapsing source, a rising H a blow-up), next to spread / skill of the members; with
+    every training line the kernel's anchor."""
     torch.manual_seed(a.seed)
     a.tag = a.tag or a.flow_tag + "_es"
     if a.tag == a.flow_tag:
@@ -626,6 +769,24 @@ def cmd_devtune(a, rest):
     dev = torch.device(a.device)
     Fm = load_devflow(a, core, a.flow_tag)
     Dk = Fm.dk
+    kt, kpar, bw, ck_k, dev0 = a.kernel_lr > 0, [], 0.0, None, Fm.meta["dev_tag"]
+    if a.kernel_lr < 0 or (not kt and (a.kernel_out or a.kernel_band_weight >= 0)):
+        raise SystemExit("--kernel-out / --kernel-band-weight belong to --kernel-lr LR > 0 (the kernel is frozen without it)")
+    if kt:
+        a.kernel_out = a.kernel_out or dev0 + "_j"
+        if a.kernel_out == dev0:
+            raise SystemExit(f"--kernel-out {a.kernel_out} is the flow's own kernel: the original kernel is never overwritten")
+        if a.kernel_out in (a.tag, a.flow_tag):
+            raise SystemExit(f"--kernel-out {a.kernel_out} is the tag of a flow of this run (--tag / --flow-tag): two files, two names")
+        own_output(os.path.join(a.out, f"{a.kernel_out}.pt"), dev0, "tune", a.tag)
+        ck_k = torch.load(os.path.join(a.out, f"{dev0}.pt"), map_location="cpu", weights_only=False)
+        bw = a.kernel_band_weight if a.kernel_band_weight >= 0 else float(
+            (ck_k.get("tune") or ck_k.get("train") or {}).get("band_weight", 0.5 if Dk.cfg.band_scale else 0.0))
+        if bw and not hasattr(Dk, "sht"):
+            raise SystemExit("--kernel-band-weight > 0: this kernel has no spherical transform (no band score)")
+        kpar = list(Dk.own_parameters().values())
+        for p_ in kpar:  # frozen by the flow's constructor; the core's weights stay frozen
+            p_.requires_grad_(True)
     if a.members > Dk.cfg.pairs:
         Dk.cfg.pairs = a.members  # more independent sources (the kernel's parameters do not depend on P)
     P = Dk.cfg.pairs
@@ -655,7 +816,8 @@ def cmd_devtune(a, rest):
     tr, vr = D.Pairs(years, a.seed, hist=W, ahead=a.days), D.Pairs(va, a.seed + 1, hist=W, ahead=a.days)
     w = D.area_weights(cl.lat).to(dev)
     params = list(Fm.net.parameters())
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4) if not kt else torch.optim.AdamW(
+        [dict(params=params, lr=a.lr), dict(params=kpar, lr=a.kernel_lr)], weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
@@ -666,13 +828,20 @@ def cmd_devtune(a, rest):
         if cfg["path"] == "line":  # the straight line's checkpoint format (no path keys)
             cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
         keep = {k: v for k, v in Fm.meta.items() if k not in ("tuned_from", "tune")}   # dev_tag, core_tag, reflow_of
-        torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, **keep, tuned_from=a.flow_tag,
-                        tune=dict(vars(a), scale=scale.tolist())), os.path.join(a.out, f"{a.tag}.pt"))
+        files = []
+        if kt:  # the tuned kernel first (the flow never names a kernel that is not there): the original's checkpoint
+            kst = {k: v.detach().cpu().clone() for k, v in Dk.state_dict().items() if not k.startswith("core.")}
+            files.append(({**ck_k, "state": kst, "tuned_from": dev0, "tune": dict(vars(a), band_weight=bw)},
+                          os.path.join(a.out, f"{a.kernel_out}.pt")))
+            keep["dev_tag"] = a.kernel_out
+        save_atomic(*files, (dict(state=Fm.net.state_dict(), cfg=cfg, **keep, tuned_from=a.flow_tag,
+                                  tune=dict(vars(a), scale=scale.tolist())), os.path.join(a.out, f"{a.tag}.pt")))
 
     def run(batch, gen=None, train=False):
         """Per lead (days, 10), batch means: ES, the anchor, |truth - xbar|, spread^2 and skill^2 (grid norm); and
         of the validation: ES of the tuning sampler, the mean squares (units of sigma) of its endpoint minus the
-        validation sampler's and of the latter, the kinetic energy and the squared displacement of the latter."""
+        validation sampler's and of the latter, the kinetic energy and the squared displacement of the latter.
+        --kernel-lr: three more columns, the kernel's IGN, its mean entropy and (training) its anchor."""
         x, ys, doy, tns, hi = batch
         if ys.dim() == 4:
             ys, tns = ys[:, None], tns[:, None]
@@ -680,22 +849,32 @@ def cmd_devtune(a, rest):
         with torch.no_grad():
             e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
         xb, out = xd, []
+        kg = kt and train        # the kernel's day with the graph of its parameters
+        gk = dict(grad=True) if kg else {}
         for k in range(a.days):
             x0 = xb
-            with torch.no_grad():
+            with torch.set_grad_enabled(kg):
                 xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-                z1 = (yd[:, k] - xb) / Dk.s * Dk.keep
+                if kg:  # two stages: the flow's part on leaves fx, fe, fH; the day's own outputs kept for the second
+                    kout = (xb, e, H)
+                    xb, e, H = (t.detach() for t in kout)   # what the anchor of the network and the next day see
+                    fx, fe, fH = leaves = [t.detach().requires_grad_(True) for t in kout]
+                else:
+                    fx, fe, fH = xb, e, H
+                z1 = (yd[:, k] - fx) / Dk.s * Dk.keep
             sel = torch.randperm(P, generator=gen)[:M] if (train and M < P) else None
-            c = Fm.day_ctx(x0, xb, e, H, doy, tns[:, k], k, gen, sel)
+            c = Fm.day_ctx(x0, fx, fe, fH, doy, tns[:, k], k, gen, sel, **gk)
             wk = 1.0 / (float(scale[k]) * a.days)                     # the lead's weight of the score in the loss
             if train and a.chunk:   # two passes: the members, d ES / d members, then the graph of a.chunk rows at a time
                 with torch.no_grad():
                     z = Fm.day_run(c, n_tr or None, **jk)
                 zl = z.clone().requires_grad_(True)
                 es = energy_score(zl, z1, norm)[0].mean()
-                gz = torch.autograd.grad(es * wk, zl)[0].flatten(0, 1)
-                for r in torch.arange(gz.shape[0], device=gz.device).split(a.chunk):
-                    (Fm.day_run(Fm.ctx_rows(c, r), n_tr or None, grad=True, **jk)[0] * gz[r]).sum().backward()
+                gz = torch.autograd.grad(es * wk, zl, retain_graph=kg)[0].flatten(0, 1)
+                if kg:  # the truth's deviation moves with the kernel's mean: d ES / d xbar through z1
+                    torch.autograd.backward(es * wk, inputs=[fx])
+                for r in torch.arange(gz.shape[0], device=gz.device).split(a.chunk):  # (the context's graph is shared)
+                    (Fm.day_run(Fm.ctx_rows(c, r), n_tr or None, grad=True, **jk)[0] * gz[r]).sum().backward(retain_graph=kg)
             else:
                 z = Fm.day_run(c, (n_tr if train else n_va) or None, grad=train, **jk)   # (B, M, 66, H, W)
                 es = energy_score(z, z1, norm)[0].mean()
@@ -710,7 +889,14 @@ def cmd_devtune(a, rest):
             an = Fm.day_loss(x0, xb, e, H, yd[:, k], doy, tns[:, k], k, w, gen, sel) if (a.lam > 0 or not train) else None
             if train and an is not None:
                 (a.lam * an / a.days).backward()
+            if kg:  # second stage, once through the kernel's day: its own loss (the anchor) + the score's gradients
+                ka = Dk.lead_loss(kout[2], kout[0], kout[1], yd[:, k], w, bw)[0]
+                (a.kernel_lam * ka / a.days + sum((t * q.grad).sum() for t, q in zip(kout, leaves)
+                                                 if t.requires_grad and q.grad is not None)).backward()
+                more = more + [0.0, 0.0, float(ka.detach())]
             with torch.no_grad():
+                if kt and not train:
+                    more = more + [float(v) for v in Dk.ign(H, xb, yd[:, k], w)] + [0.0]
                 sp, sk = spread_skill(z, z1, grid)
                 out.append([es, 0.0 if an is None else float(an.detach()), float(norm(z1).mean()),
                             float(sp.mean()), float(sk.mean())] + more)
@@ -733,6 +919,8 @@ def cmd_devtune(a, rest):
                  straight=rd(r[:, 8] / np.maximum(r[:, 9], 1e-30)))
         if n_tr != n_va:  # the tuning sampler on the validation draws: its score and its endpoint against the validation's
             v.update(es_tune=rd(r[:, 5] / scale), end_tune=rd(np.sqrt(r[:, 6] / np.maximum(r[:, 7], 1e-30))))
+        if kt:  # the source: the kernel's Gaussian log score and mean entropy (IGN - H = 1/2: calibrated)
+            v.update(kernel_ign=rd(r[:, 10]), kernel_H=rd(r[:, 11]))
         return float(np.mean(r[:, 0] / scale)), v
 
     t0 = time.time()
@@ -740,11 +928,15 @@ def cmd_devtune(a, rest):
     best, v0 = val()
     save()
     log(dict(devtune_val_start=v0, scale=rd(scale), norm=a.norm, members=M, pairs=P, flow=a.flow_tag,
-             path=Fm.cfg.path, lam=a.lam, steps=n_tr, val_steps=n_va, graph_units=units, graph_gb=round(gb, 2)))
+             path=Fm.cfg.path, lam=a.lam, steps=n_tr, val_steps=n_va, graph_units=units, graph_gb=round(gb, 2),
+             **(dict(kernel=dev0, kernel_out=a.kernel_out, kernel_lr=a.kernel_lr, kernel_lam=a.kernel_lam,
+                     kernel_band_weight=bw, kernel_params=sum(p_.numel() for p_ in kpar)) if kt else {})))
     for it in range(1, a.iters + 1):
         opt.zero_grad()
         r = run(tr(a.batch), train=True)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
+        if kt:  # on their own: the kernel's gradient does not change the clipping of the network's
+            torch.nn.utils.clip_grad_norm_(kpar, 1.0)
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
@@ -753,6 +945,7 @@ def cmd_devtune(a, rest):
                 best = sc
                 save()
             log(dict(it=it, es=rd(r[:, 0] / scale), anchor=round(float(r[:, 1].mean()), 4),
+                     **(dict(kernel_anchor=round(float(r[:, 12].mean()), 4)) if kt else {}),
                      **{"val_" + k: q for k, q in v.items()}, best=round(best, 4), sec=round(time.time() - t0)))
 
 
@@ -1008,11 +1201,24 @@ def main(argv=None):
                    help="the new part's field: 3 x 3 smoothed, spherical harmonics with learned band amplitudes + AR(1), "
                         "or balanced (psi / chi per level: rotational wind, linear-balance Phi, hydrostatic T)")
     d.add_argument("--init", default="", help="start from this fitted deviation kernel")
+    d.add_argument("--fresh-best", action="store_true",
+                   help="--init: the checkpoint is the best validation of the TRAINED states (the start is written first "
+                        "and replaced at the first validation); default: the start counts, and stays if none is better")
     d.add_argument("--through", type=int, default=0,
                    help="days of the gradient through the mean's path of the chain (a correction answers for later days)")
     d.add_argument("--seq-weight", type=float, default=0.0,
                    help="weight of the sequence term: the squared error of the sequence's mean over its mean variance")
     d.add_argument("--lr-correct", type=float, default=0.0, help="learning rate of the correction net (0 = --lr)")
+    d.add_argument("--core-lr", type=float, default=0.0,
+                   help="> 0: the core's trained weights learn along (0 = frozen), with this learning rate, through the "
+                        "mean's path of --through K (K >= 1 required). The core learns from the mean's error (the log "
+                        "score's mean term, the sequence term), not from the spread: the pairs of the deviations are "
+                        "evaluated without gradient. Writes the tuned core --core-out; the kernel is recorded on it")
+    d.add_argument("--core-anchor", type=float, default=0.0,
+                   help="--core-lr: weight W of the pull to the original core, W sum((theta - theta0)^2) / sum(theta0^2); "
+                        "its gradient is added after the clip of the loss's (compare the logged core_pull and core_grad)")
+    d.add_argument("--core-out", default="",
+                   help="--core-lr: tag of the tuned core's checkpoint (default <core-tag>_<tag>); never the core's own")
     d.add_argument("--hidden", type=int, default=32)
     d.add_argument("--iters", type=int, default=800)
     d.add_argument("--batch", type=int, default=4)
@@ -1080,6 +1286,19 @@ def main(argv=None):
                     help="refuse to start when the estimated graph of a lead (logged as graph_gb) is larger; 0 = no limit")
     dt.add_argument("--core-jac", action="store_true",
                     help="core path: keep the equation's Jacobian of the core steps in the gradient (default: identity)")
+    dt.add_argument("--kernel-lr", type=float, default=0.0,
+                    help="> 0: the kernel's own parameters learn along (0 = frozen) with this learning rate, from the "
+                         "members' energy score through the sampler (the source e_L, the conditioning's xbar_L and H_L); "
+                         "the flow-matching anchor (--lam) is kept away from them, it would collapse the source")
+    dt.add_argument("--kernel-lam", type=float, default=0.5,
+                    help="--kernel-lr: weight of the kernel's own loss of the lead (IGN + band-weight x band IGN, as devk) "
+                         "as the kernel's anchor")
+    dt.add_argument("--kernel-out", default="",
+                    help="--kernel-lr: tag of the tuned kernel's checkpoint (default <the flow's kernel>_j); never the "
+                         "kernel's own. The tuned flow is recorded on it")
+    dt.add_argument("--kernel-band-weight", type=float, default=-1.0,
+                    help="--kernel-lr: the band weight of the kernel's anchor; < 0 (default) = the one stored with the "
+                         "kernel's training options, else 0.5 for a kernel with band_scale and 0 without")
     dt.add_argument("--days", type=int, default=10)
     dt.add_argument("--batch", type=int, default=2)
     dt.add_argument("--val-batches", type=int, default=4)

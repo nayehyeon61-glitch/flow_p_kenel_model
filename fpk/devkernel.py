@@ -29,6 +29,13 @@ on every day of a rollout. Its minimum is the calibrated entropy, E[IGN] = H: th
 error of the mean, so the long-lead overshoot is penalized directly. The core is frozen and no gradient goes through
 it (r and h are the trained parts, the deviations are detached between days).
 
+The core can learn along (``run_fpk.py devk --core-lr``, ``train_core``): with ``through`` = K the mean's day keeps
+its graph, and the core's trained weights theta then receive d loss / d theta along the mean's path
+xbar_(L+1) = Phi_theta(xbar_L, m_L), m_L = GRU_theta(m_(L-1), ...) of the K days of a window. Three parts of the
+kernel stay constants of that gradient: the pairs Phi(xbar +- s e) of the deviations (``_cloud``, no graph: the
+core does not learn from the equation's growth of the spread), the physical terms G(x) (the operator runs without
+gradient) and the memory at the IC (``start``: its warm-up on the days before runs without a graph).
+
 ``correct``: the chain of transition kernels p(x_t | x_(t-1)) trained as a 10-day sequence. Every link is
     transport   the equation's day of the mean and of the deviations (above)
     correction  at the new x_t: mean += s exp(H) delta(x_t, G(x_t), cloud shift, m, ...), H += r2(...)
@@ -124,6 +131,15 @@ class DevConfig:
     #                           not reduce the spread of the band l = 1 of z or T
     aam_fix: bool = False     # balanced noise: the day's WHOLE new part (the remainder's u too) carries no axial angular
     #                           momentum: on every level u - c cos(phi), c = <u cos(phi)> / <cos^2(phi)> (``aam_neutral``)
+
+
+def core_weights(core):
+    """name -> parameter: the core's trained weights. Every nn.Parameter of the core module, which is what the core's
+    own training optimizes (third_party/pgfm/scripts/run_kai_tendency.py, arm core: AdamW(m.parameters())): the
+    tendency network, and of a memory core the memory's encoder and GRU (and the kernel times, the long-memory term).
+    Not in it: the buffers (static, t6, keep, the positivity map's units, the scale ``gscale`` of the physical terms)
+    and the operator of G(x), a plain attribute without parameters of the core."""
+    return dict(core.named_parameters())
 
 
 class EntropyDeviationKernel(nn.Module):
@@ -266,9 +282,29 @@ class EntropyDeviationKernel(nn.Module):
         return miss, diff
 
     def train(self, mode: bool = True):
+        """The core stays in eval mode, also when its weights are trained (``train_core``): it is tuned as the
+        function it forecasts with. A core with norm "gn" (GroupNorm, Dropout replaced by the identity:
+        ``stateless_norm``) is the same function in both modes; a "bn" core keeps its running statistics (buffers,
+        neither trained nor updated) and its Dropout off."""
         super().train(mode)
         self.core.eval()
         return self
+
+    def train_core(self, on: bool = True):
+        """The core's trained weights (``core_weights``) with requires_grad = ``on``: name -> parameter. With
+        ``through`` >= 1 they receive the gradient of the mean's path (``_equation``); nothing of the kernel is cached
+        from the weights (the memory of a trajectory is rebuilt by ``start``, the pairs are evaluated every day), and
+        the kernel's own checkpoint is its state without core.* as before: the trainer saves the core beside it."""
+        cw = core_weights(self.core)
+        for p in cw.values():
+            p.requires_grad_(on)
+        return cw
+
+    def own_parameters(self):
+        """name -> parameter: the kernel's own trained parts, what ``devk`` optimizes: every parameter but the
+        core's (core.*) and, with ``fdt``, the rho_raw that is kept for the checkpoints only."""
+        return {n: p for n, p in self.named_parameters()
+                if not n.startswith("core.") and not (n == "rho_raw" and bool(self.cfg.fdt))}
 
     @property
     def s(self):
@@ -384,8 +420,9 @@ class EntropyDeviationKernel(nn.Module):
 
     def _equation(self, xbar, e, doy, tisr):
         """The mean's day and the deviations carried by the equation: (Phi(xbar), p (B, P, 66, H, W), G(xbar)).
-        ``self.through``: the mean's own day keeps its graph (the core's weights are frozen, the gradient goes to
-        xbar and the memory), so a correction of day t is scored by the days after it."""
+        ``self.through``: the mean's own day keeps its graph (the gradient goes to xbar and the memory, and to the
+        core's weights when they are trained, ``train_core``; frozen otherwise), so a correction of day t is scored
+        by the days after it. The pairs of the deviations are evaluated without a graph in either case."""
         B, P = e.shape[:2]
         core, hours = self.core, doy.float() * 24.0
         with torch.set_grad_enabled(bool(self.through) and torch.is_grad_enabled()):
@@ -519,6 +556,16 @@ class EntropyDeviationKernel(nn.Module):
         m = self.keep * w
         n = m.expand_as(v).sum()
         return (v * m).sum() / n, (H * m).sum() / n
+
+    def lead_loss(self, H, xbar, e, truth, w, band_weight: float = 0.0):
+        """The log score of one lead, the loss ``devk`` sums over the days and the kernel's anchor of
+        ``devtune --kernel-lr``: IGN(H, xbar, truth) + band_weight x band_ign(e, sg(xbar), truth), e the day's
+        deviations before their detach (the band scales learn from the second term, the mean from the first only).
+        Returns (the loss, the mean entropy of ``ign``)."""
+        i, h = self.ign(H, xbar, truth, w)
+        if band_weight:
+            i = i + band_weight * self.band_ign(e, xbar.detach(), truth)
+        return i, h
 
     def _band(self, t):
         """(..., L) degree power -> (..., nb) band power."""
