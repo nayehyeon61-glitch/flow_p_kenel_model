@@ -50,12 +50,25 @@ import torch.nn.functional as F
 from .env import time_features
 from .env import PGFM  # noqa: F401  (sys.path)
 from .kernel import ADV_STATE, MEM_STATE, smooth_noise
-from .sphere import SHT, bands
+from .sphere import A_EARTH, SHT, bands
 from pgcfm.core import Net  # noqa: E402
 from pgcfm.kai_tend import core_step, stateless_norm  # noqa: E402
 from pgcfm.seqdct import _NetCfg  # noqa: E402
 
 HALF_LOG_2PIE = 0.5 * (math.log(2 * math.pi) + 1.0)
+R_DRY = 287.05  # J / (kg K)
+
+
+def _softplus_inv(v: float) -> float:
+    return math.log(math.expm1(v))
+
+
+def level_channels():
+    """The dynamic-channel indices (4, K) of z, t, u, v on the K pressure levels (top first) and the levels (Pa)."""
+    from .env import DYN, contract
+    names = [contract.CHANNEL_NAMES[c] for c in DYN]
+    idx = [[names.index(f"{v}{p}") for p in contract.LEVELS_HPA] for v in ("z", "t", "u", "v")]
+    return torch.tensor(idx), np.asarray(contract.LEVELS_PA, dtype=np.float64)
 
 
 @dataclass
@@ -86,11 +99,31 @@ class DevConfig:
     #                           diag_spectra.py: its 1-day error spectrum (err_deg, all channels), unit variance
     noise: str = "smooth"     # the new part's field: "smooth" (3 x 3 mean of white noise) or "sphere": spherical
     #                           harmonics with a learned amplitude per Littlewood-Paley band and channel (starts as
-    #                           the isotropic copy of "smooth") and an AR(1) correlation in time per band
+    #                           the isotropic copy of "smooth") and an AR(1) correlation in time per band;
+    #                           "balanced": per pressure level a streamfunction psi and a velocity potential chi
+    #                           (spherical harmonics, learned amplitude per level and band), the wind
+    #                           k x grad psi + grad chi, the geopotential of the linear balance
+    #                           lap Phi = div(f grad psi) and the hydrostatic T = -(1/R) dPhi/dln p; the other
+    #                           channels, and a learned small remainder of u, v, T, z, are "sphere" noise
+    noise_spec: str = ""      # balanced noise: a json of diag_spectra.py whose 1-day error spectrum of the wind
+    #                           (err_deg: u250, else all) starts psi's degree spectrum, amp_psi(l)^2 ~ E(l) / (l (l+1));
+    #                           "" = e0_spec if given, else the base spectrum of the sphere noise
+    bal_vert: float = 1.0     # balanced noise: the vertical correlation of psi and chi, exp(-(dln p)^2 / (2 d^2))
+    #                           (0 = independent levels, whose hydrostatic T is far too large)
+    fdt: str = ""             # fluctuation-dissipation: a json of clim_bands.py. The AR(1) rho per band is its
+    #                           one-day autocorrelation (fixed, not learned) and ``fdt_penalty`` holds the deviations'
+    #                           band power below its climatological band power
+    fdt_bmin: int = 0         # the first band of ``fdt_penalty`` (1: without the band l = 0, the global mean, whose
+    #                           power is one coefficient a pair and whose climatological value is about 1e-4 s^2)
 
 
 class EntropyDeviationKernel(nn.Module):
-    def __init__(self, core, cfg: DevConfig = DevConfig()):
+    # the fixed buffers that the balanced noise and the fdt settings derive from the configuration of the run
+    CFG_BUFFERS = ("bal_unit", "bal_k", "psi_amp", "bal_vert", "bal_dlnp", "fdt_c", "fdt_rho")
+
+    def __init__(self, core, cfg: DevConfig = DevConfig(), std=None):
+        """``std`` (66 or 67 values): the z-score std of the channels, needed by the balanced noise (SI units);
+        None = the contract's reference values. A checkpoint carries the constants derived from it."""
         super().__init__()
         self.core, self.cfg = core, cfg
         self.through = 0  # training: days of the gradient through the mean's path of the equation (0 = none)
@@ -107,7 +140,12 @@ class EntropyDeviationKernel(nn.Module):
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
         if cfg.noise_mult > 0:
             self.a_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.noise_mult))))
-        if cfg.noise == "sphere" or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0:
+        if cfg.noise not in ("smooth", "sphere", "balanced"):
+            raise ValueError(f"noise = {cfg.noise!r}: smooth, sphere or balanced")
+        if cfg.noise == "balanced" and cfg.noise_mult > 0:
+            raise ValueError("noise_mult replaces the additive new part: it cannot be combined with balanced noise")
+        sphere = cfg.noise in ("sphere", "balanced")
+        if sphere or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0 or cfg.fdt:
             H = int(core.static.shape[-2])
             lat = [-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]  # the data's equiangular grid, south to north
             self.sht = SHT(lat)
@@ -120,7 +158,7 @@ class EntropyDeviationKernel(nn.Module):
             self.register_buffer("e0_amp", (sp / sp.sum()).clamp(min=0).sqrt())  # (L,), unit total variance
         if cfg.band_scale:
             self.g_band = nn.Parameter(torch.zeros(10, 66, nb))  # log scale per lead (day 1..10), channel, band
-        if cfg.noise == "sphere":
+        if sphere:
             # the degree spectrum of smooth_noise (unit variance): the start of the band amplitudes
             with torch.no_grad():
                 z = smooth_noise((512, 1, H, 2 * H), self.sht.syn, torch.Generator().manual_seed(0))
@@ -128,7 +166,19 @@ class EntropyDeviationKernel(nn.Module):
             self.register_buffer("base_amp", base.clamp(min=1e-12).sqrt())  # (L,)
             self.a_log = nn.Parameter(torch.zeros(66, nb))      # log amplitude per channel and band
             self.rho_raw = nn.Parameter(torch.zeros(nb))         # AR(1) in time per band, rho = tanh(raw)
-        self._xi = None
+        if cfg.noise == "balanced":
+            self._init_balanced(std)
+        if cfg.fdt:
+            import json
+            d = json.load(open(cfg.fdt))
+            c, rho = torch.tensor(d["c"], dtype=torch.float32), torch.tensor(d["rho_band"], dtype=torch.float32)
+            if tuple(c.shape) != (66, nb) or tuple(rho.shape) != (nb,):
+                raise ValueError(f"{cfg.fdt}: c {tuple(c.shape)} and rho_band {tuple(rho.shape)}, not (66, {nb}) and ({nb},)")
+            self.register_buffer("fdt_c", c.clamp(min=1e-10))            # climatological band power, units of s^2
+            self.register_buffer("fdt_rho", rho.clamp(0.0, 0.999))       # one-day autocorrelation per band
+            if sphere:
+                self.rho_raw.requires_grad_(False)                       # kept for the checkpoints, not used
+        self._xi, self._bc = None, None
         if cfg.correct:
             # at the new state: x_t, G(x_t), the cloud's shift of the mean (mean of Phi over the members - Phi(xbar),
             # the equation's own nonlinear correction), the day's tendency, log size before / after, the entropy
@@ -136,6 +186,67 @@ class EntropyDeviationKernel(nn.Module):
             # head, so the chain starts as the uncorrected kernel
             c2 = 66 + n_g + 66 + 66 + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch
             self.cnet = stateless_norm(Net(c2, 132, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
+
+    def _init_balanced(self, std):
+        """The constants of the balanced noise. psi_k = K_k a_k A_k(l) sum_j V_kj eta_j: eta unit coefficients,
+        V the vertical correlation, A = exp(p_log)[band] psi_amp(l) / sqrt(2 l + 1) with sum_l l (l + 1) psi_amp^2
+        = 1, so the wind of level k has the area mean u^2 + v^2 = (K_k a_k / a)^2. K_k makes the mean of the
+        variances of u and v in the kernel's units (wind / (std s)) one at a_k = 1."""
+        from .env import DYN, contract
+        cfg, L, nb = self.cfg, self.sht.L, self.n_bands
+        idx, p = level_channels()
+        K = idx.shape[1]
+        sd = np.asarray(contract.REFERENCE_STD if std is None else std, dtype=np.float64).reshape(-1)
+        sd = sd[DYN] if sd.shape[0] == 67 else sd
+        unit = (torch.tensor(sd, dtype=torch.float32) * self.core.t6.reshape(-1).cpu())[idx]     # (4, K) SI per e
+        self.register_buffer("bal_idx", idx)
+        self.register_buffer("bal_unit", unit)
+        self.register_buffer("bal_k", A_EARTH * torch.sqrt(4.0 / (unit[2] ** -2 + unit[3] ** -2)))   # (K,) m2/s
+        # the wind's degree spectrum E(l): the 1-day error of a diag_spectra json, else the sphere noise's base
+        spec = cfg.noise_spec or cfg.e0_spec
+        if spec:
+            import json
+            d = json.load(open(spec))["err_deg"]
+            E = torch.tensor(d.get("u250", d["all"])[0], dtype=torch.float32)
+            if E.shape[0] < L:
+                raise ValueError(f"{spec}: {E.shape[0]} degrees, the grid has {L}")
+            E = E[:L].clamp(min=0)
+        else:
+            E = self.base_amp.pow(2).cpu()
+        l = torch.arange(L, dtype=torch.float32)
+        a2 = torch.where(l > 0, E / (l * (l + 1)).clamp(min=1), torch.zeros(L))    # the kinetic energy of a psi mode
+        self.register_buffer("psi_amp", (a2 / (a2 * l * (l + 1)).sum()).sqrt())    # is l (l + 1) / a^2 |psi_lm|^2
+        # the vertical correlation C_kj = exp(-(ln p_k - ln p_j)^2 / (2 d^2)): V = C^(1/2) with unit rows
+        lnp = np.log(p)
+        if cfg.bal_vert > 0:
+            ev, U = np.linalg.eigh(np.exp(-0.5 * ((lnp[:, None] - lnp[None]) / cfg.bal_vert) ** 2))
+            V = (U * np.sqrt(np.maximum(ev, 0.0))) @ U.T
+            V = V / np.sqrt((V ** 2).sum(1, keepdims=True))
+        else:
+            V = np.eye(K)
+        self.register_buffer("bal_vert", torch.tensor(V, dtype=torch.float32))
+        # hydrostatic: T = -(1/R) dPhi/dln p, centred differences in ln p, one-sided at the two ends
+        Dp = np.zeros((K, K))
+        for k in range(K):
+            lo, hi = max(k - 1, 0), min(k + 1, K - 1)
+            Dp[k, hi] += 1.0 / (lnp[hi] - lnp[lo])
+            Dp[k, lo] -= 1.0 / (lnp[hi] - lnp[lo])
+        self.register_buffer("bal_dlnp", torch.tensor(Dp, dtype=torch.float32))
+        self.p_log = nn.Parameter(torch.zeros(K, nb))                               # log amplitude of psi
+        self.chi_raw = nn.Parameter(torch.full((K, nb), _softplus_inv(0.1)))        # chi / psi amplitude
+        self.w_raw = nn.Parameter(torch.full((4, K), _softplus_inv(0.3)))           # the remainder of z, t, u, v
+
+    def load_init(self, state):
+        """Start from the state of a fitted kernel (strict=False): the learned parts are taken, the fixed buffers
+        of ``CFG_BUFFERS`` stay those of this kernel's own configuration (its cfg is what a checkpoint records).
+        Returns (the keys' result of load_state_dict, the names of the buffers where the state differed)."""
+        own = {k: getattr(self, k).clone() for k in self.CFG_BUFFERS if hasattr(self, k)}
+        miss = self.load_state_dict(state, strict=False)
+        diff = [k for k, v in own.items() if k in state and not torch.equal(state[k].to(v), v)]
+        with torch.no_grad():
+            for k, v in own.items():
+                getattr(self, k).copy_(v)
+        return miss, diff
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -166,19 +277,65 @@ class EntropyDeviationKernel(nn.Module):
         """(66, L): the new part's amplitude per channel and degree (sphere noise)."""
         return torch.exp(self.a_log)[:, self.band_of] * self.base_amp
 
+    def rho(self):
+        """(L,): the AR(1) coefficient in time of every degree (per band): learned, or the climate's (fdt)."""
+        return (self.fdt_rho if self.cfg.fdt else torch.tanh(self.rho_raw))[self.band_of]
+
     def new_noise(self, shape, like, gen=None):
         """The new part's unit field xi (shape (B, P, 66, H, W)); sphere noise keeps its last draw for the AR(1)."""
-        if self.cfg.noise != "sphere":
+        if self.cfg.noise == "smooth":
             return smooth_noise(shape, like, gen)
         eta = self.sht.noise(self.amp(), tuple(shape[:2]) + (66,), gen)  # differentiable in the amplitudes
         if self._xi is None or self._xi.shape != eta.shape:
             xi = eta
         else:  # band by band: xi_t = rho xi_(t-1) + sqrt(1 - rho^2) eta_t, done in spectral space
-            rho = torch.tanh(self.rho_raw)[self.band_of]                      # (L,)
+            rho = self.rho()                                                  # (L,)
             cp, ce = self.sht.analysis(self._xi), self.sht.analysis(eta)
             xi = self.sht.synthesis(rho[:, None] * cp + torch.sqrt(1 - rho ** 2)[:, None] * ce)
         self._xi = xi.detach()
         return xi
+
+    def balance(self, psi, chi=None):
+        """The balanced fields of a streamfunction and a velocity potential, coefficients (..., K, L, M) in m2/s
+        on the K levels: u, v (m/s) = k x grad psi + grad chi, Phi (m2/s2) with lap Phi = div(f grad psi), and
+        T (K) = -(1/R) dPhi/dln p. Each (..., K, H, W)."""
+        u, v = self.sht.wind(psi, chi)
+        phi = self.sht.synthesis(self.sht.linear_balance(psi))
+        T = -torch.einsum("kj,...jhw->...khw", self.bal_dlnp, phi) / R_DRY
+        return u, v, phi, T
+
+    def psi_chi(self, c):
+        """The coefficients of psi and chi (B, P, K, L, M), m2/s, from the unit draws c (2, B, P, K, L, M). The
+        amplitude a_k = sqrt(h_u h_v) of the level is applied to psi before any derivative, so the wind, Phi and
+        T of the level stay balanced with each other."""
+        h = self.h().reshape(-1)
+        a = torch.sqrt(h[self.bal_idx[2]] * h[self.bal_idx[3]]) * self.bal_k                       # (K,)
+        A = torch.exp(self.p_log)[:, self.band_of] * self.psi_amp / torch.sqrt(2 * self.sht.deg + 1)  # (K, L)
+        A = (a[:, None] * A)[:, :, None]
+        mix = lambda t: torch.complex(torch.einsum("kj,...jlm->...klm", self.bal_vert, t.real),  # noqa: E731
+                                      torch.einsum("kj,...jlm->...klm", self.bal_vert, t.imag))
+        return A * mix(c[0]), A * F.softplus(self.chi_raw)[:, self.band_of][:, :, None] * mix(c[1])
+
+    def remainder_weight(self):
+        """(66,): the weight of the independent sphere noise: learned (start 0.3) for u, v, T, z, 1 elsewhere."""
+        w = torch.ones(66, device=self.w_raw.device)
+        return w.index_put((self.bal_idx.reshape(-1),), F.softplus(self.w_raw).reshape(-1))
+
+    def new_part(self, shape, like, gen=None):
+        """h xi, the day's new part (B, P, 66, H, W) in units of s, tisr excluded. Balanced noise:
+        (balanced fields of a_k psi, chi) / (std s) + h_c w_c (sphere noise)_c, the draws of psi, chi and of the
+        remainder each with the AR(1) in time per band."""
+        hxi = self.h().unsqueeze(0) * (self.new_noise(shape, like, gen) * self.keep.unsqueeze(0))
+        if self.cfg.noise != "balanced":
+            return hxi
+        c = self.sht.noise_coef((2,) + tuple(shape[:2]) + (self.bal_idx.shape[1],), like, gen)
+        if self._bc is not None and self._bc.shape == c.shape:
+            rho = self.rho()[:, None]
+            c = rho * self._bc + torch.sqrt(1 - rho ** 2) * c
+        self._bc = c.detach()
+        u, v, phi, T = self.balance(*self.psi_chi(c))
+        bal = torch.cat([phi, T, u, v], 2) / self.bal_unit.reshape(1, 1, -1, 1, 1)
+        return (hxi * self.remainder_weight().view(1, 1, 66, 1, 1)).index_add(2, self.bal_idx.reshape(-1), bal)
 
     @torch.no_grad()
     def start(self, xd, doy, hist=None, gen=None):
@@ -187,7 +344,7 @@ class EntropyDeviationKernel(nn.Module):
         if self.mem:
             self.core.reset(hist, doy.float() * 24.0, xd)
         B, P = xd.shape[0], self.cfg.pairs
-        self._xi = None
+        self._xi, self._bc = None, None
         if self.cfg.e0_spec:  # shaped like the 1-day error: the variance where the error grows from, not at l 16-31
             z = self.sht.noise(self.e0_amp.to(xd), (B, P, xd.shape[1]), gen)
         else:
@@ -257,16 +414,16 @@ class EntropyDeviationKernel(nn.Module):
         the variance of the next day in units of s^2; parts = (stretch, r): the day's entropy production split
         into the equation's stretching 1/2 log <p^2> / <e^2> (+ the new part) and the learned residual."""
         B, _, Hh, Ww = xbar.shape
-        xi = self.new_noise(tuple(e.shape), xbar, gen) * self.keep.unsqueeze(0)
+        hxi = self.new_part(tuple(e.shape), xbar, gen)
         if self.cfg.noise_pre:
             # K_phys o G: the noise goes through the equation with the deviations (linear part M (e + h xi)); the
             # gradient to h and to the noise amplitudes goes through the straight-through copy of the injected part
-            inj = self.h().unsqueeze(0) * xi
+            inj = hxi
             phi0, p, g, shift = self._equation(xbar, e + inj.detach(), doy, tisr)
             q = p + (inj - inj.detach())
         else:
             phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
-            q = p + self.h().unsqueeze(0) * xi
+            q = p + hxi
         if self.cfg.noise_mult > 0:
             L_ = self.sht.L
             amp = torch.zeros(L_, device=xbar.device)
@@ -327,6 +484,24 @@ class EntropyDeviationKernel(nn.Module):
         n = m.expand_as(v).sum()
         return (v * m).sum() / n, (H * m).sum() / n
 
+    def _band(self, t):
+        """(..., L) degree power -> (..., nb) band power."""
+        return torch.stack([t[..., self.band_of == b].sum(-1) for b in range(self.n_bands)], -1)
+
+    def band_power(self, e):
+        """V_cj (B, 66, nb): the band power of the deviations (B, P, 66, H, W), mean over the pairs = the
+        ensemble's variance about its mean in the band (units of s^2)."""
+        return self._band(self.sht.spectrum(e).mean(1)).clamp(min=1e-10)
+
+    def fdt_penalty(self, e):
+        """The one-sided fluctuation-dissipation bound: the spread about the mean cannot exceed the climate's
+        variance, mean over the channels (tisr excluded) and bands j >= fdt_bmin of relu(log V_cj - log c_cj)^2.
+        V_cj is the mean over the pairs AND the batch before the log: the log of a band power estimated from few
+        coefficients scatters, and a one-sided penalty of every sample is then positive at V = c (0.20 in the band
+        l = 0 with 2 pairs), which would push the large scales below the climate instead of capping them."""
+        over = F.relu(torch.log(self.band_power(e).mean(0)) - torch.log(self.fdt_c))       # (66, nb)
+        return over[self.keep.reshape(-1) > 0, self.cfg.fdt_bmin:].pow(2).mean()
+
     def band_ign(self, e, xbar, truth):
         """The Gaussian log score by scale: per channel and band j of degrees, the error's power E_j against the
         deviations' power V_j (mean over the pairs), over the band's n_j coefficients,
@@ -335,9 +510,8 @@ class EntropyDeviationKernel(nn.Module):
         bj = self.band_of
         n = torch.stack([(2 * torch.arange(self.sht.L, device=bj.device)[bj == b] + 1).sum()
                          for b in range(self.n_bands)]).to(e)
-        band = lambda t: torch.stack([t[..., bj == b].sum(-1) for b in range(self.n_bands)], -1)  # noqa: E731
-        V = band(self.sht.spectrum(e).mean(1)).clamp(min=1e-10)                    # (B, 66, nb)
-        E = band(self.sht.spectrum((truth - xbar) / self.s))
+        V = self.band_power(e)                                                     # (B, 66, nb)
+        E = self._band(self.sht.spectrum((truth - xbar) / self.s))
         v = (n * (0.5 * torch.log(V / n) + E / (2 * V))).sum(-1) / n.sum()          # (B, 66)
         k = self.keep.reshape(-1) > 0
         return v[:, k].mean()

@@ -392,3 +392,469 @@ def test_noise_multiplying_the_tendency(mcore):
     assert float(tend.abs().mean()) > 0 and float((zeta - zeta[:, :, :1]).abs().median()) < 1e-3
     Dk.ign(H1, x1, x1.detach() + 0.3 * Dk.s, torch.ones(1, 1, H, 1))[0].backward()
     assert float(Dk.a_raw.grad.abs().sum()) > 0
+
+
+def _gc_dphi(F):
+    """d/dphi of a field (H, W) that is smooth over the poles, by the FFT along the great circles (the meridian
+    lon and its continuation lon + 180 deg form 2 H equally spaced points of a circle)."""
+    Hn = F.shape[-2]
+    G = torch.cat([F, F.roll(F.shape[-1] // 2, -1).flip(-2)], -2)
+    k = torch.fft.fftfreq(2 * Hn, 1.0 / (2 * Hn))
+    return torch.fft.ifft(1j * k[:, None] * torch.fft.fft(G, dim=-2), dim=-2).real[..., :Hn, :]
+
+
+def test_sht_derivatives_on_analytic_fields():
+    """Tolerances on the 32 x 64 grid in float32: 1e-4 relative for the analytic fields, 1e-3 for the pointwise
+    divergence / vorticity of random fields of degree <= 20 against the size of the other one."""
+    from fpk.sphere import OMEGA, SHT
+    lat = np.linspace(-90 + 2.8125, 90 - 2.8125, 32)
+    S = SHT(lat)
+    assert list(S.state_dict()) == ["syn", "ana", "deg"]                 # the checkpoints keep their keys
+    a = S.radius
+    phi = torch.tensor(np.deg2rad(lat), dtype=torch.float32)[:, None]
+    lam = torch.arange(64)[None] * (2 * math.pi / 64)
+    cos, sin = torch.cos(phi), torch.sin(phi)
+    # psi = a cos(phi) cos(lam) (l = 1): lap psi = -2 psi / a^2, u = sin(phi) cos(lam), v = -sin(lam)
+    psi = a * cos * torch.cos(lam)
+    c = S.analysis(psi)
+    assert float((S.synthesis(S.lap(c)) + 2 * psi / a ** 2).abs().max()) < 1e-4 * 2 / a
+    assert torch.allclose(S.inv_lap(S.lap(c)), c, atol=1e-4 * a)
+    u, v = S.wind(c)
+    assert float((u - sin * torch.cos(lam)).abs().max()) < 1e-4 and float((v + torch.sin(lam) * cos / cos).abs().max()) < 1e-4
+    # f = cos^2(phi) cos(2 lam) (l = 2, m = 2): the gradient, and the eigenvalue -l (l + 1) / a^2 = -6 / a^2
+    f = cos ** 2 * torch.cos(2 * lam)
+    cf = S.analysis(f)
+    gx, gy = S.grad(cf)
+    assert float((a * gx + 2 * cos * torch.sin(2 * lam)).abs().max()) < 1e-4
+    assert float((a * gy + 2 * cos * sin * torch.cos(2 * lam)).abs().max()) < 1e-4
+    assert float((a ** 2 * S.synthesis(S.lap(cf)) + 6 * f).abs().max()) < 1e-3
+    # random psi, chi of degree <= 20: the wind of psi has no divergence, the wind of chi no vorticity (pointwise,
+    # d/dlam and d/dphi by FFT along the latitude and the great circles), and helmholtz inverts wind
+    g = torch.Generator().manual_seed(0)
+    cp, cc = S.noise_coef((2,), torch.zeros(1), g), S.noise_coef((2,), torch.zeros(1), g)
+    cp[..., 21:, :], cc[..., 21:, :], cp[..., 0, :], cc[..., 0, :] = 0, 0, 0, 0
+    dlam = lambda F: torch.fft.irfft(1j * torch.arange(33) * torch.fft.rfft(F, dim=-1), n=64, dim=-1)  # noqa: E731
+    div = lambda u, v: (dlam(u) + _gc_dphi(v * cos)) / (a * cos)  # noqa: E731
+    vor = lambda u, v: (dlam(v) - _gc_dphi(u * cos)) / (a * cos)  # noqa: E731
+    rms = lambda t: float(t.pow(2).mean().sqrt())  # noqa: E731
+    up, vp = S.wind(cp)
+    uc, vc = S.wind(torch.zeros_like(cp), cc)
+    assert rms(div(up, vp)) < 1e-3 * rms(vor(up, vp)) and rms(vor(uc, vc)) < 1e-3 * rms(div(uc, vc))
+    assert rms(vor(up, vp) - S.synthesis(S.lap(cp))) < 1e-3 * rms(vor(up, vp))
+    p2, c2 = S.helmholtz(up + uc, vp + vc)
+    assert torch.allclose(p2, cp, atol=1e-4) and torch.allclose(c2, cc, atol=1e-4)
+    zeta, dv = S.vortdiv(up, vp)
+    assert rms(dv) < 1e-4 * rms(zeta)
+    # linear balance: the solid-body rotation u = U cos(phi), psi = -a U sin(phi): Phi = -a Omega U (sin^2 - 1/3);
+    # and lap Phi = f lap psi + (2 Omega cos(phi) / a) (1 / a) dpsi/dphi on the grid for the random psi
+    U = 10.0
+    Phi = S.synthesis(S.linear_balance(S.analysis(-a * U * sin.expand(32, 64))))
+    assert float((Phi + a * OMEGA * U * (sin ** 2 - 1 / 3)).abs().max()) < 1e-4 * a * OMEGA * U
+    rhs = 2 * OMEGA * sin * S.synthesis(S.lap(cp)) + 2 * OMEGA * cos / a * S.grad(cp)[1]
+    assert rms(S.synthesis(S.lap(S.linear_balance(cp))) - rhs) < 1e-4 * rms(rhs)
+
+
+def _balanced(mcore, **kw):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    return EntropyDeviationKernel(mcore, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, noise="balanced", **kw))
+
+
+def test_default_kernel_has_no_new_state(core):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    own = lambda D: sorted(k for k in D.state_dict() if not k.startswith(("core.", "net.", "cnet.")))  # noqa: E731
+    cfg = dict(pairs=2, hidden=8, blocks=(1,))
+    assert own(EntropyDeviationKernel(core, DevConfig(**cfg))) == ["h_raw", "r_bias"]
+    assert own(EntropyDeviationKernel(core, DevConfig(noise="sphere", band_scale=True, **cfg))) == sorted(
+        ["h_raw", "r_bias", "a_log", "rho_raw", "g_band", "band_of", "base_amp", "sht.syn", "sht.ana", "sht.deg"])
+    assert DevConfig().noise == "smooth" and DevConfig().fdt == "" and DevConfig().noise_spec == ""
+
+
+def test_balanced_noise_is_balanced(mcore):
+    """Tolerances (8 x 16 grid, float32): divergence < 1e-3 of the vorticity (RMS) without chi and remainder;
+    hydrostatic and linear-balance residuals < 1e-3 of the terms."""
+    from fpk.devkernel import R_DRY, level_channels
+    from fpk.sphere import OMEGA
+    torch.manual_seed(0)
+    Dk = _balanced(mcore)
+    S, (iz, it, iu, iv) = Dk.sht, Dk.bal_idx
+    rms = lambda t: float(t.pow(2).mean().sqrt())  # noqa: E731
+    with torch.no_grad():
+        x = Dk.new_part((40, 2, 66, H, W), torch.zeros(1), torch.Generator().manual_seed(0))
+        si = lambda k: x[:, :, Dk.bal_idx[k]] * Dk.bal_unit[k].view(1, 1, -1, 1, 1)  # noqa: E731
+        zeta, dv = S.vortdiv(si(2), si(3))
+        r0 = rms(dv) / rms(zeta)                 # chi = 0.1 psi and the remainder 0.3: clearly divergent
+        Dk.chi_raw.fill_(-30.0)
+        Dk.w_raw.fill_(-30.0)
+        Dk.h_raw.fill_(math.log(math.e - 1))     # h = 1
+        x = Dk.new_part((40, 2, 66, H, W), torch.zeros(1), torch.Generator().manual_seed(0))
+        zeta, dv = S.vortdiv(si(2), si(3))
+        assert rms(dv) < 1e-3 * rms(zeta) and r0 > 0.05
+        # h = 1: the wind channels have about unit variance; q and the surface keep the unit sphere noise
+        assert abs(rms(x[:, :, torch.cat([iu, iv])]) - 1.0) < 0.15 and abs(rms(x[:, :, 12:24]) - 1.0) < 0.1
+        assert float(x[:, :, Dk.keep.reshape(-1) == 0].abs().max()) == 0
+        # hydrostatic: R T = -dPhi/dln p (centred in ln p, one-sided at the ends), on the fields of the noise
+        phi, T = si(0), si(1)
+        lnp = torch.tensor(np.log(level_channels()[1]), dtype=torch.float32)
+        d = torch.stack([(phi[:, :, min(k + 1, 11)] - phi[:, :, max(k - 1, 0)]) / (lnp[min(k + 1, 11)] - lnp[max(k - 1, 0)])
+                         for k in range(12)], 2)
+        assert rms(R_DRY * T + d) < 1e-3 * rms(d)
+        # the levels are correlated in the vertical (T of independent levels would be several times larger)
+        assert float((phi[:, :, 5] * phi[:, :, 6]).mean()) > 0.8 * rms(phi[:, :, 5]) * rms(phi[:, :, 6])
+        # linear balance on a psi of degree <= L - 2 (lap Phi is then inside the truncation): lap Phi = div(f grad psi)
+        cp = S.noise_coef((3, 12), torch.zeros(1), torch.Generator().manual_seed(1)) * 1e6
+        cp[..., S.L - 1:, :], cp[..., 0, :] = 0, 0
+        u, v, phi, T = Dk.balance(cp)
+        ph = torch.tensor(np.deg2rad([-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]), dtype=torch.float32)[:, None]
+        rhs = 2 * OMEGA * torch.sin(ph) * S.synthesis(S.lap(cp)) + 2 * OMEGA * torch.cos(ph) / S.radius * S.grad(cp)[1]
+        assert rms(S.synthesis(S.lap(S.analysis(phi))) - rhs) < 1e-3 * rms(rhs)
+        assert rms(S.vortdiv(u, v)[1]) < 1e-3 * rms(S.vortdiv(u, v)[0])
+
+
+def test_balanced_noise_day_gradients_and_time_correlation(mcore, tmp_path):
+    import json
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    torch.manual_seed(0)
+    Dk = _balanced(mcore)
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 2, H, W)
+    hist = torch.randn(2, int(mcore.mem), 66, H, W)
+    with torch.no_grad():
+        Dk.rho_raw.fill_(2.0)
+    e = Dk.start(xd, doy, hist)
+    x1, e1, H1, _ = Dk.day(xd, e, doy, tis[:, 0], 0)
+    assert x1.shape == (2, 66, H, W) and e1.shape == (2, 2, 66, H, W) and H1.shape == (2, 66, H, W)
+    assert torch.isfinite(e1).all() and torch.isfinite(H1).all() and Dk.last["hxi"].shape == e1.shape
+    assert float(e1[:, :, Dk.keep.reshape(-1) == 0].abs().max()) == 0
+    b1, n1 = Dk._bc.clone(), Dk.last["hxi"].detach().clone()
+    x2, e2, H2, _ = Dk.day(x1, e1.detach(), doy + 1, tis[:, 1], 1)
+    cor = lambda a, b: float((a.conj() * b).real.sum() / (a.abs().pow(2).sum().sqrt() * b.abs().pow(2).sum().sqrt()))  # noqa: E731
+    assert cor(b1, Dk._bc) > 0.8 and cor(n1, Dk.last["hxi"].detach()) > 0.8   # AR(1), rho = tanh(2) = 0.96
+    Dk.ign(H2, x2, x2.detach() + 0.3 * Dk.s, torch.ones(1, 1, H, 1))[0].backward()
+    for n in ("p_log", "chi_raw", "w_raw", "a_log", "h_raw", "rho_raw"):
+        g = getattr(Dk, n).grad
+        assert g is not None and torch.isfinite(g).all() and float(g.abs().sum()) > 0, n
+    assert all(p.grad is None for p in mcore.parameters())
+    # composed with the equation (noise_pre) it runs; with the multiplicative noise it is refused
+    Dp = _balanced(mcore, noise_pre=True)
+    x1, e1, H1, _ = Dp.day(xd, Dp.start(xd, doy, hist) * 0, doy, tis[:, 0], 0)
+    assert torch.isfinite(H1).all() and float(e1.abs().mean()) > 0 and float(Dp.last["hxi"].abs().max()) < 1e-6
+    with pytest.raises(ValueError):
+        _balanced(mcore, noise_mult=0.5)
+    # the start of psi's spectrum from a 1-day error spectrum of the wind: amp_psi^2 ~ E(l) / (l (l + 1))
+    E = [0.0, 1.0, 2.0, 4.0, 2.0, 1.0, 0.5, 0.25]
+    f = tmp_path / "d.json"
+    f.write_text(json.dumps({"err_deg": {"all": [[1.0] * H], "u250": [E]}}))
+    Ds = _balanced(mcore, noise_spec=str(f))
+    l = torch.arange(H, dtype=torch.float32)
+    ke = Ds.psi_amp.pow(2) * l * (l + 1)                       # the wind's spectrum of the start
+    assert torch.allclose(ke, torch.tensor(E) / sum(E), atol=1e-5) and float(Ds.psi_amp[0]) == 0
+    with torch.no_grad():
+        Ds.w_raw.fill_(-30.0)
+        Ds.chi_raw.fill_(-30.0)
+        x = Ds.new_part((60, 2, 66, H, W), torch.zeros(1), torch.Generator().manual_seed(0))
+    sp = Ds.sht.spectrum(x[:, :, Ds.bal_idx[2]]).mean((0, 1, 2)) + Ds.sht.spectrum(x[:, :, Ds.bal_idx[3]]).mean((0, 1, 2))
+    assert int(sp.argmax()) == 3
+    # a checkpoint carries the constants: a kernel built without the statistics loads them
+    Dl = _balanced(mcore)
+    Dl.load_state_dict({k: v for k, v in Ds.state_dict().items() if not k.startswith("core.")}, strict=False)
+    assert torch.equal(Dl.psi_amp, Ds.psi_amp) and torch.equal(Dl.bal_k, Ds.bal_k)
+
+
+def test_fdt_bound_and_fixed_time_correlation(core, tmp_path):
+    import json
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    from fpk.sphere import bands
+    nb = bands(H)[1]
+    f = tmp_path / "clim.json"
+    f.write_text(json.dumps(dict(c=[[1.0] * nb] * 66, rho=[[0.5] * nb] * 66, rho_band=[0.9, 0.9, 0.5, 0.0])))
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, noise="sphere", fdt=str(f)))
+    assert not Dk.rho_raw.requires_grad and torch.allclose(Dk.rho()[Dk.band_of == 1], torch.tensor(0.9))
+    e = smooth_noise((2, 2, 66, H, W), torch.zeros(1), torch.Generator().manual_seed(0)) * Dk.keep.unsqueeze(0)
+    V = Dk.band_power(e)
+    assert float(V[:, Dk.keep.reshape(-1) > 0].max()) < 1.0 and float(Dk.fdt_penalty(e)) == 0   # below the climate
+    big = (3.0 * e).requires_grad_(True)
+    pen = Dk.fdt_penalty(big)
+    k = Dk.keep.reshape(-1) > 0
+    want = torch.relu(torch.log(Dk.band_power(big.detach()).mean(0)[k])).pow(2).mean()   # V: mean over the batch
+    assert float(pen) > 0 and abs(float(pen) - float(want)) < 1e-6
+    pen.backward()
+    assert float(big.grad.abs().sum()) > 0
+    # the AR(1) of the noise uses the file's rho: band 1 keeps 0.9 of the last draw, the last band nothing
+    xd, doy = torch.randn(2, 66, H, W), torch.tensor([5, 6])
+    e0 = Dk.start(xd, doy)
+    Dk.new_noise(tuple(e0.shape), xd, torch.Generator().manual_seed(1))
+    a = Dk.sht.analysis(Dk._xi)
+    Dk.new_noise(tuple(e0.shape), xd, torch.Generator().manual_seed(2))
+    b = Dk.sht.analysis(Dk._xi)
+    cor = lambda j: float((a.conj() * b).real[..., Dk.band_of == j, :].sum()  # noqa: E731
+                          / (a.abs().pow(2)[..., Dk.band_of == j, :].sum().sqrt() * b.abs().pow(2)[..., Dk.band_of == j, :].sum().sqrt()))
+    assert abs(cor(1) - 0.9) < 0.08 and abs(cor(nb - 1)) < 0.1
+    # without sphere noise the bound alone works (smooth noise), and a wrong file is refused
+    Dn = EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), fdt=str(f)))
+    assert float(Dn.fdt_penalty(3.0 * e)) > 0 and not hasattr(Dn, "rho_raw")
+    f.write_text(json.dumps(dict(c=[[1.0] * (nb + 1)] * 66, rho_band=[0.5] * (nb + 1))))
+    with pytest.raises(ValueError):
+        EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), fdt=str(f)))
+
+
+def test_balanced_amplitude_scales_psi_and_start_values(mcore):
+    """h of the wind channels is the amplitude of psi BEFORE the derivatives (u, v, Phi and T follow it together);
+    the start values of the spec (chi 0.1 of psi, remainder 0.3) and the unit std s of the balanced fields."""
+    import copy
+    import torch.nn.functional as Fn
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel, R_DRY, level_channels
+    from fpk.env import DYN
+    from fpk.sphere import A_EARTH
+    Dk = _balanced(mcore)
+    iz, it, iu, iv = Dk.bal_idx
+    # the start: chi = 0.1 psi, the remainder 0.3 on z, t, u, v of the levels and 1 on every other channel
+    assert torch.allclose(Fn.softplus(Dk.chi_raw), torch.tensor(0.1)) and Dk.chi_raw.shape == (12, Dk.n_bands)
+    assert torch.allclose(Fn.softplus(Dk.w_raw), torch.tensor(0.3)) and float(Dk.p_log.abs().max()) == 0
+    w = Dk.remainder_weight()
+    lev = torch.zeros(66, dtype=torch.bool)
+    lev[Dk.bal_idx.reshape(-1)] = True
+    assert int(lev.sum()) == 48 and torch.allclose(w[lev], torch.tensor(0.3)) and bool((w[~lev] == 1).all())
+
+    def draw(D, seed=0, n=40):
+        D._xi, D._bc = None, None
+        with torch.no_grad():
+            return D.new_part((n, 2, 66, H, W), torch.zeros(1), torch.Generator().manual_seed(seed))
+
+    # the size of the start: the remainder is 0.3 h of unit noise, the divergent wind about 0.1 of the rotational
+    with torch.no_grad():
+        Dk.h_raw.fill_(math.log(math.e - 1))             # h = 1
+    x = draw(Dk)
+    rms = lambda t: float(t.pow(2).mean().sqrt())  # noqa: E731
+    with torch.no_grad():
+        Dk.p_log.fill_(-30.0)                            # psi and chi off: the remainder alone
+    rem = draw(Dk)
+    assert abs(rms(rem[:, :, lev]) - 0.3) < 0.03 and torch.allclose(rem[:, :, 12:24], x[:, :, 12:24])
+    with torch.no_grad():
+        Dk.p_log.fill_(0.0)
+        Dk.w_raw.fill_(-30.0)
+    xr = draw(Dk)
+    si = lambda t, k: t[:, :, Dk.bal_idx[k]] * Dk.bal_unit[k].view(1, 1, -1, 1, 1)  # noqa: E731
+    zeta, dv = Dk.sht.vortdiv(si(xr, 2), si(xr, 3))
+    assert 0.05 < rms(dv) / rms(zeta) < 0.2
+    # h: twice the h of u and v on every level doubles u, v, z and T; the h of z and T does not enter
+    h1 = math.log(math.e - 1)
+    with torch.no_grad():
+        Dk.chi_raw.fill_(-30.0)
+    x1 = draw(Dk)
+    with torch.no_grad():
+        Dk.h_raw[torch.cat([iu, iv])] = math.log(math.expm1(2.0))
+    x2 = draw(Dk)
+    assert torch.allclose(x2[:, :, lev], 2 * x1[:, :, lev], rtol=1e-4, atol=1e-5) and rms(x1[:, :, it]) > 0.1
+    with torch.no_grad():
+        Dk.h_raw[torch.cat([iu, iv])] = h1
+        Dk.h_raw[torch.cat([iz, it])] = math.log(math.expm1(5.0))
+    assert torch.allclose(draw(Dk), x1, atol=1e-5)
+    # one level (k = 4), a = sqrt(h_u h_v) = 2: its u, v and Phi double, the other levels keep theirs, and T stays
+    # the hydrostatic T of the new Phi (the levels next to it change, R T = -dPhi/dln p)
+    with torch.no_grad():
+        Dk.h_raw[torch.cat([iz, it])] = h1
+        Dk.h_raw[iu[4]], Dk.h_raw[iv[4]] = math.log(math.expm1(4.0)), math.log(math.expm1(1.0))
+    x3 = draw(Dk)
+    oth = torch.tensor([k for k in range(12) if k != 4])
+    for i in (iz, iu, iv):
+        assert torch.allclose(x3[:, :, i[4]], 2 * x1[:, :, i[4]], rtol=1e-4, atol=1e-5)
+        assert torch.allclose(x3[:, :, i[oth]], x1[:, :, i[oth]], atol=1e-5)
+    assert rms(x3[:, :, it[3]] - x1[:, :, it[3]]) > 0.1 * rms(x1[:, :, it[3]])
+    phi, T = si(x3, 0), si(x3, 1)
+    lnp = torch.tensor(np.log(level_channels()[1]), dtype=torch.float32)
+    d = torch.stack([(phi[:, :, min(k + 1, 11)] - phi[:, :, max(k - 1, 0)]) / (lnp[min(k + 1, 11)] - lnp[max(k - 1, 0)])
+                     for k in range(12)], 2)
+    assert rms(R_DRY * T + d) < 1e-3 * rms(d)
+    # the unit of a core whose s differs by channel and of the run's own std: SI = std s e, and the wind of every
+    # level has about unit variance in these units at h = 1
+    c2 = copy.deepcopy(mcore)
+    g = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        c2.t6.copy_((0.1 + 0.5 * torch.rand(66, generator=g)).view_as(c2.t6))
+    std = 0.5 + 10 * torch.rand(67, generator=g).numpy()
+    D2 = EntropyDeviationKernel(c2, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, noise="balanced"), std=std)
+    want = (torch.tensor(std[np.asarray(DYN)], dtype=torch.float32) * c2.t6.reshape(-1))[D2.bal_idx]
+    assert torch.allclose(D2.bal_unit, want, rtol=1e-6) and float(want.std() / want.mean()) > 0.3
+    assert torch.allclose(D2.bal_k, A_EARTH * torch.sqrt(4.0 / (want[2] ** -2 + want[3] ** -2)), rtol=1e-5)
+    with torch.no_grad():
+        D2.h_raw.fill_(h1)
+        D2.w_raw.fill_(-30.0)
+        D2.chi_raw.fill_(-30.0)
+    y = draw(D2, n=80)
+    var = 0.5 * (y[:, :, D2.bal_idx[2]].pow(2).mean((0, 1, 3, 4)) + y[:, :, D2.bal_idx[3]].pow(2).mean((0, 1, 3, 4)))
+    assert float((var - 1).abs().max()) < 0.2, var
+
+
+def test_balanced_time_state_spectrum_fallback_and_init(mcore, tmp_path):
+    """The AR(1) state of psi / chi is cleared by start() and uses the fdt file's rho; noise_spec falls back to
+    e0_spec; load_init keeps the fixed buffers of this run's options."""
+    import json
+    from fpk.sphere import bands
+    nb = bands(H)[1]
+    xd, doy = torch.randn(2, 66, H, W), torch.tensor([5, 6])
+    hist = torch.randn(2, int(mcore.mem), 66, H, W)
+    shape = (2, 2, 66, H, W)
+    gen = lambda i: torch.Generator().manual_seed(i)  # noqa: E731
+    # (a) a new trajectory does not carry the last draw of the one before (rho = tanh(2) = 0.96)
+    Dk = _balanced(mcore)
+    with torch.no_grad():
+        Dk.rho_raw.fill_(2.0)
+        Dk.start(xd, doy, hist)
+        Dk.new_part(shape, xd, gen(1))
+        carried = Dk.new_part(shape, xd, gen(2))
+        Dk.new_part(shape, xd, gen(1))
+        Dk.start(xd, doy, hist)
+        assert Dk._bc is None and Dk._xi is None
+        fresh = Dk.new_part(shape, xd, gen(2))
+        Dk.start(xd, doy, hist)
+        again = Dk.new_part(shape, xd, gen(2))
+    assert torch.equal(fresh, again) and float((fresh - carried).abs().max()) > 0.1
+    # (b) fdt: the AR(1) of the psi / chi draws is the file's rho per band (0.9 at l = 1, 0 in the last band), not
+    # the frozen rho_raw = 0
+    f = tmp_path / "clim.json"
+    f.write_text(json.dumps(dict(c=[[1.0] * nb] * 66, rho_band=[0.9, 0.9, 0.5, 0.0])))
+    Df = _balanced(mcore, fdt=str(f))
+    assert not Df.rho_raw.requires_grad and float(Df.rho_raw.abs().max()) == 0
+    with torch.no_grad():
+        Df.new_part((40, 2, 66, H, W), xd, gen(1))
+        a = Df._bc.clone()
+        Df.new_part((40, 2, 66, H, W), xd, gen(2))
+        b = Df._bc.clone()
+    bj = Df.band_of
+    cor = lambda j: float((a.conj() * b).real[..., bj == j, :].sum()  # noqa: E731
+                          / (a.abs().pow(2)[..., bj == j, :].sum().sqrt() * b.abs().pow(2)[..., bj == j, :].sum().sqrt()))
+    assert abs(cor(1) - 0.9) < 0.03 and abs(cor(2) - 0.5) < 0.05 and abs(cor(nb - 1)) < 0.05
+    # (c) the spectrum of psi: noise_spec, else e0_spec, else the base spectrum of the sphere noise
+    E1, E2 = [0.0, 1.0, 2.0, 4.0, 2.0, 1.0, 0.5, 0.25], [0.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.1, 0.1]
+    f1, f2 = tmp_path / "s1.json", tmp_path / "s2.json"
+    f1.write_text(json.dumps({"err_deg": {"all": [[1.0] * H], "u250": [E1]}}))
+    f2.write_text(json.dumps({"err_deg": {"all": [[1.0] * H], "u250": [E2]}}))
+    l = torch.arange(H, dtype=torch.float32)
+    ke = lambda D: D.psi_amp.pow(2) * l * (l + 1)  # noqa: E731
+    D1, D12, D0 = _balanced(mcore, e0_spec=str(f1)), _balanced(mcore, e0_spec=str(f1), noise_spec=str(f2)), _balanced(mcore)
+    assert torch.allclose(ke(D1), torch.tensor(E1) / sum(E1), atol=1e-5)
+    assert torch.allclose(ke(D12), torch.tensor(E2) / sum(E2), atol=1e-5)
+    assert torch.allclose(ke(D0)[1:], (D0.base_amp.pow(2) / D0.base_amp.pow(2)[1:].sum())[1:], atol=1e-5)
+    # a file without u250: the spectrum of all channels
+    f1.write_text(json.dumps({"err_deg": {"all": [E2]}}))
+    assert torch.allclose(ke(_balanced(mcore, noise_spec=str(f1))), torch.tensor(E2) / sum(E2), atol=1e-5)
+    # (d) --init: the learned parts come from the checkpoint, the fixed buffers stay those of this run's options
+    A = _balanced(mcore, fdt=str(f))
+    with torch.no_grad():
+        A.p_log.fill_(0.5)
+        A.h_raw.fill_(0.7)
+    state = {k: v.clone() for k, v in A.state_dict().items() if not k.startswith("core.")}
+    f.write_text(json.dumps(dict(c=[[2.0] * nb] * 66, rho_band=[0.1] * nb)))
+    C = _balanced(mcore, fdt=str(f), bal_vert=0.0, noise_spec=str(f2))
+    miss, own = C.load_init(state)
+    assert not miss.unexpected_keys and sorted(own) == ["bal_vert", "fdt_c", "fdt_rho", "psi_amp"]
+    assert torch.equal(C.bal_vert, torch.eye(12)) and torch.allclose(ke(C), torch.tensor(E2) / sum(E2), atol=1e-5)
+    assert float(C.fdt_c.min()) == 2.0 and torch.allclose(C.fdt_rho, torch.tensor(0.1))
+    assert torch.equal(C.p_log, A.p_log) and torch.equal(C.h_raw, A.h_raw)
+    assert C.load_init({k: v for k, v in C.state_dict().items() if not k.startswith("core.")})[1] == []
+
+
+def test_fdt_penalty_at_the_climate_and_first_band(core, tmp_path):
+    """Deviations whose band power IS the climate's: the bound is not active beyond the scatter of the batch's
+    estimate (the penalty of every sample alone would be several times larger), and fdt_bmin leaves l = 0 out."""
+    import json
+    import torch.nn.functional as Fn
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    from fpk.sphere import SHT, bands
+    bj, nb = bands(H)
+    S = SHT([-90.0 + 180.0 / H * (i + 0.5) for i in range(H)])
+    amp = torch.ones(H) / math.sqrt(H)
+    c = torch.stack([(amp ** 2)[bj == b].sum() for b in range(nb)])                 # the band power of the noise
+    f = tmp_path / "clim.json"
+    f.write_text(json.dumps(dict(c=[c.tolist()] * 66, rho_band=[0.5] * nb)))
+    cfg = dict(pairs=2, hidden=8, blocks=(1,), fdt=str(f))
+    Dk, D1 = EntropyDeviationKernel(core, DevConfig(**cfg)), EntropyDeviationKernel(core, DevConfig(fdt_bmin=1, **cfg))
+    e = S.noise(amp, (64, 2, 66), torch.Generator().manual_seed(0)) * Dk.keep.unsqueeze(0)
+    k = Dk.keep.reshape(-1) > 0
+    V = Dk.band_power(e)
+    assert abs(float(V[:, k].mean((0, 1))[-1] / c[-1]) - 1) < 0.05
+    each = Fn.relu(torch.log(V[:, k]) - torch.log(c)).pow(2).mean()                # sample by sample: biased
+    pen = float(Dk.fdt_penalty(e))
+    assert pen < 0.004 and float(each) > 0.03 and pen < 0.1 * float(each)
+    # twice the climate's power in the band l = 0 alone: seen by the bound, not with fdt_bmin = 1
+    co = S.analysis(e)
+    co[..., 0, :] = co[..., 0, :] * math.sqrt(2.0)
+    e2 = S.synthesis(co)
+    assert float(Dk.fdt_penalty(e2)) > 0.5 * math.log(2.0) ** 2 / nb and float(D1.fdt_penalty(e2)) < 0.004
+    assert abs(float(D1.fdt_penalty(3.0 * e)) - math.log(9.0) ** 2) < 0.2 and DevConfig().fdt_bmin == 0
+
+
+def test_daily_climatology_of_years():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from clim_bands import daily_clim
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(size=(365, 2, 2, 3)).astype(np.float32), rng.normal(size=(366, 2, 2, 3)).astype(np.float32)
+    m = np.concatenate([0.5 * (a + b[:365]), b[365:]], 0)        # the mean per day; day 366 from the leap year alone
+    assert np.allclose(daily_clim(iter([a, b]), half=0, step=50), m, atol=1e-6)
+    cl = daily_clim([a, b], half=15)
+    want = lambda i: m[np.arange(i - 15, i + 16) % 366].mean(0)  # noqa: E731
+    assert cl.shape == (366, 2, 2, 3) and all(np.allclose(cl[i], want(i), atol=1e-5) for i in (0, 7, 200, 365))
+    # more years: the climatology's own sampling error, which the anomaly's variance would carry, shrinks as 1 / n
+    ys = [rng.normal(size=(365, 1, 4, 4)).astype(np.float32) for _ in range(16)]
+    v2, v16 = daily_clim(ys[:2], half=0)[:365].var(), daily_clim(ys, half=0)[:365].var()
+    assert abs(v2 - 0.5) < 0.05 and abs(v16 - 1 / 16) < 0.01
+
+
+def test_climate_band_power_and_autocorrelation():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from clim_bands import band_stats
+    from fpk.sphere import SHT, bands
+    lat = np.linspace(-90 + 5.625, 90 - 5.625, 16)
+    S = SHT(lat)
+    bj, nb = bands(S.L)
+    g = torch.Generator().manual_seed(0)
+    amp = torch.ones(S.L) / math.sqrt(S.L)                     # unit variance, equal power per degree
+    rho = torch.tensor([0.9, 0.8, 0.6, 0.3, 0.0])[bj]
+    x = [S.noise(amp, (3,), g)]
+    for _ in range(399):                                       # an AR(1) in time with a rho per band
+        c = rho[:, None] * S.analysis(x[-1]) + torch.sqrt(1 - rho ** 2)[:, None] * S.analysis(S.noise(amp, (3,), g))
+        x.append(S.synthesis(c))
+    c, r = band_stats(torch.stack(x), S, chunk=64)
+    want = torch.stack([(amp ** 2)[bj == b].sum() for b in range(nb)])
+    assert c.shape == (3, nb) and float((c / want - 1).abs()[:, 2:].max()) < 0.15
+    assert float((r - torch.tensor([0.9, 0.8, 0.6, 0.3, 0.0])).abs()[:, 1:].max()) < 0.1
+
+
+def test_conservation_diagnostic(mcore):
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    import diag_conserve as C
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    from fpk.env import DYN
+    from fpk.sphere import A_EARTH
+    lat = np.linspace(-78.75, 78.75, H)
+    mean, std = np.asarray(contract.REFERENCE_MEAN)[DYN], np.asarray(contract.REFERENCE_STD)[DYN]
+    inv = C.Invariants(contract.REFERENCE_MEAN, contract.REFERENCE_STD, lat)
+    names = [contract.CHANNEL_NAMES[c] for c in DYN]
+    # a state at rest at the mean, plus 100 Pa of msl and a solid-body wind u = 10 cos(phi) on every level
+    x = torch.zeros(2, 66, H, W)
+    cosl = torch.tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32).view(H, 1)
+    for i, n in enumerate(names):
+        if n[0] == "u" and n[1:].isdigit():
+            x[1, i] = (10.0 * cosl - mean[i]) / std[i]
+            x[0, i] = -mean[i] / std[i]
+        if n[0] == "v" and n[1:].isdigit():
+            x[:, i] = -mean[i] / std[i]
+    x[1, names.index("msl")] = 100.0 / std[names.index("msl")]
+    v = inv(x)
+    w = np.cos(np.deg2rad(lat))
+    want = A_EARTH / C.G0 * 10.0 * (w ** 3).sum() / w.sum() * (100000.0 - 5000.0)    # sum of the dp = 950 hPa
+    assert abs(float(v["mass"][1] - v["mass"][0]) - 100.0) < 0.5 and abs(float(v["aam"][0])) < 1e-6 * want
+    assert abs(float(v["aam"][1]) / want - 1) < 1e-3
+    ke = 0.5 * 100.0 * (w ** 3).sum() / w.sum()                                       # 1/2 u^2, area mean
+    assert abs(float(v["energy"][1] - v["energy"][0]) - ke) < 0.02 * ke
+    d = C.daily_change(inv, torch.stack([x[0], x[1], x[1]], 0)[None])                 # (1, 3 days) -> (1, 2)
+    assert d["mass"].shape == (1, 2) and abs(float(d["mass"][0, 0]) - 100.0) < 0.5 and float(d["mass"][0, 1]) == 0
+    assert abs(C.rms(d["mass"]) - 100.0 / math.sqrt(2)) < 0.5
+    # the trajectories of a kernel: the members average to the mean, the mean is the core's own path
+    Dk = EntropyDeviationKernel(mcore, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3))
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 3, H, W)
+    hist = torch.randn(2, int(mcore.mem), 66, H, W)
+    memb, mn, det = C.paths(Dk, mcore, xd, doy, tis, 3, hist, torch.Generator().manual_seed(0))
+    assert memb.shape == (2, 4, 4, 66, H, W) and mn.shape == det.shape == (2, 4, 66, H, W)
+    assert torch.allclose(memb.mean(1), mn, atol=1e-4) and torch.allclose(mn, det, atol=1e-4)
+    ch = C.daily_change(inv, memb)
+    assert all(ch[k].shape == (2, 4, 3) and torch.isfinite(ch[k]).all() for k in C.KEYS)

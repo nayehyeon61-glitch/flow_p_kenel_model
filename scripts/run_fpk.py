@@ -210,11 +210,17 @@ def cmd_devk(a, rest):
                                                cloud_mean=a.cloud_mean, correct=a.correct, noise=a.noise,
                                                r_dissip=a.r_dissip, band_scale=a.band_scale,
                                                e0_spec=a.e0_spec, noise_pre=a.noise_pre,
-                                               noise_mult=a.noise_mult)).to(dev)
+                                               noise_mult=a.noise_mult, noise_spec=a.noise_spec,
+                                               bal_vert=a.bal_vert, fdt=a.fdt, fdt_bmin=a.fdt_bmin),
+                                std=cl.std).to(dev)
+    if a.fdt_weight and not a.fdt:
+        raise SystemExit("--fdt-weight needs the climatological band power: --fdt clim_bands.json")
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
-        miss = Dk.load_state_dict(ck["state"], strict=False)
+        miss, own = Dk.load_init(ck["state"])
         assert not miss.unexpected_keys, miss
+        if own:  # the options of this run decide the fixed buffers of the balanced noise / fdt, not the checkpoint
+            log(dict(init=a.init, buffers_of_this_run_kept=own))
     Dk.through = a.through
     if a.energy_weight:
         names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
@@ -238,6 +244,8 @@ def cmd_devk(a, rest):
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
 
+    aux = {}  # of the last run: the fdt penalty of every day
+
     def run(batch, days, gen=None):
         x, ys, doy, tns, hi = batch
         if ys.dim() == 4:
@@ -245,12 +253,17 @@ def cmd_devk(a, rest):
         xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
         e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
         xb, ign, ent, prod, rm, es, vs = xd, [], [], [], [], [], []
+        aux["fdt"] = []
         xprev = xd
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
             i, h_ = Dk.ign(H, xb, yd[:, k], w)
             if a.band_weight:  # on the deviations before the detach: the band scales learn from it
                 i = i + a.band_weight * Dk.band_ign(e, xb.detach(), yd[:, k])
+            if a.fdt_weight:  # the spread about the mean stays below the climate's variance, band by band
+                fd = Dk.fdt_penalty(e)
+                i = i + a.fdt_weight * fd
+                aux["fdt"].append(float(fd))
             if a.energy_weight:
                 # the physical constraint: a member's change of total energy over the day stays within k sigma of
                 # the mean's (sigma = the spread of the data's daily change of energy, measured once)
@@ -304,6 +317,7 @@ def cmd_devk(a, rest):
     for it in range(1, a.iters + 1):
         days = a.days[min(len(a.days) - 1, (it - 1) * len(a.days) // a.iters)]
         ign, ent, prod, _, seq = run(tr(a.batch), days)
+        fdt = dict(fdt=round(float(np.mean(aux["fdt"])), 5)) if a.fdt_weight else {}
         loss = sum(ign) / days + a.seq_weight * seq
         opt.zero_grad()
         loss.backward()
@@ -318,7 +332,7 @@ def cmd_devk(a, rest):
             log(dict(it=it, days=days, ign=round(float(loss), 4), best=round(best, 4), val_seq=vs_, val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
                      prod_eq=[round(p_[0], 3) for p_ in prod], prod_noise=[round(p_[1], 3) for p_ in prod],
                      r=[round(p_[2], 3) for p_ in prod],
-                     h=round(float(Dk.h().mean()), 4), sec=round(time.time() - t0)))
+                     h=round(float(Dk.h().mean()), 4), **fdt, sec=round(time.time() - t0)))
 
 
 def load_devk(a, core, tag):
@@ -645,8 +659,18 @@ def main(argv=None):
     d.add_argument("--band-scale", action="store_true", help="entropy by scale: band-wise rescaling of the deviations")
     d.add_argument("--band-weight", type=float, default=0.0, help="weight of the band-wise log score (needs the SHT)")
     d.add_argument("--r-dissip", action="store_true", help="the learned residual r <= 0 (noise makes the positive part)")
-    d.add_argument("--noise", default="smooth", choices=["smooth", "sphere"],
-                   help="the new part's field: 3 x 3 smoothed, or spherical harmonics with learned band amplitudes + AR(1)")
+    d.add_argument("--noise-spec", default="",
+                   help="balanced noise: diag_spectra json, psi starts from its 1-day wind error spectrum (default --e0-spec)")
+    d.add_argument("--bal-vert", type=float, default=1.0,
+                   help="balanced noise: vertical correlation scale of psi / chi in ln p (0 = independent levels)")
+    d.add_argument("--fdt", default="", help="clim_bands.py json: the AR(1) rho per band is its one-day autocorrelation (fixed)")
+    d.add_argument("--fdt-weight", type=float, default=0.0,
+                   help="weight of the one-sided penalty relu(log V - log c)^2: band spread <= climatological band power")
+    d.add_argument("--fdt-bmin", type=int, default=0,
+                   help="first band of the fdt penalty (1 = without the band l = 0, the global mean)")
+    d.add_argument("--noise", default="smooth", choices=["smooth", "sphere", "balanced"],
+                   help="the new part's field: 3 x 3 smoothed, spherical harmonics with learned band amplitudes + AR(1), "
+                        "or balanced (psi / chi per level: rotational wind, linear-balance Phi, hydrostatic T)")
     d.add_argument("--init", default="", help="start from this fitted deviation kernel")
     d.add_argument("--through", type=int, default=0,
                    help="days of the gradient through the mean's path of the chain (a correction answers for later days)")
