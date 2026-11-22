@@ -115,6 +115,15 @@ class DevConfig:
     #                           band power below its climatological band power
     fdt_bmin: int = 0         # the first band of ``fdt_penalty`` (1: without the band l = 0, the global mean, whose
     #                           power is one coefficient a pair and whose climatological value is about 1e-4 s^2)
+    bal_lmin: int = 1         # balanced noise: psi and chi have no power in the degrees l < bal_lmin. 2 = without the
+    #                           solid-body rotations l = 1 (m = 0: the axial angular momentum, the area mean of
+    #                           u cos(phi), is the projection of psi on sin(phi); m = 1: the equatorial axes); the
+    #                           wind's variance at h = 1 stays one (psi_amp is normalized over the degrees left).
+    #                           For the angular momentum ONLY: the l = 1 band of z and T does not change (linear
+    #                           balance: Phi_1 comes from psi_2; psi_1 makes Phi_2, whose power falls), so 2 does
+    #                           not reduce the spread of the band l = 1 of z or T
+    aam_fix: bool = False     # balanced noise: the day's WHOLE new part (the remainder's u too) carries no axial angular
+    #                           momentum: on every level u - c cos(phi), c = <u cos(phi)> / <cos^2(phi)> (``aam_neutral``)
 
 
 class EntropyDeviationKernel(nn.Module):
@@ -144,6 +153,8 @@ class EntropyDeviationKernel(nn.Module):
             raise ValueError(f"noise = {cfg.noise!r}: smooth, sphere or balanced")
         if cfg.noise == "balanced" and cfg.noise_mult > 0:
             raise ValueError("noise_mult replaces the additive new part: it cannot be combined with balanced noise")
+        if (cfg.bal_lmin != 1 or cfg.aam_fix) and cfg.noise != "balanced":
+            raise ValueError("bal_lmin and aam_fix are options of the balanced noise")
         sphere = cfg.noise in ("sphere", "balanced")
         if sphere or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0 or cfg.fdt:
             H = int(core.static.shape[-2])
@@ -191,9 +202,15 @@ class EntropyDeviationKernel(nn.Module):
         """The constants of the balanced noise. psi_k = K_k a_k A_k(l) sum_j V_kj eta_j: eta unit coefficients,
         V the vertical correlation, A = exp(p_log)[band] psi_amp(l) / sqrt(2 l + 1) with sum_l l (l + 1) psi_amp^2
         = 1, so the wind of level k has the area mean u^2 + v^2 = (K_k a_k / a)^2. K_k makes the mean of the
-        variances of u and v in the kernel's units (wind / (std s)) one at a_k = 1."""
+        variances of u and v in the kernel's units (wind / (std s)) one at a_k = 1. psi_amp(l) = 0 for l < bal_lmin
+        (the sum over the degrees left stays 1); chi has psi's amplitudes, so neither has power there. The balanced
+        Phi and T keep their degree 1 at bal_lmin = 2: Phi_n is made of psi_(n-1) and psi_(n+1) (``linear_balance``),
+        so Phi_1 = 2 Omega (3/2) eps_2 psi_2 and psi_1 goes into Phi_2 only; the degree-1 power of z and T is that of
+        bal_lmin = 1 times the renormalization of psi_amp^2 (psi_amp rises by 0.22 % on the runs' spectrum)."""
         from .env import DYN, contract
         cfg, L, nb = self.cfg, self.sht.L, self.n_bands
+        if not 1 <= cfg.bal_lmin < L:
+            raise ValueError(f"bal_lmin = {cfg.bal_lmin}: 1 (every degree) to {L - 1}")
         idx, p = level_channels()
         K = idx.shape[1]
         sd = np.asarray(contract.REFERENCE_STD if std is None else std, dtype=np.float64).reshape(-1)
@@ -214,7 +231,7 @@ class EntropyDeviationKernel(nn.Module):
         else:
             E = self.base_amp.pow(2).cpu()
         l = torch.arange(L, dtype=torch.float32)
-        a2 = torch.where(l > 0, E / (l * (l + 1)).clamp(min=1), torch.zeros(L))    # the kinetic energy of a psi mode
+        a2 = torch.where(l >= cfg.bal_lmin, E / (l * (l + 1)).clamp(min=1), torch.zeros(L))   # kinetic energy of a psi mode
         self.register_buffer("psi_amp", (a2 / (a2 * l * (l + 1)).sum()).sqrt())    # is l (l + 1) / a^2 |psi_lm|^2
         # the vertical correlation C_kj = exp(-(ln p_k - ln p_j)^2 / (2 d^2)): V = C^(1/2) with unit rows
         lnp = np.log(p)
@@ -324,7 +341,7 @@ class EntropyDeviationKernel(nn.Module):
     def new_part(self, shape, like, gen=None):
         """h xi, the day's new part (B, P, 66, H, W) in units of s, tisr excluded. Balanced noise:
         (balanced fields of a_k psi, chi) / (std s) + h_c w_c (sphere noise)_c, the draws of psi, chi and of the
-        remainder each with the AR(1) in time per band."""
+        remainder each with the AR(1) in time per band; ``aam_fix``: without its axial angular momentum."""
         hxi = self.h().unsqueeze(0) * (self.new_noise(shape, like, gen) * self.keep.unsqueeze(0))
         if self.cfg.noise != "balanced":
             return hxi
@@ -335,7 +352,21 @@ class EntropyDeviationKernel(nn.Module):
         self._bc = c.detach()
         u, v, phi, T = self.balance(*self.psi_chi(c))
         bal = torch.cat([phi, T, u, v], 2) / self.bal_unit.reshape(1, 1, -1, 1, 1)
-        return (hxi * self.remainder_weight().view(1, 1, 66, 1, 1)).index_add(2, self.bal_idx.reshape(-1), bal)
+        new = (hxi * self.remainder_weight().view(1, 1, 66, 1, 1)).index_add(2, self.bal_idx.reshape(-1), bal)
+        return self.aam_neutral(new) if self.cfg.aam_fix else new
+
+    def aam_neutral(self, x):
+        """x (B, P, 66, H, W) in units of s without the axial angular momentum of its wind: on every level
+        u <- u - c cos(phi), the solid-body rotation with c = <u cos(phi)> / <cos^2(phi)> in m/s (through bal_unit and
+        back; one constant per level, so c cos(phi) is the same field in either unit). <.> = the area mean with the
+        grid's weights, sum_i cos(phi_i) (mean over lon)_i / sum_i cos(phi_i), as scripts/diag_conserve.py takes it:
+        that mean of the result's u cos(phi) is zero to rounding."""
+        Hn = x.shape[-2]
+        cos = torch.cos(torch.deg2rad(-90.0 + 180.0 / Hn * (torch.arange(Hn, device=x.device) + 0.5))).view(Hn, 1).to(x)
+        iu, unit = self.bal_idx[2], self.bal_unit[2].view(-1, 1, 1)
+        u = x[:, :, iu] * unit
+        c = (u * cos ** 2).mean(-1, keepdim=True).sum(-2, keepdim=True) / cos.pow(3).sum()
+        return x.index_copy(2, iu, (u - c * cos) / unit)
 
     @torch.no_grad()
     def start(self, xd, doy, hist=None, gen=None):

@@ -18,10 +18,21 @@ the velocity error in those units, so every lead weighs the same (in units of s 
 The kernel's own deviations go on through the equation (the flow transports each lead's distribution, it is not fed
 back), so training (sources from the kernel's rollout) and forecasting see the same source distribution.
 ``source="gauss"``: the control, smooth unit Gaussian noise as the source with the same conditioning (H included).
+
+Two uses of a trained flow (scripts/run_fpk.py):
+  * reflow (``devflow --reflow TEACHER``): the same loss with the target of every source row replaced by the
+    teacher's transported endpoint of that row, z1 = T_teacher(z0). The coupling (z0, z1) is then a map, the
+    regression target z1 - z0 is a function of the source row, and the learned paths straighten toward the lines
+    z0 -> T_teacher(z0) without changing the law of the endpoints (rectified flow).
+  * energy-score fine-tuning (``devtune``): the members x^m = xbar + s T(e^m) with the gradient through the sampler
+    (``integrate(..., grad=True)``: the Heun steps as written, every network call in the graph), scored with the
+    fair energy score of fpk.escore. ``ctx_rows``: the sampler on a part of the day's source rows, for a gradient
+    taken a few rows at a time (the memory of the graph of those rows only).
 """
 
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -60,7 +71,7 @@ class DeviationFlow(nn.Module):
         core = dk.core
         n_g = core.gscale.shape[1] if dk.gfeat else 0
         # z_tau, xbar, G(xbar), H, static, time of year, lead, tau
-        c_in = 66 + 66 + n_g + 66 + core.static.shape[0] + 4 + 1 + 4
+        self.c_in = c_in = 66 + 66 + n_g + 66 + core.static.shape[0] + 4 + 1 + 4
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
 
     def train(self, mode: bool = True):
@@ -96,12 +107,16 @@ class DeviationFlow(nn.Module):
         Hh, Ww = z.shape[-2:]
         return self.net(torch.cat([z / sig, cond, tau_features(tau, Hh, Ww)], 1)) * sig * self.dk.keep
 
-    def loss(self, e, xbar, truth, cond, H, w, gen=None):
-        """Flow-matching loss of one lead: every one of the P deviations is a source draw for the same target."""
+    def loss(self, e, xbar, truth, cond, H, w, gen=None, teacher=None):
+        """Flow-matching loss of one lead: every one of the P deviations is a source draw for the same target.
+        ``teacher`` (reflow): the target of a source row is the teacher's transported endpoint of that row,
+        z1 = T_teacher(z0) (its own steps, no gradient), in place of the data's deviation."""
         B, P = e.shape[:2]
         z0 = self.source(e, gen, self.sigma(H)[:, None]).flatten(0, 1)
         z1 = ((truth - xbar) / self.dk.s * self.dk.keep).repeat_interleave(P, 0)
         c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
+        if teacher is not None:
+            z1 = teacher.integrate(z0, c, sig)
         tau = torch.rand(B * P, generator=gen).to(z0)
         t = tau.view(-1, 1, 1, 1)
         zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * sig * torch.randn(z0.shape, generator=gen).to(z0) * self.dk.keep
@@ -109,40 +124,73 @@ class DeviationFlow(nn.Module):
         m = self.dk.keep * w
         return (sq * m).sum() / m.expand_as(sq).sum()
 
-    @torch.no_grad()
-    def transport(self, e, cond, H, gen=None, steps: Optional[int] = None):
-        """(B, P, 66, H, W) -> the transported deviations (Heun)."""
-        B, P = e.shape[:2]
-        z = self.source(e, gen, self.sigma(H)[:, None]).flatten(0, 1)
-        c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
+    def integrate(self, z, c, sig, steps: Optional[int] = None, grad: bool = False):
+        """The transport T of the source rows z (R, 66, H, W) with their conditioning c and sigma: ``steps`` Heun
+        steps of dz / dtau = v_theta(z, tau). ``grad``: with the gradient to the network's parameters (the exact
+        gradient of this discrete sampler: all 2 x steps network calls stay in the graph); else no graph is built."""
         n = steps or self.cfg.steps
         dt = 1.0 / n
         z0, kin = z, 0.0
-        for i in range(n):
-            t = torch.full((z.shape[0],), i * dt, device=z.device)
-            k1 = self.velocity(z, t, c, sig)
-            k2 = self.velocity(z + dt * k1, t + dt, c, sig)
-            v = 0.5 * (k1 + k2)
-            kin = kin + dt * (v / sig).pow(2).mean()
-            z = z + dt * v
+        with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
+            for i in range(n):
+                t = torch.full((z.shape[0],), i * dt, device=z.device)
+                k1 = self.velocity(z, t, c, sig)
+                k2 = self.velocity(z + dt * k1, t + dt, c, sig)
+                v = 0.5 * (k1 + k2)
+                kin = kin + dt * (v.detach() / sig).pow(2).mean()
+                z = z + dt * v
         # how straight the paths are (Benamou-Brenier): the kinetic energy int |v|^2 dtau over the squared
         # displacement |T(z) - z|^2 (units of sigma); 1 = straight lines at constant speed, the OT geodesic
-        disp = ((z - z0) / sig).pow(2).mean()
+        disp = ((z.detach() - z0) / sig).pow(2).mean()
         self.last_path = (float(kin), float(disp))
+        return z
+
+    def transport(self, e, cond, H, gen=None, steps: Optional[int] = None, grad: bool = False):
+        """(B, P, 66, H, W) -> the transported deviations (Heun); ``grad``: see ``integrate``."""
+        B, P = e.shape[:2]
+        with torch.no_grad():
+            z = self.source(e, gen, self.sigma(H)[:, None]).flatten(0, 1)
+            c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
+        z = self.integrate(z, c, sig, steps, grad)
         return z.view(B, P, *z.shape[1:])
 
     # ---- one day of the kernel -> its loss / its members: the calls a trainer or a rollout makes right after
     # ``dk.day`` (x0 the mean before the day, xb the mean after it, e and H what the day returned, doy0 the IC's day
     # of year, tisr the day's forcing, lead = days since the IC of the day's start). The same for every path.
-    def day_loss(self, x0, xb, e, H, truth, doy0, tisr, lead: int, w, gen=None, sel=None):
-        """The flow-matching loss of the day; ``sel``: the indices of the kernel's pairs used as source draws."""
+    def day_loss(self, x0, xb, e, H, truth, doy0, tisr, lead: int, w, gen=None, sel=None, teacher=None):
+        """The flow-matching loss of the day; ``sel``: the indices of the kernel's pairs used as source draws;
+        ``teacher``: the reflow target (see ``loss``)."""
         es = e if sel is None else e[:, sel]
-        return self.loss(es, xb, truth, self.cond(xb, H, doy0 + lead + 1, lead + 1), H, w, gen)
+        return self.loss(es, xb, truth, self.cond(xb, H, doy0 + lead + 1, lead + 1), H, w, gen, teacher)
 
-    @torch.no_grad()
-    def day_transport(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, steps: Optional[int] = None):
+    def day_transport(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, steps: Optional[int] = None,
+                      grad: bool = False):
         """The members' deviations of the day (B, P, 66, H, W), units of s around xb."""
-        return self.transport(e, self.cond(xb, H, doy0 + lead + 1, lead + 1), H, gen, steps)
+        return self.transport(e, self.cond(xb, H, doy0 + lead + 1, lead + 1), H, gen, steps, grad)
+
+    # ---- the sampler in two calls (the same for every path): the day's source rows once, then any number of runs
+    # from them (other step counts, another flow on the same rows, with or without the gradient)
+    @torch.no_grad()
+    def day_ctx(self, x0, xb, e, H, doy0, tisr, lead: int, gen=None, sel=None):
+        """The sampler's context of the day: the source rows z0 (R = B P', 66, H, W) of the kernel's pairs ``sel``
+        (None = all P; the +e of every antithetic pair, as in ``rollout``), their conditioning and sigma."""
+        es = e if sel is None else e[:, sel]
+        B, P = es.shape[:2]
+        sig = self.sigma(H)
+        return SimpleNamespace(B=B, P=P, z0=self.source(es, gen, sig[:, None]).flatten(0, 1), sig=sig.repeat_interleave(P, 0),
+                               cd=self.cond(xb, H, doy0 + lead + 1, lead + 1).repeat_interleave(P, 0))
+
+    def day_run(self, c, steps: Optional[int] = None, grad: bool = False):
+        """The members' deviations (B, P', 66, H, W) from the context of ``day_ctx``; ``steps``, ``grad``: see
+        ``integrate``."""
+        z = self.integrate(c.z0, c.cd, c.sig, steps, grad)
+        return z.view(c.B, c.P, *z.shape[1:])
+
+    def ctx_rows(self, c, rows):
+        """The context of the source rows ``rows`` (indices into the R rows of c) alone, as one batch element:
+        ``day_run`` of it is (1, len(rows), 66, H, W), those rows of the full run (the rows do not see each other).
+        For a gradient in pieces: sum over the pieces of [d L / d z of the rows] . z(rows) has the gradient of L."""
+        return SimpleNamespace(B=1, P=len(rows), z0=c.z0[rows], sig=c.sig[rows], cd=c.cd[rows])
 
     @torch.no_grad()
     def rollout(self, xd0, doy0, tisr, leads: int, hist=None, gen=None, steps: Optional[int] = None):

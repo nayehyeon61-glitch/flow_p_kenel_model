@@ -11,6 +11,13 @@
     python scripts/run_fpk.py flow --source gauss --iters 3000 --tag flow_gauss
     # 4. 10-day ensembles on the test year, scores and entropy
     python scripts/run_fpk.py score --arms core kernel flow flow_gauss
+
+The deviation kernel and its flow (devk, devflow), and two uses of a trained deviation flow:
+    # reflow: the student learns the teacher's own (source, endpoint) pairs, its paths straighten
+    python scripts/run_fpk.py devflow --dev-tag devk --reflow devflow --tag devflow_r1
+    # fine-tuning with the fair energy score of the members, through the sampler (2 steps of it by default; the
+    # flow's own steps at the same memory: --steps 0 --chunk 2)
+    python scripts/run_fpk.py devtune --flow-tag devflow_r1 --tag devflow_r1_es --norm grid
 """
 
 import argparse
@@ -30,6 +37,7 @@ from fpk.flow import FlowConfig, KernelFlow  # noqa: E402
 from fpk.devflow import DevFlowConfig, DeviationFlow  # noqa: E402,F401
 from fpk.coreflow import build_flow  # noqa: E402
 from fpk.devkernel import DevConfig, EntropyDeviationKernel, TotalEnergy  # noqa: E402
+from fpk.escore import energy_score, make_norm, spread_skill  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from fpk.kernel import KernelConfig, PhysicsKernel  # noqa: E402
 from pgcfm.kai_tend import core_step  # noqa: E402
@@ -212,7 +220,8 @@ def cmd_devk(a, rest):
                                                r_dissip=a.r_dissip, band_scale=a.band_scale,
                                                e0_spec=a.e0_spec, noise_pre=a.noise_pre,
                                                noise_mult=a.noise_mult, noise_spec=a.noise_spec,
-                                               bal_vert=a.bal_vert, fdt=a.fdt, fdt_bmin=a.fdt_bmin),
+                                               bal_vert=a.bal_vert, fdt=a.fdt, fdt_bmin=a.fdt_bmin,
+                                               bal_lmin=a.bal_lmin, aam_fix=a.aam_fix),
                                 std=cl.std).to(dev)
     if a.fdt_weight and not a.fdt:
         raise SystemExit("--fdt-weight needs the climatological band power: --fdt clim_bands.json")
@@ -351,15 +360,109 @@ def load_devk(a, core, tag):
 
 
 # ------------------------------------------------------------------------------------------------------- devflow
+def reflow_teacher(a, Fm):
+    """The teacher of ``devflow --reflow TAG``: the trained flow TAG, built on the student's kernel. It must have
+    been trained on the same kernel and core (the same sources) with the student's architecture and path; the
+    student Fm starts from its weights."""
+    if a.reflow == a.tag:
+        raise SystemExit(f"--reflow {a.reflow}: the student's --tag is the teacher's (it would be overwritten)")
+    ck = torch.load(os.path.join(a.out, f"{a.reflow}.pt"), map_location="cpu", weights_only=False)
+    if ck.get("core_tag") not in (None, a.core_tag):
+        raise SystemExit(f"--reflow {a.reflow} was trained on core {ck['core_tag']}, not --core-tag {a.core_tag}")
+    if ck["dev_tag"] != a.dev_tag:
+        raise SystemExit(f"--reflow {a.reflow} was trained on the kernel {ck['dev_tag']}, not --dev-tag {a.dev_tag}")
+    cfg = dict(ck["cfg"])
+    cfg["blocks"] = tuple(cfg["blocks"])
+    tc = DevFlowConfig(**cfg)
+    keys = ("hidden", "blocks", "source", "path") + (("core_steps", "core_sub") if tc.path == "core" else ())
+    diff = {k: [getattr(Fm.cfg, k), getattr(tc, k)] for k in keys if getattr(Fm.cfg, k) != getattr(tc, k)}
+    if diff:
+        raise SystemExit(f"--reflow {a.reflow}: the student is not the teacher's flow, [student, teacher] = {diff}")
+    Te = build_flow(Fm.dk, tc).to(a.device)
+    Te.net.load_state_dict(ck["state"])
+    Fm.net.load_state_dict(ck["state"])
+    for p_ in Te.net.parameters():
+        p_.requires_grad_(False)
+    return Te.eval()
+
+
+@torch.no_grad()
+def path_diag(flows, Dk, batches, days, dev, seed=123, steps=None, ref=None):
+    """How straight the paths of the flows (name -> flow, all on the kernel Dk) are, on the same kernel days and
+    source rows z0 of ``batches``, per lead, in units of sigma. ``steps``: the number of steps n of the full sampler
+    of EVERY flow (None = each flow's own; reflow: the teacher's, so both flows are judged with one sampler).
+    ``ref``: the name of the flow whose full endpoint R_n(z0) is the reference of drift and ref_m (reflow: the
+    teacher).
+        steps     n as used (line: Heun steps; core path: Heun steps of the learned part of a grid step, 0 = one
+                  Euler step a grid step, which has no step count to vary)
+        straight  kinetic energy int |v|^2 dtau / squared displacement |T_n(z0) - z0|^2 of the full sampler
+                  (``last_path``; 1 = straight lines at constant speed. Core path: of the learned part)
+        end_1, end_2   RMS[T_m(z0) - T_n(z0)] / RMS[T_n(z0)] for a sampler of m = 1, 2 steps: how far the flow's OWN
+                  endpoint moves when its sampler is cut to m steps (None when the path has no step count)
+        move      RMS[T_n(z0) - z0] / RMS[T_n(z0)]: the size of the transport itself, the scale of end_m (core
+                  path: of the learned part)
+      and with ``ref``:
+        drift     RMS[T_n(z0) - R_n(z0)] / RMS[R_n(z0)]: how far the flow's endpoints are from the reference's on
+                  the same rows (0 for the reference). A reflow keeps the law of the endpoints only as far as the
+                  student reproduces the teacher's: end_m of a student says nothing about that, drift does
+        ref_1, ref_2   RMS[T_m(z0) - R_n(z0)] / RMS[R_n(z0)]: the cut sampler against the REFERENCE's full endpoint
+                  (the reference's own ref_m is its end_m). The student's m-step sampler is nearer the teacher's
+                  law than the teacher's own m-step sampler only if its ref_m is below the teacher's end_m."""
+    dyn = torch.tensor(DYN)
+    names = ([ref] if ref else []) + [n for n in flows if n != ref]      # the reference first
+    acc = {n: np.zeros((days, 9)) for n in names}
+    cut = {n: flows[n].cfg.path == "line" or flows[n].cfg.core_sub > 0 for n in names}   # a step count to vary
+    gen = torch.Generator().manual_seed(seed)
+    for x, ys, doy, tns, hi in batches:
+        if ys.dim() == 4:
+            ys, tns = ys[:, None], tns[:, None]
+        xd, doy, tns = x[:, dyn].to(dev), doy.to(dev), tns.to(dev)
+        e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
+        xb = xd
+        for k in range(days):
+            x0 = xb
+            xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
+            c = flows[names[0]].day_ctx(x0, xb, e, H, doy, tns[:, k], k, gen)
+            ms = lambda t: float((t / c.sig.view_as(t)).pow(2).mean())  # noqa: E731
+            base = None
+            for n in names:
+                Fl = flows[n]
+                full = Fl.day_run(c, steps if cut[n] else None)
+                kin, disp = Fl.last_path
+                base = full if n == ref else base
+                runs = [Fl.day_run(c, m) if cut[n] else None for m in (1, 2)]
+                vs = lambda b: [np.nan if q is None else ms(q - b) for q in runs]  # noqa: E731
+                acc[n][k] += [kin, disp, ms(full)] + vs(full) + ([np.nan] * 4 if ref is None else [ms(base), ms(full - base)] + vs(base))
+    out = {}
+    for n in flows:
+        Fl, v = flows[n], acc[n]
+        r = lambda t: [None if np.isnan(q) else round(float(q), 4) for q in t]  # noqa: E731
+        own = Fl.cfg.steps if Fl.cfg.path == "line" else Fl.cfg.core_sub
+        out[n] = dict(steps=(steps or own) if cut[n] else 0,
+                      straight=r(v[:, 0] / np.maximum(v[:, 1], 1e-30)), end_1=r(np.sqrt(v[:, 3] / v[:, 2])),
+                      end_2=r(np.sqrt(v[:, 4] / v[:, 2])), move=r(np.sqrt(v[:, 1] / v[:, 2])))
+        if ref is not None:
+            out[n].update(drift=r(np.sqrt(v[:, 6] / v[:, 5])), ref_1=r(np.sqrt(v[:, 7] / v[:, 5])), ref_2=r(np.sqrt(v[:, 8] / v[:, 5])))
+    return out
+
+
 def cmd_devflow(a, rest):
     """Flow matching from the entropy deviation kernel (fpk.devflow): the kernel runs D days from the data's state,
-    and on every day its deviations are the source and the data's deviation from the mean the target."""
+    and on every day its deviations are the source and the data's deviation from the mean the target.
+    ``--reflow TEACHER``: the target of every source row is the teacher's transported endpoint of that row (the
+    teacher's own number of steps, no gradient) in place of the data's deviation; the student starts from the
+    teacher's weights. At the end one json line ``reflow_paths`` (``path_diag``) on the validation batches: both
+    flows sampled with the TEACHER's number of steps as the full sampler (logged as ``steps``), their straightness,
+    the change of the endpoint when the sampler is cut to 1 and 2 steps (against the flow's own full endpoint,
+    end_m, and against the teacher's, ref_m), and the student's drift from the teacher's endpoints."""
     torch.manual_seed(a.seed)
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
     Dk = load_devk(a, core, a.dev_tag)
     Fm = build_flow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps, path=a.path,
                                       core_steps=a.core_steps, core_sub=a.core_sub)).to(dev)
+    Te = reflow_teacher(a, Fm) if a.reflow else None
+    rf = {} if Te is None else dict(teacher=Te)   # the reflow target of the day's loss
     W = int(getattr(core, "mem", 0))
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
@@ -375,8 +478,8 @@ def cmd_devflow(a, rest):
         cfg = dict(Fm.cfg.__dict__)
         if cfg["path"] == "line":  # the straight line's checkpoint as it always was (the path's keys only with a path)
             cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
-        torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, dev_tag=a.dev_tag, core_tag=a.core_tag),
-                   os.path.join(a.out, f"{a.tag}.pt"))
+        torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, dev_tag=a.dev_tag, core_tag=a.core_tag,
+                        **(dict(reflow_of=a.reflow) if a.reflow else {})), os.path.join(a.out, f"{a.tag}.pt"))
 
     def run(batch, gen=None, train=False):
         x, ys, doy, tns, hi = batch
@@ -391,7 +494,7 @@ def cmd_devflow(a, rest):
             with torch.no_grad():
                 xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
             sel = torch.randperm(e.shape[1], generator=gen)[:a.sources] if train else None
-            lk = Fm.day_loss(x0, xb, e, H, yd[:, k], doy, tns[:, k], k, w, gen, sel)
+            lk = Fm.day_loss(x0, xb, e, H, yd[:, k], doy, tns[:, k], k, w, gen, sel, **rf)
             if train:  # a lead's graph is freed before the next one (ten leads at once did not fit the memory)
                 (lk / a.days).backward()
             out.append(float(lk))
@@ -406,7 +509,8 @@ def cmd_devflow(a, rest):
         return [round(float(v), 4) for v in r]
 
     t0 = time.time()
-    log(dict(devflow_val_start=val(), source=a.source, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub))))
+    log(dict(devflow_val_start=val(), source=a.source, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub)),
+             **(dict(reflow=a.reflow) if a.reflow else {})))
     for it in range(1, a.iters + 1):
         opt.zero_grad()
         loss = sum(run(tr(a.batch), train=True)) / a.days
@@ -417,6 +521,11 @@ def cmd_devflow(a, rest):
             log(dict(it=it, loss=round(loss, 4), val=val(), sec=round(time.time() - t0)))
             save()  # the state so far (a run that is cut off still leaves a usable flow)
     save()
+    if Te is not None:  # both flows with the teacher's sampler: its step count is the full sampler of the diagnostic
+        Fm.eval()
+        n = Te.cfg.steps if Te.cfg.path == "line" else Te.cfg.core_sub
+        log(dict(reflow_paths=path_diag(dict(teacher=Te, student=Fm), Dk, vx, a.days, dev, steps=n or None, ref="teacher"),
+                 teacher=a.reflow, steps=n))
 
 
 def load_devflow(a, core, tag, pairs=0):
@@ -430,7 +539,221 @@ def load_devflow(a, core, tag, pairs=0):
     cfg["blocks"] = tuple(cfg["blocks"])
     Fm = build_flow(Dk, DevFlowConfig(**cfg))  # the checkpoint's path: the straight line (no key) or the core's flow
     Fm.net.load_state_dict(ck["state"])
+    Fm.meta = {k: v for k, v in ck.items() if k not in ("state", "cfg")}  # dev_tag, core_tag, reflow_of, tuned_from
     return Fm.to(a.device).eval()
+
+
+# ------------------------------------------------------------------------------------------------------- devtune
+@torch.no_grad()
+def net_call_mb(Fm, hw):
+    """MB that ONE call of the flow's network on ONE row keeps in the graph for the backward pass, estimated as its
+    input plus the outputs of its leaf modules, 4 bytes a value. Measured (resident memory of a sampler with the
+    graph, one thread): 31.3 MB against 34.8 here for hidden 64, blocks (2, 2, 2) on 32 x 64; 13.7 against 14.7
+    for hidden 32, blocks (2, 2); 2.2 against 2.3 on 8 x 16: an upper estimate, within 10 %."""
+    size = []
+    hooks = [m.register_forward_hook(lambda m_, i_, o: size.append(o.numel() * o.element_size()))
+             for m in Fm.net.modules() if not list(m.children())]
+    x = torch.zeros(1, Fm.c_in, *hw, device=next(Fm.net.parameters()).device)
+    try:
+        Fm.net(x)
+    finally:
+        [h.remove() for h in hooks]
+    return (sum(size) + x.numel() * x.element_size()) / 2 ** 20
+
+
+def cmd_devtune(a, rest):
+    """Energy-score fine-tuning of a trained deviation flow (line or core path). The kernel runs D days from the
+    data's state exactly as in ``devflow`` (no gradient); on every lead L the flow's members z^m = T(e^m) are drawn
+    with the gradient through the sampler and the loss of the lead is
+
+        ES_L / n_L  +  lam x (the flow-matching loss of the same batch and sources, the anchor)
+
+    ES_L = the fair energy score (fpk.escore) of the M members against the truth's deviation (truth - xbar) / s in
+    the norm --norm, mean over the batch. n_L = the mean over the validation batches of |truth - xbar| in that
+    norm at lead L (the energy score of the mean alone, a forecast without spread), computed once at the start:
+    a constant per lead, so the leads weigh alike and the score stays proper (a weight that depends on the batch's
+    truth or draws would not). ES_L / n_L < 1: the members score better than the mean alone; about 0.71 for a
+    calibrated Gaussian in many dimensions. A lead's graph is freed before the next lead, and the score's graph
+    before the anchor's is built (two backward passes a lead, the gradients add).
+
+    --norm band: the band-weighted norm of diag_spectra with the climatological band power of --clim. --band-bmin
+    (default 1) is the first band that counts: the band l = 0 is the global mean, which is the core's own mass drift
+    and has a tiny climatological power, so with it (--band-bmin 0) the norm is mostly the global mean of msl; the
+    default is the norm of diag_spectra's "energy_score_b1" (which takes its own c: the values differ by the c).
+
+    Members. The sources are the +e of the kernel's P antithetic pairs, as in the forecast (``rollout``, score):
+    the members T(e^1), ..., T(e^P) are independent draws, which the fair score assumes. The mirror sources -e are
+    NOT used: T(e) and T(-e) are not independent (fpk.escore, antithetic pairs). --members M: 0 = all P; M < P =
+    M of the P pairs, drawn anew for every lead (the validation uses all P); M > P = the kernel is run with M pairs
+    (as score --members does).
+
+    The gradient. Line path: the exact gradient of the discrete Heun sampler (2 x steps network calls a member in
+    the graph; --steps sets the tuning sampler, default 2; --val-steps the validation's; 0 = the flow's own).
+    Core path: the core's steps are constants and their state Jacobian is replaced by the identity (fpk.coreflow,
+    the module's docstring; --core-jac keeps it); --steps is the Heun steps of the learned part when the flow has
+    core_sub >= 1.
+
+    Memory. One pass keeps batch x M x calls network evaluations of a lead in the graph (calls a member: 2 x steps
+    on the line; N, or 2 N x steps with core_sub >= 1, on the core path), about 35 MB each for the hidden 64,
+    blocks (2, 2, 2) network on 32 x 64 (``net_call_mb``): 1.1 GB at batch 2, P = 4, --steps 2; 3.3 GB with the
+    flow's own 6 steps, 6.5 GB at batch 4. The count and the estimate are logged, and above --max-graph-gb the run
+    is refused (before the data are loaded). --chunk R: the same gradient in two passes, the members without a
+    graph and d ES / d members first, then the sampler with the graph for R source rows at a time, each backward
+    with its rows' d ES / d z (the chain rule: the rows are independent given the network); the graph then holds
+    R x calls evaluations whatever the batch, the members and the steps, at the price of one more sampler pass
+    without a graph. The core steps of --core-jac in the graph are not in the estimate.
+
+    Logged: the training ES_L / n_L per lead and the anchor; on the validation batches (fixed draws) ES_L / n_L,
+    the raw ES_L, the anchor, spread / skill per lead in the grid norm (the members' std about their mean over
+    the RMSE of their mean, x sqrt((M + 1) / M): 1 = calibrated, < 1 = the tuning has narrowed the ensemble) and
+    val_straight (kinetic energy / squared displacement of the validation sampler, 1 = straight). When the tuning
+    sampler is not the validation's (--steps 2 on a 6-step flow), also val_es_tune (ES_L / n_L of the TUNING
+    sampler on the same validation draws) and val_end_tune (RMS of the tuning sampler's endpoint minus the
+    validation sampler's over the RMS of the latter, units of sigma): the score is tuned through one sampler and
+    judged (here, by score --arms and diag_spectra) with another, and the energy score's gradient through a short
+    sampler bends the paths again (on the fixture it gave back part of a reflow's straightening, less with the
+    anchor); a val_es that falls less than val_es_tune, or a rising val_end_tune, shows the two drifting apart
+    (--steps 0 --chunk R tunes through the validation's sampler at the memory of R rows). The checkpoint is the
+    state of the best validation mean of ES_L / n_L with the VALIDATION sampler (the start included); it has the
+    format of the flow it came from (``load_devflow``, score --arms, diag_spectra --flow-tag) plus tuned_from."""
+    torch.manual_seed(a.seed)
+    a.tag = a.tag or a.flow_tag + "_es"
+    if a.tag == a.flow_tag:
+        raise SystemExit("--tag is the flow's own tag (it would be overwritten)")
+    if not a.tag.startswith("devflow"):
+        raise SystemExit(f"--tag {a.tag}: score --arms takes a deviation flow by its tag, which must start with 'devflow'")
+    pa, cl, core = load_core(a)
+    dev = torch.device(a.device)
+    Fm = load_devflow(a, core, a.flow_tag)
+    Dk = Fm.dk
+    if a.members > Dk.cfg.pairs:
+        Dk.cfg.pairs = a.members  # more independent sources (the kernel's parameters do not depend on P)
+    P = Dk.cfg.pairs
+    M = a.members or P
+    if M < 2:
+        raise SystemExit("the fair energy score needs at least 2 members (--members, or a kernel with 2 pairs)")
+    # the samplers: n_tr steps while tuning, n_va in the validation (0: the path has no step count), and the graph
+    line = Fm.cfg.path == "line"
+    cut = line or Fm.cfg.core_sub > 0
+    own = Fm.cfg.steps if line else Fm.cfg.core_sub
+    n_tr, n_va = ((a.steps or own), (a.val_steps or own)) if cut else (0, 0)
+    calls = 2 * n_tr if line else Fm.N * (2 * n_tr if cut else 1)                # network calls a member
+    rows = a.batch * M
+    units = max(min(a.chunk or rows, rows) * calls, rows if a.lam > 0 else 0)    # the sampler's graph, or the anchor's
+    gb = units * net_call_mb(Fm, core.static.shape[-2:]) / 1024
+    if a.max_graph_gb and gb > a.max_graph_gb:
+        raise SystemExit(
+            f"devtune: {units} network evaluations a lead in the graph ({min(a.chunk or rows, rows)} rows x {calls} calls a member), "
+            f"about {gb:.1f} GB > --max-graph-gb {a.max_graph_gb}: use --chunk (rows a backward pass, the same gradient), "
+            f"or lower --steps / --members / --batch, or raise --max-graph-gb (0 = no limit)")
+    norm = make_norm(a.norm, Dk.keep, cl.lat, s=Dk.s, std=getattr(cl, "std", None), clim=a.clim, bmin=a.band_bmin).to(dev)
+    grid = make_norm("grid", Dk.keep, cl.lat, eps=0.0).to(dev)
+    jk = dict(jac=True) if (a.core_jac and not line) else {}
+    W = int(getattr(core, "mem", 0))
+    years = D.load(pa, a.train_years)
+    va = D.load(pa, [a.val_year])
+    tr, vr = D.Pairs(years, a.seed, hist=W, ahead=a.days), D.Pairs(va, a.seed + 1, hist=W, ahead=a.days)
+    w = D.area_weights(cl.lat).to(dev)
+    params = list(Fm.net.parameters())
+    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
+    dyn = torch.tensor(DYN)
+    vx = [vr(a.batch) for _ in range(a.val_batches)]
+    scale = np.ones(a.days)  # n_L, set by the first validation
+
+    def save():
+        cfg = dict(Fm.cfg.__dict__)
+        if cfg["path"] == "line":  # the straight line's checkpoint format (no path keys)
+            cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+        keep = {k: v for k, v in Fm.meta.items() if k not in ("tuned_from", "tune")}   # dev_tag, core_tag, reflow_of
+        torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, **keep, tuned_from=a.flow_tag,
+                        tune=dict(vars(a), scale=scale.tolist())), os.path.join(a.out, f"{a.tag}.pt"))
+
+    def run(batch, gen=None, train=False):
+        """Per lead (days, 10), batch means: ES, the anchor, |truth - xbar|, spread^2 and skill^2 (grid norm); and
+        of the validation: ES of the tuning sampler, the mean squares (units of sigma) of its endpoint minus the
+        validation sampler's and of the latter, the kinetic energy and the squared displacement of the latter."""
+        x, ys, doy, tns, hi = batch
+        if ys.dim() == 4:
+            ys, tns = ys[:, None], tns[:, None]
+        xd, yd, doy, tns = x[:, dyn].to(dev), ys[:, :, dyn].to(dev), doy.to(dev), tns.to(dev)
+        with torch.no_grad():
+            e = Dk.start(xd, doy, None if hi is None else hi[:, :, dyn].to(dev), gen)
+        xb, out = xd, []
+        for k in range(a.days):
+            x0 = xb
+            with torch.no_grad():
+                xb, e, H, _ = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
+                z1 = (yd[:, k] - xb) / Dk.s * Dk.keep
+            sel = torch.randperm(P, generator=gen)[:M] if (train and M < P) else None
+            c = Fm.day_ctx(x0, xb, e, H, doy, tns[:, k], k, gen, sel)
+            wk = 1.0 / (float(scale[k]) * a.days)                     # the lead's weight of the score in the loss
+            if train and a.chunk:   # two passes: the members, d ES / d members, then the graph of a.chunk rows at a time
+                with torch.no_grad():
+                    z = Fm.day_run(c, n_tr or None, **jk)
+                zl = z.clone().requires_grad_(True)
+                es = energy_score(zl, z1, norm)[0].mean()
+                gz = torch.autograd.grad(es * wk, zl)[0].flatten(0, 1)
+                for r in torch.arange(gz.shape[0], device=gz.device).split(a.chunk):
+                    (Fm.day_run(Fm.ctx_rows(c, r), n_tr or None, grad=True, **jk)[0] * gz[r]).sum().backward()
+            else:
+                z = Fm.day_run(c, (n_tr if train else n_va) or None, grad=train, **jk)   # (B, M, 66, H, W)
+                es = energy_score(z, z1, norm)[0].mean()
+                if train:  # the sampler's graph is freed here: before the anchor's is built, and before the next lead
+                    (es * wk).backward()
+            z, es, more = z.detach(), float(es.detach()), [0.0] * 5
+            if not train:
+                kin, disp = Fm.last_path
+                ms = lambda t: float((t.flatten(0, 1) / c.sig).pow(2).mean())  # noqa: E731
+                zt = Fm.day_run(c, n_tr or None, **jk) if n_tr != n_va else z
+                more = [float(energy_score(zt, z1, norm)[0].mean()) if n_tr != n_va else es, ms(zt - z), ms(z), kin, disp]
+            an = Fm.day_loss(x0, xb, e, H, yd[:, k], doy, tns[:, k], k, w, gen, sel) if (a.lam > 0 or not train) else None
+            if train and an is not None:
+                (a.lam * an / a.days).backward()
+            with torch.no_grad():
+                sp, sk = spread_skill(z, z1, grid)
+                out.append([es, 0.0 if an is None else float(an.detach()), float(norm(z1).mean()),
+                            float(sp.mean()), float(sk.mean())] + more)
+        return np.array(out)
+
+    rd = lambda t: [round(float(q), 4) for q in t]  # noqa: E731
+
+    def val():
+        """The validation mean of ES_L / n_L, and what is logged of the batch means per lead."""
+        Fm.eval()
+        gv = torch.Generator().manual_seed(123)
+        with torch.no_grad():
+            r = np.mean([run(b, gv) for b in vx], 0)
+        Fm.train()
+        if first:  # n_L = E|truth - xbar| on the validation batches, once
+            scale[:] = np.maximum(r[:, 2], 1e-30)
+            first.clear()
+        v = dict(es=rd(r[:, 0] / scale), es_raw=rd(r[:, 0]), anchor=rd(r[:, 1]),
+                 spread_skill=rd(np.sqrt((P + 1) / P * r[:, 3] / np.maximum(r[:, 4], 1e-30))),
+                 straight=rd(r[:, 8] / np.maximum(r[:, 9], 1e-30)))
+        if n_tr != n_va:  # the tuning sampler on the validation draws: its score and its endpoint against the validation's
+            v.update(es_tune=rd(r[:, 5] / scale), end_tune=rd(np.sqrt(r[:, 6] / np.maximum(r[:, 7], 1e-30))))
+        return float(np.mean(r[:, 0] / scale)), v
+
+    t0 = time.time()
+    first = [True]
+    best, v0 = val()
+    save()
+    log(dict(devtune_val_start=v0, scale=rd(scale), norm=a.norm, members=M, pairs=P, flow=a.flow_tag,
+             path=Fm.cfg.path, lam=a.lam, steps=n_tr, val_steps=n_va, graph_units=units, graph_gb=round(gb, 2)))
+    for it in range(1, a.iters + 1):
+        opt.zero_grad()
+        r = run(tr(a.batch), train=True)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        sch.step()
+        if it % a.log_every == 0 or it == a.iters:
+            sc, v = val()
+            if sc < best:  # the checkpoint is the best validation energy score
+                best = sc
+                save()
+            log(dict(it=it, es=rd(r[:, 0] / scale), anchor=round(float(r[:, 1].mean()), 4),
+                     **{"val_" + k: q for k, q in v.items()}, best=round(best, 4), sec=round(time.time() - t0)))
 
 
 # ---------------------------------------------------------------------------------------------------------- tune
@@ -669,6 +992,13 @@ def main(argv=None):
                    help="balanced noise: diag_spectra json, psi starts from its 1-day wind error spectrum (default --e0-spec)")
     d.add_argument("--bal-vert", type=float, default=1.0,
                    help="balanced noise: vertical correlation scale of psi / chi in ln p (0 = independent levels)")
+    d.add_argument("--bal-lmin", type=int, default=1,
+                   help="balanced noise: psi / chi have no power in the degrees l < this (2 = no solid-body rotation, "
+                        "so the balanced wind carries no axial angular momentum). For the angular momentum only: the "
+                        "l = 1 band of z and T is NOT changed (linear balance: Phi_1 comes from psi_2)")
+    d.add_argument("--aam-fix", action="store_true",
+                   help="balanced noise: take the axial angular momentum out of the day's whole new wind, per level "
+                        "u - c cos(phi) (the remainder's u too)")
     d.add_argument("--fdt", default="", help="clim_bands.py json: the AR(1) rho per band is its one-day autocorrelation (fixed)")
     d.add_argument("--fdt-weight", type=float, default=0.0,
                    help="weight of the one-sided penalty relu(log V - log c)^2: band spread <= climatological band power")
@@ -713,6 +1043,47 @@ def main(argv=None):
                          "grid step is a line flow after the core's step, M Heun steps (2 M network calls)")
     df.add_argument("--val-batches", type=int, default=4)
     df.add_argument("--log-every", type=int, default=50)
+    df.add_argument("--reflow", default="",
+                    help="reflow: the tag of a trained deviation flow on --dev-tag (the teacher). The student starts "
+                         "from it and learns its (source, transported endpoint) pairs: straighter paths, the same "
+                         "endpoints; give the teacher's --hidden / --source / --path options")
+    dt = sub.add_parser("devtune")
+    common(dt)
+    dt.add_argument("--flow-tag", required=True, help="the trained deviation flow to tune (line or core path)")
+    dt.add_argument("--tag", default="", help="the tuned flow (default <flow-tag>_es); it must start with 'devflow'")
+    dt.add_argument("--norm", default="grid", choices=["grid", "band", "energy"],
+                    help="the norm of the energy score (fpk.escore): area-weighted RMS in units of s, the "
+                         "band-weighted norm of diag_spectra, or the dry + moist total-energy norm")
+    dt.add_argument("--clim", default="docs/results/clim_bands.json",
+                    help="--norm band: clim_bands.py json, its climatological band power c")
+    dt.add_argument("--band-bmin", type=int, default=1,
+                    help="--norm band: the first band that counts. Default 1 = without the band l = 0: that band is "
+                         "the global mean (the core's own mass drift, and a tiny climatological power, so it would "
+                         "dominate the norm); 0 = all bands, diag_spectra's full norm")
+    dt.add_argument("--members", type=int, default=0,
+                    help="members (source draws, the +e of the kernel's pairs) per IC in the score: 0 = the kernel's P; "
+                         "fewer = a random choice per lead; more = the kernel runs that many pairs")
+    dt.add_argument("--lam", type=float, default=0.5, help="weight of the flow-matching loss (anchor)")
+    dt.add_argument("--iters", type=int, default=300)
+    dt.add_argument("--lr", type=float, default=1e-4)
+    dt.add_argument("--steps", type=int, default=2,
+                    help="sampler steps during tuning (2 x steps network calls a member in the graph); 0 = the flow's "
+                         "own. Default 2: the flow's own 6 steps hold 3 x the graph")
+    dt.add_argument("--val-steps", type=int, default=0,
+                    help="sampler steps of the validation (it picks the checkpoint); 0 = the flow's own (score "
+                         "samples with its own --steps, default 6)")
+    dt.add_argument("--chunk", type=int, default=0,
+                    help="source rows a backward pass: the same gradient in two passes, with the graph of this many "
+                         "rows at a time (memory = rows x calls network evaluations, one more sampler pass without "
+                         "a graph); 0 = one pass with all batch x members rows in the graph")
+    dt.add_argument("--max-graph-gb", type=float, default=2.5,
+                    help="refuse to start when the estimated graph of a lead (logged as graph_gb) is larger; 0 = no limit")
+    dt.add_argument("--core-jac", action="store_true",
+                    help="core path: keep the equation's Jacobian of the core steps in the gradient (default: identity)")
+    dt.add_argument("--days", type=int, default=10)
+    dt.add_argument("--batch", type=int, default=2)
+    dt.add_argument("--val-batches", type=int, default=4)
+    dt.add_argument("--log-every", type=int, default=25)
     t = sub.add_parser("tune")
     common(t)
     t.add_argument("--tag", required=True)
@@ -749,7 +1120,8 @@ def main(argv=None):
     if a.threads:
         torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
-    {"core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "devflow": cmd_devflow, "score": cmd_score}[a.cmd](a, rest)
+    {"core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "devflow": cmd_devflow,
+     "devtune": cmd_devtune, "score": cmd_score}[a.cmd](a, rest)
 
 
 if __name__ == "__main__":

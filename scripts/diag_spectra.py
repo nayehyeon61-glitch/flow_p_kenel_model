@@ -9,6 +9,16 @@
 2. rho_eq: the share of the deviations' variance carried by the equation's directions,
    rho_eq = <|p e^r|^2> / <|e_next|^2>, e_next = (p + h xi) e^r, per lead (area-weighted, tisr excluded). A small
    rho_eq means the flow's source is mostly the isotropic new part, which a Gaussian source reproduces.
+
+Also the fair energy score of the members in the band-weighted norm (fpk.escore; c = the band power of the validation
+year's anomalies, computed here). The json has "es_version": 2:
+    energy_score      a flow's P members (--flow-tag): the fair score of independent members. The kernel's 2 P
+                      members xbar +- s e: P antithetic pairs, the spread term over members of different pairs only
+    energy_score_v1   what version 1 (no "es_version" in meta) wrote as "energy_score": the kernel's 2 P members as
+                      independent ones, biased low (a member and its mirror are 2 |e| apart) and the more the wider
+                      the kernel; for a flow the same number as energy_score. Compare a version-1 file with this key
+    energy_score_b1   energy_score in the norm without the band l = 0 (the global mean: the core's own mass drift
+                      and a tiny climatological power, so it dominates the full norm)
 """
 
 import argparse
@@ -23,6 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import run_fpk as R  # noqa: E402
 from fpk import data as D  # noqa: E402
+from fpk.escore import BandNorm, band_power, energy_score  # noqa: E402
 from fpk.sphere import SHT, bands  # noqa: E402
 
 VARS = ("z500", "t850", "u250", "msl")
@@ -47,7 +58,9 @@ def main():
     if Fm is not None:
         Dk = Fm.dk
     path, split = np.zeros((a.leads, 2)), np.zeros((a.leads, 2))
-    es = np.zeros((a.leads, 3))  # band-weighted energy score: E|X - y|, 1/2 E|X - X'|, their difference
+    # band-weighted energy score (fpk.escore), sums over the ICs: E|X - y|, 1/2 E|X - X'| and their difference of
+    # "energy_score"; the same of es_version 1 ("energy_score_v1"); the score without the band l = 0 ("energy_score_b1")
+    es = np.zeros((a.leads, 7))
     S = SHT(cl.lat)
     va = D.load(pa, [a.val_year])[a.val_year]
     names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
@@ -58,13 +71,11 @@ def main():
     ics = np.linspace(8, len(va) - L - 1, a.ics).astype(int)
     w = D.area_weights(cl.lat)
     sums = {k: torch.zeros(L, 66, S.L) for k in ("err", "dev", "new", "eq")}
-    bj0, nb0 = bands(S.L)
-    band_pw = lambda f: torch.stack([S.spectrum(f)[..., bj0 == b].sum(-1) for b in range(nb0)], -1)  # noqa: E731
     with torch.no_grad():  # the climatological band power of the day-to-day anomaly (units of s), per channel
         an = torch.from_numpy(va[::7][:, dyn]) - torch.from_numpy(va[:, dyn]).mean(0, keepdim=True)
-        cpw = band_pw(an / Dk.s).mean(0).clamp(min=1e-8)                                    # (66, nb)
-        nj0 = torch.tensor([float((2 * torch.arange(S.L)[bj0 == b] + 1).sum()) for b in range(nb0)])
-        wES = (1.0 / (nj0 * cpw / nj0.sum())) * (Dk.keep.reshape(-1, 1) > 0) / 65.0 / nb0   # (66, nb)
+        cpw = band_power(S, an / Dk.s).mean(0).clamp(min=1e-8)                              # (66, nb)
+        nrm = BandNorm(S, cpw, Dk.keep)   # |f|_w (fpk.escore), w = 1 / (n_j cpw / sum n) / 65 / nb, the norm of devtune
+        nrm1 = BandNorm(S, cpw, Dk.keep, bmin=1)   # the same weights without the band l = 0 (the global mean)
     rho = torch.zeros(L, 66, 2)
     g = torch.Generator().manual_seed(7)
     n = 0
@@ -87,14 +98,21 @@ def main():
                     if getattr(Fm, "last_split", None) is not None:      # the core's flow: core / learned growth
                         split[k] += np.array(Fm.last_split) * len(j)
                 # the energy score in the band-weighted norm |f|_w^2 = sum_c sum_j w_cj |P_j f_c|^2, w = 1 / (the
-                # error's own band power of that lead is not known beforehand: the climatological band power c_cj)
-                mem = dev if Fm is not None else torch.cat([e, -e], 1)
-                er = ((truth[:, k] - x) / Dk.s)[:, None]
-                nrm = lambda f: (band_pw(f) * wES).sum((-1, -2)).sqrt()  # noqa: E731  (B, M)
-                d1 = nrm(mem - er).mean(1)
-                M = mem.shape[1]
-                d2 = sum(nrm(mem - mem.roll(q, 1)).mean(1) for q in range(1, M)) / (M - 1)
-                es[k] += np.array([float(d1.sum()), float(0.5 * d2.sum()), float((d1 - 0.5 * d2).sum())])
+                # error's own band power of that lead is not known beforehand: the climatological band power c_cj).
+                # A flow's P members are independent draws: the fair score. The kernel's 2 P members [e, -e] are P
+                # antithetic pairs: the spread term over members of different pairs only (es_version 2; version 1
+                # took them as 2 P independent members, which is low by (2 - sqrt 2) E|e| / (2 (2 P - 1)) for
+                # Gaussian deviations: 6 % of a calibrated score at P = 4, an estimated 7 to 10 % on the stored
+                # kernel runs, and the more the wider the kernel)
+                anti = Fm is None
+                mem, yk = dev if Fm is not None else torch.cat([e, -e], 1), (truth[:, k] - x) / Dk.s
+                if anti and e.shape[1] < 2:   # one pair alone has no two independent members: no score (nan)
+                    score = lambda n_: (torch.full((len(j),), float("nan")),) * 3  # noqa: E731
+                else:
+                    score = lambda n_: energy_score(mem, yk, n_, pairs=anti)  # noqa: E731
+                fair, d1, d2 = score(nrm)                                            # ES, E|X - y|, 1/2 E|X - X'|: (B,)
+                old = energy_score(mem, yk, nrm) if anti else (fair, d1, d2)         # es_version 1
+                es[k] += np.array([float(q.sum()) for q in (d1, d2, fair, old[1], old[2], old[0], score(nrm1)[0])])
                 er = torch.exp(Dk.last["r"])[:, None]
                 eq, new = Dk.last["p"] * er, Dk.last["hxi"] * er          # (B, P, 66, H, W)
                 sums["err"][k] += S.spectrum((truth[:, k] - x) / Dk.s).sum(0)
@@ -108,7 +126,7 @@ def main():
     sp = {k: v / n for k, v in sums.items()}
     bj, nb = bands(S.L)
     band = lambda t: torch.stack([t[..., bj == b].sum(-1) for b in range(nb)], -1)  # noqa: E731
-    out = dict(meta=dict(core_tag=a.core_tag, dev_tag=a.dev_tag, year=a.val_year, ics=n, leads=L,
+    out = dict(meta=dict(core_tag=a.core_tag, dev_tag=a.dev_tag, year=a.val_year, ics=n, leads=L, es_version=2,
                          bands=[[int(np.where(bj.numpy() == b)[0].min()), int(np.where(bj.numpy() == b)[0].max())]
                                 for b in range(nb)]))
     r = rho[..., 0] / rho[..., 1]
@@ -126,15 +144,24 @@ def main():
                       for v in out["dev"]}
     out["w2"] = {v: np.sum(out["w2_band"][v], -1).tolist() for v in out["dev"]}
     f = lambda v: " ".join(f"{x:6.3f}" for x in v)  # noqa: E731
+    # es_version 2. "energy_score": the fair score of the members (kernel: of its antithetic pairs, the spread term
+    # over members of different pairs); "energy_score_v1": what es_version 1 wrote as "energy_score" (the kernel's
+    # 2 P members as independent ones: biased low; a flow's members: the same number as "energy_score");
+    # "energy_score_b1": "energy_score" in the norm without the band l = 0
     out["energy_score"] = (es[:, 2] / n).tolist()
     out["energy_score_parts"] = (es[:, :2] / n).tolist()
+    out["energy_score_v1"] = (es[:, 5] / n).tolist()
+    out["energy_score_parts_v1"] = (es[:, 3:5] / n).tolist()
+    out["energy_score_b1"] = (es[:, 6] / n).tolist()
     if Fm is not None:
         out["path_kinetic_over_displacement"] = (path[:, 0] / np.maximum(path[:, 1], 1e-12)).tolist()
         if getattr(Fm, "last_split", None) is not None:
             out["day_growth_core_learned"] = (split / n).tolist()   # 1/2 log variance of the day, units of sigma
             print("day's growth (core, learned) at leads 1/5/10:", [f(split[q] / n) for q in (0, 4, 9) if q < L])
         print("path kinetic / displacement at leads 1/5/10:", f([out["path_kinetic_over_displacement"][q] for q in (0, 4, 9) if q < L]))
-    print("band-weighted energy score at leads 1/5/10:", " ".join(f"{out['energy_score'][q]:.4f}" for q in (0, 4, 9) if q < L))
+    for key, what in (("energy_score", "band-weighted energy score"), ("energy_score_v1", "    the same, es_version 1"),
+                      ("energy_score_b1", "    without the band l = 0")):
+        print(f"{what} at leads 1/5/10:", " ".join(f"{out[key][q]:.4f}" for q in (0, 4, 9) if q < L))
     json.dump(out, open(a.json, "w"))
     print("bands (degrees):", out["meta"]["bands"])
     for v in ("all",) + VARS:
