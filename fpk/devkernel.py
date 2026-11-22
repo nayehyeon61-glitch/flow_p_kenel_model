@@ -78,6 +78,10 @@ class DevConfig:
     noise_pre: bool = False   # the new part composed with the equation: the Gaussian field is added to the deviations
     #                           BEFORE the equation's day, e_in = e + h xi, so the day's new variance is M (h xi): it
     #                           lies in the region the equation reaches (balanced, on the equation's scales)
+    noise_mult: float = 0.0   # > 0: the noise multiplies the physics. The day's tendency of a member is (1 + a zeta)
+    #                           times the equation's, zeta one large-scale field (degrees <= 7) for all channels (the
+    #                           balance between the variables is kept), a per channel (start noise_mult). The new
+    #                           part is then a zeta (Phi(xbar) - xbar) / s in place of the additive h xi
     e0_spec: str = ""         # the initial deviations' degree spectrum: "" = smooth_noise; a json of
     #                           diag_spectra.py: its 1-day error spectrum (err_deg, all channels), unit variance
     noise: str = "smooth"     # the new part's field: "smooth" (3 x 3 mean of white noise) or "sphere": spherical
@@ -101,7 +105,9 @@ class EntropyDeviationKernel(nn.Module):
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))  # zero head: r = bias
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
-        if cfg.noise == "sphere" or cfg.band_scale or cfg.e0_spec:
+        if cfg.noise_mult > 0:
+            self.a_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.noise_mult))))
+        if cfg.noise == "sphere" or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0:
             H = int(core.static.shape[-2])
             lat = [-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]  # the data's equiangular grid, south to north
             self.sht = SHT(lat)
@@ -261,6 +267,13 @@ class EntropyDeviationKernel(nn.Module):
         else:
             phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
             q = p + self.h().unsqueeze(0) * xi
+        if self.cfg.noise_mult > 0:
+            L_ = self.sht.L
+            amp = torch.zeros(L_, device=xbar.device)
+            amp[1:8] = torch.sqrt((2 * torch.arange(1, 8, device=xbar.device) + 1) / 63.0)  # unit variance, l = 1..7
+            zeta = self.sht.noise(amp, (B, e.shape[1], 1), gen)                               # (B, P, 1, H, W)
+            tend0 = ((phi0 - xbar) / self.s * self.keep).detach()
+            q = p + F.softplus(self.a_raw).view(1, 1, 66, 1, 1) * zeta * tend0[:, None]
         g = None if g is None else g.detach()
         le, lq = self.size(e), self.size(q)
         tend = ((phi0 - xbar) / self.s * self.keep).detach()

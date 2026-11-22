@@ -209,7 +209,8 @@ def cmd_devk(a, rest):
     Dk = EntropyDeviationKernel(core, DevConfig(pairs=a.pairs, hidden=a.hidden, eps0=a.eps0, smooth=a.smooth,
                                                cloud_mean=a.cloud_mean, correct=a.correct, noise=a.noise,
                                                r_dissip=a.r_dissip, band_scale=a.band_scale,
-                                               e0_spec=a.e0_spec, noise_pre=a.noise_pre)).to(dev)
+                                               e0_spec=a.e0_spec, noise_pre=a.noise_pre,
+                                               noise_mult=a.noise_mult)).to(dev)
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
         ck = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu", weights_only=False)
         miss = Dk.load_state_dict(ck["state"], strict=False)
@@ -638,6 +639,8 @@ def main(argv=None):
     d.add_argument("--energy-k", type=float, default=1.0)
     d.add_argument("--noise-pre", action="store_true",
                    help="compose the noise with the equation: add it to the deviations before the equation's day")
+    d.add_argument("--noise-mult", type=float, default=0.0,
+                   help="the noise multiplies the day's tendency, (1 + a zeta) f, in place of the additive new part")
     d.add_argument("--e0-spec", default="", help="diag_spectra json: initial deviations shaped like its 1-day error")
     d.add_argument("--band-scale", action="store_true", help="entropy by scale: band-wise rescaling of the deviations")
     d.add_argument("--band-weight", type=float, default=0.0, help="weight of the band-wise log score (needs the SHT)")

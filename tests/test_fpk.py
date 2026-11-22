@@ -375,3 +375,20 @@ def test_noise_composed_with_the_equation(core):
     x1, e1, H1, _ = Dk.day(xd, e, doy, tis[:, 0], 0)
     assert float(e1.abs().mean()) > 0 and torch.isfinite(H1).all()
     assert float(Dk.last["hxi"].abs().max()) < 1e-6     # nothing is added after the equation
+
+
+def test_noise_multiplying_the_tendency(mcore):
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    torch.manual_seed(0)
+    Dk = EntropyDeviationKernel(mcore, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=3, noise_mult=0.5))
+    xd, doy, tis = torch.randn(2, 66, H, W), torch.tensor([5, 6]), torch.zeros(2, 1, H, W)
+    e = Dk.start(xd, doy, torch.randn(2, int(mcore.mem), 66, H, W)) * 0
+    x1, e1, H1, _ = Dk.day(xd, e, doy, tis[:, 0], 0)
+    tend = (x1 - xd) / Dk.s * Dk.keep
+    new = Dk.last["hxi"]                                   # a zeta tend: proportional to the day's tendency
+    k = Dk.keep.reshape(-1) > 0
+    a = torch.nn.functional.softplus(Dk.a_raw)[k].view(1, 1, -1, 1, 1)
+    zeta = new[:, :, k] / (a * tend[:, None][:, :, k])     # the same field in every channel
+    assert float(tend.abs().mean()) > 0 and float((zeta - zeta[:, :, :1]).abs().median()) < 1e-3
+    Dk.ign(H1, x1, x1.detach() + 0.3 * Dk.s, torch.ones(1, 1, H, 1))[0].backward()
+    assert float(Dk.a_raw.grad.abs().sum()) > 0
