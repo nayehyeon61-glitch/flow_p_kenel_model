@@ -406,7 +406,9 @@ class EntropyDeviationKernel(nn.Module):
         grid's weights, sum_i cos(phi_i) (mean over lon)_i / sum_i cos(phi_i), as scripts/diag_conserve.py takes it:
         that mean of the result's u cos(phi) is zero to rounding."""
         Hn, Wn = x.shape[-2:]
-        cos = torch.cos(torch.deg2rad(torch.as_tensor(grid_lat(Hn, Wn)))).view(Hn, 1).to(x)
+        # float32 as before (the grids' latitudes are exact in float32, so the cell-centre grid gives the old numbers)
+        cos = torch.cos(torch.deg2rad(torch.as_tensor(grid_lat(Hn, Wn), dtype=torch.float32, device=x.device)))
+        cos = cos.view(Hn, 1).to(x)
         cos = cos * (cos > 1e-6)  # the pole rows: cos(+-90 deg) = 6e-17, carry no weight
         iu, unit = self.bal_idx[2], self.bal_unit[2].view(-1, 1, 1)
         u = x[:, :, iu] * unit

@@ -85,6 +85,7 @@ def years_of(a):
 
 
 def pargs(a, extra=None):
+    years_of(a)  # --train-range, for every script that takes ``common``'s options (diag_conserve, diag_nongauss too)
     return pgfm_args(a.data_root, a.out, a.train_years, a.val_year, a.test_year, a.device, a.core_tag, extra)
 
 
@@ -114,10 +115,11 @@ def part_path(a):
 
 def save_part(a, it, best, model, opt, sch, pairs, **extra):
     """The state to continue a cut-off run from (--resume): the model, the optimizer, the schedule, the iteration,
-    the best validation, the data's and torch's random states. Not bit-identical to an uncut run (a prefetched
-    batch is drawn again), but the same schedule and the same checkpoints' meaning."""
+    the best validation, the data's and torch's random states. The continued run draws the batches the uncut run
+    would have drawn (``Pairs.state``: a batch drawn ahead by the prefetching thread is not counted); its numbers
+    need not be bit-identical (the GPU's kernels), but the schedule and the checkpoints' meaning are the same."""
     st = dict(it=it, best=best, model=model.state_dict(), opt=opt.state_dict(), sch=sch.state_dict(),
-              rng=pairs.rng.bit_generator.state, torch_rng=torch.get_rng_state(),
+              rng=pairs.state(), torch_rng=torch.get_rng_state(),
               cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, extra=extra)
     save_atomic((st, part_path(a)))
 
@@ -131,7 +133,7 @@ def load_part(a, model, opt, sch, pairs):
     model.load_state_dict(st["model"])
     opt.load_state_dict(st["opt"])
     sch.load_state_dict(st["sch"])
-    pairs.rng.bit_generator.state = st["rng"]
+    pairs.set_state(st["rng"])
     torch.set_rng_state(st["torch_rng"])
     if st.get("cuda_rng") is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(st["cuda_rng"])
@@ -694,6 +696,8 @@ def cmd_devflow(a, rest):
         cfg = dict(Fm.cfg.__dict__)
         if cfg["path"] == "line":  # the straight line's checkpoint as it always was (the path's keys only with a path)
             cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+        if not cfg["unet"]:  # the plain net's checkpoint as it always was (the U-Net's keys only with a U-Net)
+            cfg.pop("unet"), cfg.pop("unet_reps")
         torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, dev_tag=a.dev_tag, core_tag=a.core_tag,
                         **(dict(reflow_of=a.reflow) if a.reflow else {})), os.path.join(a.out, f"{a.tag}.pt"))
 
@@ -939,6 +943,8 @@ def cmd_devtune(a, rest):
         cfg = dict(Fm.cfg.__dict__)
         if cfg["path"] == "line":  # the straight line's checkpoint format (no path keys)
             cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+        if not cfg["unet"]:  # the plain net's checkpoint format (no U-Net keys)
+            cfg.pop("unet"), cfg.pop("unet_reps")
         keep = {k: v for k, v in Fm.meta.items() if k not in ("tuned_from", "tune")}   # dev_tag, core_tag, reflow_of
         files = []
         if kt:  # the tuned kernel first (the flow never names a kernel that is not there): the original's checkpoint

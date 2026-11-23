@@ -80,13 +80,20 @@ def main():
     w = D.area_weights(cl.lat).to(dv)
     sums = {k: torch.zeros(L, 66, S.L, device=dv) for k in ("err", "dev", "new", "eq")}
     with torch.no_grad():  # the climatological band power of the day-to-day anomaly (units of s), per channel
-        # the year's mean in slabs of days (a 1.5 deg year read at once is 2.85 GB, and more in its z-scoring)
-        ym = sum(torch.from_numpy(np.asarray(va[i:i + 32][:, dyn], dtype=np.float64)).sum(0) for i in range(0, len(va), 32))
-        ym = (ym / len(va)).float()[None].to(dv)
-        an = torch.from_numpy(va[::7][:, dyn]).to(dv) - ym
-        cpw = torch.cat([band_power(S, an[i:i + 8] / Dk.s) for i in range(0, len(an), 8)]).mean(0).clamp(min=1e-8)  # (66, nb)
-        nrm = BandNorm(S, cpw, Dk.keep)   # |f|_w (fpk.escore), w = 1 / (n_j cpw / sum n) / 65 / nb, the norm of devtune
-        nrm1 = BandNorm(S, cpw, Dk.keep, bmin=1)   # the same weights without the band l = 0 (the global mean)
+        bjd = bands(S.L)[0].to(dv)       # the bands' degrees on the device of the fields
+        if isinstance(va, np.ndarray):   # a year in memory (5.625 deg): in one pass, the numbers as they always were
+            an = torch.from_numpy(va[::7][:, dyn]) - torch.from_numpy(va[:, dyn]).mean(0, keepdim=True)
+            cpw = band_power(S, an.to(dv) / Dk.s, bjd).mean(0)
+        else:   # a year on disk (1.5 deg, 2.85 GB, and more in its z-scoring): the mean and the power in slabs
+            ym = sum(torch.from_numpy(np.asarray(va[i:i + 32][:, dyn], dtype=np.float64)).sum(0) for i in range(0, len(va), 32))
+            ym = (ym / len(va)).float()[None].to(dv)
+            an = torch.from_numpy(va[::7][:, dyn]).to(dv) - ym
+            cpw = torch.cat([band_power(S, an[i:i + 8] / Dk.s, bjd) for i in range(0, len(an), 8)]).mean(0)
+        cpw = cpw.clamp(min=1e-8).cpu()                                                          # (66, nb)
+        # |f|_w (fpk.escore), w = 1 / (n_j cpw / sum n) / 65 / nb, the norm of devtune; built on the CPU (its weights
+        # come from CPU tensors), then on the device with the fields
+        nrm = BandNorm(S, cpw, Dk.keep).to(dv)
+        nrm1 = BandNorm(S, cpw, Dk.keep, bmin=1).to(dv)   # the same weights without the band l = 0 (the global mean)
     rho = torch.zeros(L, 66, 2, device=dv)
     g = make_gen(7, dv)
     n = 0

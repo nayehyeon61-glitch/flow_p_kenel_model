@@ -75,9 +75,10 @@ def climate(a) -> Climate:
     lat = R.lat_of(os.path.join(a.data, f"{y}.nc"), clim.shape[-2], a.era5)
     # a stats.npz of another grid (an --out of the 5.625 deg runs) would be used without a word: refuse it
     H, W = clim.shape[-2:]
-    y0 = a.train_years[0]
-    first = R.daily(os.path.join(a.data, f"{y0}.nc"), os.path.join(a.cache, f"{y0}.npy"))  # memmap: the shape only
-    if tuple(first.shape[-2:]) != (H, W):
+    # the validation year's file (a score or a diagnosis reads it too); a folder without it is not checked here
+    src, npy = os.path.join(a.data, f"{y}.nc"), os.path.join(a.cache, f"{y}.npy")
+    first = R.daily(src, npy) if (os.path.exists(src) or os.path.exists(npy)) else None   # memmap: the shape only
+    if first is not None and tuple(first.shape[-2:]) != (H, W):
         raise SystemExit(f"{a.out}/stats.npz is for a {H} x {W} grid, the data is {tuple(first.shape[-2:])}: "
                          f"use another --out for this grid")
     from .sphere import grid_lat
@@ -103,8 +104,10 @@ class Pairs:
     def __init__(self, years: Dict[int, np.ndarray], seed: int = 0, hist: int = 0, ahead: int = 1, device=None,
                  prefetch: bool = False):
         """``device`` (lazy years): x, y and hist come back on the device, z-scored there from the raw days of one
-        read per sample (the same float32 numbers as indexing the ``LazyYear``). ``prefetch``: the next batch of the same size is drawn in a thread meanwhile (the same draws, in the
-        same order, as without it)."""
+        read per sample (the same float32 numbers as indexing the ``LazyYear``). ``prefetch``: the next batch of the
+        same size is drawn in a thread meanwhile. The batches are those without it, in the same order: a call with
+        another size first undoes the draws of the batch drawn ahead, and ``state`` is the generator's state where
+        the next batch to be returned begins (``set_state`` puts it back for a continued run)."""
         self.years, self.hist, self.ahead = years, int(hist), int(ahead)
         self.keys = sorted(years)
         self.n = np.array([len(years[k]) - self.ahead for k in self.keys])
@@ -121,10 +124,28 @@ class Pairs:
     def __call__(self, B: int):
         if self._pool is None:
             return self.draw(B)
-        fut = self._next[1] if self._next is not None and self._next[0] == B else self._pool.submit(self.draw, B)
-        out = fut.result()
-        self._next = (B, self._pool.submit(self.draw, B))
+        if self._next is not None and self._next[0] == B:
+            out = self._next[1].result()
+        else:
+            self._drop()                      # another size: the batch drawn ahead is undone, drawn now at this size
+            out = self.draw(B)
+        # the worker is idle here: the state where the next batch begins, read before it is drawn
+        self._next = (B, self._pool.submit(self.draw, B), self.rng.bit_generator.state)
         return out
+
+    def _drop(self):
+        if self._next is not None:
+            self._next[1].result()
+            self.rng.bit_generator.state = self._next[2]
+            self._next = None
+
+    def state(self):
+        """The generator's state where the next batch to be returned begins (a batch drawn ahead is not counted)."""
+        return self._next[2] if self._next is not None else self.rng.bit_generator.state
+
+    def set_state(self, st):
+        self._drop()
+        self.rng.bit_generator.state = st
 
     def draw(self, B: int):
         ys = self.rng.choice(len(self.keys), size=B, p=self.n / self.n.sum())

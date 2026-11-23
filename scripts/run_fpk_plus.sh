@@ -102,7 +102,7 @@ do_smoke() {  # every stage at the full grid and batch, a few iterations, in its
     $FPK devflow $S --tag devflow_s --dev-tag devk_s2 --iters 2 --val-batches 1 --log-every 1 $FLOW_ARCH $GPU || return 1
     $FPK score $S --arms persistence core devk_s2 devflow_s --max-ics 2 --score-tag score_s || return 1
     echo "== smoke: GPU memory (GB) and seconds of the logged iterations"
-    grep -ho '"gpu_gb": [0-9.]*' "$OUT/logs/smoke$SFX.log" | sort -t: -k2 -n | tail -1
+    grep -ho '"gpu_gb": [0-9.]*' "$OUT/logs/smoke$SFX.log" | sort -t: -k2 -n | tail -1 || true   # none on the CPU
 }
 
 do_report() {
