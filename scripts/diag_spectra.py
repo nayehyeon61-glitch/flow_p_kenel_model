@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import run_fpk as R  # noqa: E402
 from fpk import data as D  # noqa: E402
 from fpk.escore import BandNorm, band_power, energy_score  # noqa: E402
+from fpk.kernel import make_gen  # noqa: E402
 from fpk.sphere import SHT, bands  # noqa: E402
 
 VARS = ("z500", "t850", "u250", "msl")
@@ -48,7 +49,7 @@ def main():
     p.add_argument("--leads", type=int, default=10)
     p.add_argument("--flow-tag", default="", help="a deviation flow on --dev-tag: its members instead of the kernel's")
     p.add_argument("--json", default="docs/results/diag_spectra.json")
-    a = p.parse_args()
+    a = R.years_of(p.parse_args())
     a.cloud_mean = False
     if a.threads:
         torch.set_num_threads(a.threads)
@@ -63,31 +64,39 @@ def main():
     # band-weighted energy score (fpk.escore), sums over the ICs: E|X - y|, 1/2 E|X - X'| and their difference of
     # "energy_score"; the same of es_version 1 ("energy_score_v1"); the score without the band l = 0 ("energy_score_b1")
     es = np.zeros((a.leads, 7))
-    S = SHT(cl.lat)
+    dv = torch.device(a.device)
+    if Fm is not None:
+        R.net_run(a, Fm)
+    else:
+        R.net_run(a, Dk)
+    S = SHT(cl.lat, nlon=int(core.static.shape[-1])).to(dv)   # the data's grid (the 1.5 deg one has the poles)
     va = D.load(pa, [a.val_year])[a.val_year]
-    names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
+    names = [R.contract.CHANNEL_NAMES[c] for c in R.DYN]
     dyn = np.asarray(R.DYN)
-    kk = torch.tensor(np.where(Dk.keep.reshape(-1).numpy() > 0)[0])
+    kk = torch.tensor(np.where(Dk.keep.reshape(-1).cpu().numpy() > 0)[0])
     ci = [names.index(v) for v in VARS]
     W, L = int(getattr(core, "mem", 0)), a.leads
     ics = np.linspace(8, len(va) - L - 1, a.ics).astype(int)
-    w = D.area_weights(cl.lat)
-    sums = {k: torch.zeros(L, 66, S.L) for k in ("err", "dev", "new", "eq")}
+    w = D.area_weights(cl.lat).to(dv)
+    sums = {k: torch.zeros(L, 66, S.L, device=dv) for k in ("err", "dev", "new", "eq")}
     with torch.no_grad():  # the climatological band power of the day-to-day anomaly (units of s), per channel
-        an = torch.from_numpy(va[::7][:, dyn]) - torch.from_numpy(va[:, dyn]).mean(0, keepdim=True)
-        cpw = band_power(S, an / Dk.s).mean(0).clamp(min=1e-8)                              # (66, nb)
+        # the year's mean in slabs of days (a 1.5 deg year read at once is 2.85 GB, and more in its z-scoring)
+        ym = sum(torch.from_numpy(np.asarray(va[i:i + 32][:, dyn], dtype=np.float64)).sum(0) for i in range(0, len(va), 32))
+        ym = (ym / len(va)).float()[None].to(dv)
+        an = torch.from_numpy(va[::7][:, dyn]).to(dv) - ym
+        cpw = torch.cat([band_power(S, an[i:i + 8] / Dk.s) for i in range(0, len(an), 8)]).mean(0).clamp(min=1e-8)  # (66, nb)
         nrm = BandNorm(S, cpw, Dk.keep)   # |f|_w (fpk.escore), w = 1 / (n_j cpw / sum n) / 65 / nb, the norm of devtune
         nrm1 = BandNorm(S, cpw, Dk.keep, bmin=1)   # the same weights without the band l = 0 (the global mean)
-    rho = torch.zeros(L, 66, 2)
-    g = torch.Generator().manual_seed(7)
+    rho = torch.zeros(L, 66, 2, device=dv)
+    g = make_gen(7, dv)
     n = 0
     for i in range(0, len(ics), a.batch):
         j = ics[i:i + a.batch]
-        x = torch.from_numpy(va[j][:, dyn])
-        doy = torch.tensor(j)
-        tis = torch.from_numpy(np.stack([va[k + 1:k + 1 + L][:, D.TISR] for k in j]))
-        hist = torch.from_numpy(np.stack([va[np.maximum(np.arange(k - W, k), 0)][:, dyn] for k in j])) if W else None
-        truth = torch.from_numpy(np.stack([va[k + 1:k + 1 + L][:, dyn] for k in j]))
+        x = torch.from_numpy(va[j][:, dyn]).to(dv)
+        doy = torch.tensor(j, device=dv)
+        tis = torch.from_numpy(np.stack([va[k + 1:k + 1 + L][:, D.TISR] for k in j])).to(dv)
+        hist = torch.from_numpy(np.stack([va[np.maximum(np.arange(k - W, k), 0)][:, dyn] for k in j])).to(dv) if W else None
+        truth = torch.from_numpy(np.stack([va[k + 1:k + 1 + L][:, dyn] for k in j])).to(dv)
         with torch.no_grad():
             e = Dk.start(x, doy, hist, g)
             for k in range(L):
@@ -125,7 +134,8 @@ def main():
                 rho[k, :, 1] += (e.pow(2) * w).mean((1, 3, 4)).sum(0)
         n += len(j)
         print(json.dumps(dict(ics=n)), flush=True)
-    sp = {k: v / n for k, v in sums.items()}
+    sp = {k: v.cpu() / n for k, v in sums.items()}
+    rho = rho.cpu()
     bj, nb = bands(S.L)
     band = lambda t: torch.stack([t[..., bj == b].sum(-1) for b in range(nb)], -1)  # noqa: E731
     out = dict(meta=dict(core_tag=a.core_tag, dev_tag=a.dev_tag, year=a.val_year, ics=n, leads=L, es_version=2,

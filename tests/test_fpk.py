@@ -1667,7 +1667,7 @@ def _cli(mcore, tmp_path, monkeypatch, fixed=False):
         real, kept = R.D.Pairs, {}
 
         class Fixed:
-            def __init__(self, years, seed=0, hist=0, ahead=1):
+            def __init__(self, years, seed=0, hist=0, ahead=1, **kw):  # device, prefetch: the real Pairs on the CPU
                 self.p = real(years, 0, hist=hist, ahead=ahead)
 
             def __call__(self, B):

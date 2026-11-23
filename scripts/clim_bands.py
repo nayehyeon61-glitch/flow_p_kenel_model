@@ -88,7 +88,7 @@ def main():
                    help="years of the daily climatology (default: every cached year before --val-year; "
                         "'--clim-years' alone: the climatology of stats.npz, the first run's training years)")
     p.add_argument("--json", default="docs/results/clim_bands.json")
-    a = p.parse_args()
+    a = R.years_of(p.parse_args())
     torch.set_num_threads(a.threads or 1)
     pa = R.pargs(a)
     cl = D.climate(pa)

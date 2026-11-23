@@ -57,10 +57,9 @@ import torch.nn.functional as F
 from .env import time_features
 from .env import PGFM  # noqa: F401  (sys.path)
 from .kernel import ADV_STATE, MEM_STATE, smooth_noise
-from .sphere import A_EARTH, SHT, bands
-from pgcfm.core import Net  # noqa: E402
-from pgcfm.kai_tend import core_step, stateless_norm  # noqa: E402
-from pgcfm.seqdct import _NetCfg  # noqa: E402
+from .nets import make_net, run_net
+from .sphere import A_EARTH, SHT, bands, grid_lat
+from pgcfm.kai_tend import core_step  # noqa: E402
 
 HALF_LOG_2PIE = 0.5 * (math.log(2 * math.pi) + 1.0)
 R_DRY = 287.05  # J / (kg K)
@@ -129,6 +128,11 @@ class DevConfig:
     #                           For the angular momentum ONLY: the l = 1 band of z and T does not change (linear
     #                           balance: Phi_1 comes from psi_2; psi_1 makes Phi_2, whose power falls), so 2 does
     #                           not reduce the spread of the band l = 1 of z or T
+    unet: tuple = ()          # the + version: widths (fine to coarse) of a multi-scale trunk for the r-net and the
+    #                           correction net (fpk.nets.make_net); () = ClimODE's trunk (hidden, blocks) as before
+    unet_reps: int = 2        # residual blocks per level of that trunk on the way down
+    noise_cells: int = 3      # the cells of smooth_noise (the smooth new part, the e0 without e0_spec and the start
+    #                           of the sphere noise's spectrum): 3 = 17 deg at 5.625 deg; 11 = the same at 1.5 deg
     aam_fix: bool = False     # balanced noise: the day's WHOLE new part (the remainder's u too) carries no axial angular
     #                           momentum: on every level u - c cos(phi), c = <u cos(phi)> / <cos^2(phi)> (``aam_neutral``)
 
@@ -155,12 +159,13 @@ class EntropyDeviationKernel(nn.Module):
         for p in core.parameters():
             p.requires_grad_(False)
         self.gfeat = bool(getattr(core.cfg, "gfeat", False))
+        self.net_dtype, self.net_ckpt = None, False  # how the nets run (fpk.nets.set_run: bf16, recomputation)
         n_g = core.gscale.shape[1] if self.gfeat else 0
         self.mem = int(getattr(core, "mem", 0))
         self.mem_ch = int(core.mem_ch) if self.mem else 0
         # xbar, G(xbar), (Phi(xbar) - xbar) / s, log size before / after the equation's day, static, time, lead, m
         c_in = 66 + n_g + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch
-        self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))  # zero head: r = bias
+        self.net = make_net(c_in, 66, cfg.hidden, cfg.blocks, cfg.unet, cfg.unet_reps)  # zero head: r = bias
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
         if cfg.noise_mult > 0:
@@ -173,22 +178,25 @@ class EntropyDeviationKernel(nn.Module):
             raise ValueError("bal_lmin and aam_fix are options of the balanced noise")
         sphere = cfg.noise in ("sphere", "balanced")
         if sphere or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0 or cfg.fdt:
-            H = int(core.static.shape[-2])
-            lat = [-90.0 + 180.0 / H * (i + 0.5) for i in range(H)]  # the data's equiangular grid, south to north
-            self.sht = SHT(lat)
+            H, W = (int(n) for n in core.static.shape[-2:])
+            # the data's equiangular grid, south to north: cell centres (5.625 deg) or with the poles (1.5 deg)
+            self.sht = SHT(grid_lat(H, W), nlon=W)
             bj, nb = bands(self.sht.L)
             self.register_buffer("band_of", bj)
             self.n_bands = nb
         if cfg.e0_spec:
             import json
             sp = torch.tensor(json.load(open(cfg.e0_spec))["err_deg"]["all"][0], dtype=torch.float32)
+            if sp.shape[0] != self.sht.L:  # a spectrum of another grid (5.625 deg: 32 degrees) is not this grid's
+                raise ValueError(f"{cfg.e0_spec}: {sp.shape[0]} degrees, the kernel's grid has {self.sht.L}: make it on "
+                                 f"this grid (scripts/diag_spectra.py)")
             self.register_buffer("e0_amp", (sp / sp.sum()).clamp(min=0).sqrt())  # (L,), unit total variance
         if cfg.band_scale:
             self.g_band = nn.Parameter(torch.zeros(10, 66, nb))  # log scale per lead (day 1..10), channel, band
         if sphere:
             # the degree spectrum of smooth_noise (unit variance): the start of the band amplitudes
             with torch.no_grad():
-                z = smooth_noise((512, 1, H, 2 * H), self.sht.syn, torch.Generator().manual_seed(0))
+                z = smooth_noise((512, 1, H, W), self.sht.syn, torch.Generator().manual_seed(0), cfg.noise_cells)
                 base = self.sht.spectrum(z).mean(0).squeeze(0)
             self.register_buffer("base_amp", base.clamp(min=1e-12).sqrt())  # (L,)
             self.a_log = nn.Parameter(torch.zeros(66, nb))      # log amplitude per channel and band
@@ -212,7 +220,7 @@ class EntropyDeviationKernel(nn.Module):
             # H, static, time, lead, m. Out: delta (mean, units of the cloud's size exp(H)) and r2 (entropy); zero
             # head, so the chain starts as the uncorrected kernel
             c2 = 66 + n_g + 66 + 66 + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch
-            self.cnet = stateless_norm(Net(c2, 132, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
+            self.cnet = make_net(c2, 132, cfg.hidden, cfg.blocks, cfg.unet, cfg.unet_reps)
 
     def _init_balanced(self, std):
         """The constants of the balanced noise. psi_k = K_k a_k A_k(l) sum_j V_kj eta_j: eta unit coefficients,
@@ -337,7 +345,7 @@ class EntropyDeviationKernel(nn.Module):
     def new_noise(self, shape, like, gen=None):
         """The new part's unit field xi (shape (B, P, 66, H, W)); sphere noise keeps its last draw for the AR(1)."""
         if self.cfg.noise == "smooth":
-            return smooth_noise(shape, like, gen)
+            return smooth_noise(shape, like, gen, self.cfg.noise_cells)
         eta = self.sht.noise(self.amp(), tuple(shape[:2]) + (66,), gen)  # differentiable in the amplitudes
         if self._xi is None or self._xi.shape != eta.shape:
             xi = eta
@@ -397,8 +405,9 @@ class EntropyDeviationKernel(nn.Module):
         back; one constant per level, so c cos(phi) is the same field in either unit). <.> = the area mean with the
         grid's weights, sum_i cos(phi_i) (mean over lon)_i / sum_i cos(phi_i), as scripts/diag_conserve.py takes it:
         that mean of the result's u cos(phi) is zero to rounding."""
-        Hn = x.shape[-2]
-        cos = torch.cos(torch.deg2rad(-90.0 + 180.0 / Hn * (torch.arange(Hn, device=x.device) + 0.5))).view(Hn, 1).to(x)
+        Hn, Wn = x.shape[-2:]
+        cos = torch.cos(torch.deg2rad(torch.as_tensor(grid_lat(Hn, Wn)))).view(Hn, 1).to(x)
+        cos = cos * (cos > 1e-6)  # the pole rows: cos(+-90 deg) = 6e-17, carry no weight
         iu, unit = self.bal_idx[2], self.bal_unit[2].view(-1, 1, 1)
         u = x[:, :, iu] * unit
         c = (u * cos ** 2).mean(-1, keepdim=True).sum(-2, keepdim=True) / cos.pow(3).sum()
@@ -415,7 +424,7 @@ class EntropyDeviationKernel(nn.Module):
         if self.cfg.e0_spec:  # shaped like the 1-day error: the variance where the error grows from, not at l 16-31
             z = self.sht.noise(self.e0_amp.to(xd), (B, P, xd.shape[1]), gen)
         else:
-            z = smooth_noise((B, P) + tuple(xd.shape[1:]), xd, gen)
+            z = smooth_noise((B, P) + tuple(xd.shape[1:]), xd, gen, self.cfg.noise_cells)
         return self.cfg.eps0 * z * self.keep.unsqueeze(0)
 
     def _equation(self, xbar, e, doy, tisr):
@@ -510,7 +519,7 @@ class EntropyDeviationKernel(nn.Module):
                                                            xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
         if self.mem:
             parts.append(self.core.m)
-        u = self.net(torch.cat(parts, 1)) + self.r_bias
+        u = run_net(self.net, torch.cat(parts, 1), self) + self.r_bias
         if self.cfg.r_dissip:
             r = -self.cfg.r_max * torch.tanh(F.softplus(-u) / self.cfg.r_max) * self.keep
         else:
@@ -524,7 +533,7 @@ class EntropyDeviationKernel(nn.Module):
                 time_features((doy.float() + 1.0) * 24.0, Hh, Ww), xbar.new_full((B, 1, Hh, Ww), (lead + 1) / 10.0)]
             if self.mem:
                 new.append(self.core.m)
-            out = self.cnet(torch.cat(new, 1))
+            out = run_net(self.cnet, torch.cat(new, 1), self)
             # bounded: the corrected x_t goes back into the equation, so an unbounded correction compounds over
             # the chain (first run: day-10 RMSE 1.50 -> 1.71 s after 150 iterations)
             delta = self.cfg.d_max * torch.tanh(out[:, :66] / self.cfg.d_max) * torch.exp(H0).clamp(max=20.0) * self.keep

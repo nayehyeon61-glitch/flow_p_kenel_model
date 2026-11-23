@@ -48,7 +48,8 @@ from fpk.coreflow import build_flow  # noqa: E402
 from fpk.devkernel import DevConfig, EntropyDeviationKernel, TotalEnergy  # noqa: E402
 from fpk.escore import energy_score, make_norm, spread_skill  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from fpk.kernel import KernelConfig, PhysicsKernel  # noqa: E402
+from fpk.kernel import KernelConfig, PhysicsKernel, make_gen  # noqa: E402
+from fpk.nets import set_run  # noqa: E402
 from pgcfm.kai_tend import core_step  # noqa: E402
 
 
@@ -56,12 +57,31 @@ def common(p):
     p.add_argument("--data-root", default="data/era5_5p625")
     p.add_argument("--out", default="runs/fpk")
     p.add_argument("--train-years", type=int, nargs="+", default=[2014, 2015])
+    p.add_argument("--train-range", type=int, nargs=2, default=None, metavar=("Y0", "Y1"),
+                   help="the training years Y0 .. Y1 (both included), in place of --train-years")
     p.add_argument("--val-year", type=int, default=2016)
     p.add_argument("--test-year", type=int, default=2017)
     p.add_argument("--core-tag", default="core_gng")
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--threads", type=int, default=0)
+    # the + version on a GPU (docs/plus_gpu_ko.md); all off by default, the 5.625 deg CPU runs are unchanged
+    p.add_argument("--core-ckpt", action="store_true",
+                   help="recompute the core's substeps in the backward pass (pgcfm grad_ckpt): the gradient through the "
+                        "mean's path (--through) keeps only the substeps' inputs")
+    p.add_argument("--amp", action="store_true",
+                   help="the kernel's and the flow's nets in bf16 (autocast of the nets alone; the SHT, the entropy, the "
+                        "scores and the states stay fp32)")
+    p.add_argument("--net-ckpt", action="store_true", help="recompute the nets' activations in the backward pass")
+    p.add_argument("--resume", action="store_true",
+                   help="devk / devflow: continue from <out>/<tag>.part (written at every log step) if it is there")
+
+
+def years_of(a):
+    """--train-range Y0 Y1 -> a.train_years (every script that takes ``common``'s options calls this)."""
+    if getattr(a, "train_range", None):
+        a.train_years = list(range(a.train_range[0], a.train_range[1] + 1))
+    return a
 
 
 def pargs(a, extra=None):
@@ -78,11 +98,78 @@ def load_core(a):
         raise SystemExit("memory core: the long-memory terms (acc / kern / pacc) are not supported by the kernel")
     if getattr(core, "stride", 1) != 1:
         raise SystemExit("the kernel pipeline is daily: a core with stride > 1 (multi-day step) is not supported")
+    if getattr(a, "core_ckpt", False):
+        core.grad_ckpt = True
     return pa, cl, core
+
+
+def net_run(a, module):
+    """--amp / --net-ckpt on the nets of a kernel or flow (fpk.nets.set_run)."""
+    return set_run(module, torch.bfloat16 if getattr(a, "amp", False) else None, getattr(a, "net_ckpt", False))
+
+
+def part_path(a):
+    return os.path.join(a.out, f"{a.tag}.part")
+
+
+def save_part(a, it, best, model, opt, sch, pairs, **extra):
+    """The state to continue a cut-off run from (--resume): the model, the optimizer, the schedule, the iteration,
+    the best validation, the data's and torch's random states. Not bit-identical to an uncut run (a prefetched
+    batch is drawn again), but the same schedule and the same checkpoints' meaning."""
+    st = dict(it=it, best=best, model=model.state_dict(), opt=opt.state_dict(), sch=sch.state_dict(),
+              rng=pairs.rng.bit_generator.state, torch_rng=torch.get_rng_state(),
+              cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, extra=extra)
+    save_atomic((st, part_path(a)))
+
+
+def load_part(a, model, opt, sch, pairs):
+    """--resume: the state of ``save_part`` put back; None (a fresh start) without --resume or without the file."""
+    p = part_path(a)
+    if not (getattr(a, "resume", False) and os.path.exists(p)):
+        return None
+    st = torch.load(p, map_location="cpu", weights_only=False)
+    model.load_state_dict(st["model"])
+    opt.load_state_dict(st["opt"])
+    sch.load_state_dict(st["sch"])
+    pairs.rng.bit_generator.state = st["rng"]
+    torch.set_rng_state(st["torch_rng"])
+    if st.get("cuda_rng") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(st["cuda_rng"])
+    log(dict(resumed=p, it=st["it"], best=st["best"]))
+    return st
+
+
+def end_part(a):
+    if os.path.exists(part_path(a)):
+        os.remove(part_path(a))
 
 
 def log(d):
     print(json.dumps(d), flush=True)
+
+
+def gpu_mem(dev):
+    """The peak GPU memory so far (GB), for the logs of a run on a GPU; nothing on the CPU."""
+    if dev.type != "cuda":
+        return {}
+    return dict(gpu_gb=round(torch.cuda.max_memory_allocated(dev) / 2 ** 30, 2))
+
+
+# --------------------------------------------------------------------------------------------------------- stats
+def cmd_stats(a, rest):
+    """<out>/stats.npz of the training years (mean, std, the daily increment's std, the daily climatology), made once
+    before the core (on the 1.5 deg grid a streaming pass over the memmapped years), and the grid's check: the data's
+    shape and latitudes, the cached years present."""
+    pa = pargs(a)
+    t0 = time.time()
+    miss = [y for y in list(a.train_years) + [a.val_year, a.test_year]
+            if not os.path.exists(os.path.join(pa.cache, f"{y}.npy")) and not os.path.exists(os.path.join(pa.data, f"{y}.nc"))]
+    if miss:
+        raise SystemExit(f"years without data under {a.data_root} (kaiday/<year>.npy or kai6h/<year>.nc): {miss}")
+    cl = D.climate(pa)
+    log(dict(stats=os.path.join(a.out, "stats.npz"), grid=list(cl.clim.shape[-2:]), lat=[float(cl.lat[0]), float(cl.lat[-1])],
+             train_years=[min(a.train_years), max(a.train_years), len(a.train_years)], val=a.val_year, test=a.test_year,
+             inc_z500=round(float(cl.inc[contract.CHANNEL_INDEX["z500"]]), 4), sec=round(time.time() - t0)))
 
 
 # ---------------------------------------------------------------------------------------------------------- core
@@ -91,7 +178,8 @@ def cmd_core(a, rest):
     ``--no-gfeat``: the control without the physical field, the same core with no G(x) inputs (the kernel and the
     flow built on it then read no G(x) either: fpk.devkernel / fpk.devflow follow the core's gfeat)."""
     argv = ["--arm", "core", "--tag", a.core_tag, "--core-norm", "gn"] + ([] if a.no_gfeat else ["--core-gfeat"]) + [
-            "--log-every", "250", "--iters", str(a.iters), "--seed", str(a.seed)] + list(rest)
+            "--log-every", "250", "--iters", str(a.iters), "--seed", str(a.seed)] + (
+            ["--core-ckpt"] if a.core_ckpt else []) + (["--resume"] if a.resume else []) + list(rest)
     pa = pargs(a, argv)
     os.makedirs(pa.out, exist_ok=True)
     R = rkt()
@@ -176,7 +264,7 @@ def cmd_flow(a, rest):
     vx = [vr(a.batch) for _ in range(4)]
     dyn = torch.tensor(DYN)
     hdyn = lambda hi: None if hi is None else hi[:, :, dyn].to(dev)  # noqa: E731
-    gv = torch.Generator().manual_seed(123)
+    gv = make_gen(123, dev)
 
     def val():
         Fm.eval()
@@ -295,8 +383,10 @@ def cmd_devk(a, rest):
                                                e0_spec=a.e0_spec, noise_pre=a.noise_pre,
                                                noise_mult=a.noise_mult, noise_spec=a.noise_spec,
                                                bal_vert=a.bal_vert, fdt=a.fdt, fdt_bmin=a.fdt_bmin,
-                                               bal_lmin=a.bal_lmin, aam_fix=a.aam_fix),
+                                               bal_lmin=a.bal_lmin, aam_fix=a.aam_fix, unet=tuple(a.unet),
+                                               unet_reps=a.unet_reps, noise_cells=a.noise_cells),
                                 std=cl.std).to(dev)
+    net_run(a, Dk)
     if a.fdt_weight and not a.fdt:
         raise SystemExit("--fdt-weight needs the climatological band power: --fdt clim_bands.json")
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
@@ -314,7 +404,8 @@ def cmd_devk(a, rest):
     W, Dmax = int(getattr(core, "mem", 0)), max(a.days)
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
-    tr, vr = D.Pairs(years, a.seed, hist=W, ahead=Dmax), D.Pairs(va, a.seed + 1, hist=W, ahead=Dmax)
+    tr = D.Pairs(years, a.seed, hist=W, ahead=Dmax, device=dev, prefetch=dev.type == "cuda")
+    vr = D.Pairs(va, a.seed + 1, hist=W, ahead=Dmax, device=dev)
     w = D.area_weights(cl.lat).to(dev)
     if a.energy_weight:  # the spread of the data's daily change of total energy (training years)
         ey = np.concatenate([years[y][:, DYN] for y in sorted(years)[-2:]])
@@ -390,7 +481,7 @@ def cmd_devk(a, rest):
 
     def val():
         Dk.eval()
-        gv = torch.Generator().manual_seed(123)
+        gv = make_gen(123, dev)
         with torch.no_grad():
             r = [run(b, Dmax, gv) for b in vx]
         Dk.train()
@@ -415,16 +506,21 @@ def cmd_devk(a, rest):
                      os.path.join(a.out, f"{a.tag}.pt")))
 
     t0 = time.time()
-    i0, g0, m0, s0 = val()
-    log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0, seq=s0)))
     score = lambda vi_, vs_: sum(vi_) / len(vi_) + a.seq_weight * vs_  # noqa: E731
-    # --init: the start is a candidate checkpoint (a continued run never ends worse than it began), unless
-    # --fresh-best: a run whose options change the sampler or the loss (--fdt and its penalty, another noise) is not
-    # measured by the start's score, and with it as the bar its training can be discarded as a whole
-    best = score(i0, s0) if (a.init and not a.fresh_best) else float("inf")
-    if a.init:
-        save()
-    for it in range(1, a.iters + 1):
+    part = load_part(a, Dk, opt, sch, tr)
+    if part is not None:  # --resume: the iteration, the best validation and the checkpoint of the cut-off run
+        it0, best = part["it"], part["best"]
+    else:
+        it0 = 0
+        i0, g0, m0, s0 = val()
+        log(dict(devk_val_start=dict(ign=i0, ign_minus_H=g0, rmse_s=m0, seq=s0)))
+        # --init: the start is a candidate checkpoint (a continued run never ends worse than it began), unless
+        # --fresh-best: a run whose options change the sampler or the loss (--fdt and its penalty, another noise) is
+        # not measured by the start's score, and with it as the bar its training can be discarded as a whole
+        best = score(i0, s0) if (a.init and not a.fresh_best) else float("inf")
+        if a.init:
+            save()
+    for it in range(it0 + 1, a.iters + 1):
         days = a.days[min(len(a.days) - 1, (it - 1) * len(a.days) // a.iters)]
         ign, ent, prod, _, seq = run(tr(a.batch), days)
         fdt = dict(fdt=round(float(np.mean(aux["fdt"])), 5)) if a.fdt_weight else {}
@@ -455,7 +551,11 @@ def cmd_devk(a, rest):
             log(dict(it=it, days=days, ign=round(float(loss.detach()), 4), best=round(best, 4), val_seq=vs_, val_ign=vi, val_ign_minus_H=vg, val_rmse_s=vm,
                      prod_eq=[round(p_[0], 3) for p_ in prod], prod_noise=[round(p_[1], 3) for p_ in prod],
                      r=[round(p_[2], 3) for p_ in prod],
-                     h=round(float(Dk.h().mean()), 4), **fdt, **ct, sec=round(time.time() - t0)))
+                     h=round(float(Dk.h().mean()), 4), **fdt, **ct, sec=round(time.time() - t0),
+                     **gpu_mem(dev)))
+            if a.resume:
+                save_part(a, it, best, Dk, opt, sch, tr)
+    end_part(a)
 
 
 def load_devk(a, core, tag):
@@ -525,7 +625,7 @@ def path_diag(flows, Dk, batches, days, dev, seed=123, steps=None, ref=None):
     names = ([ref] if ref else []) + [n for n in flows if n != ref]      # the reference first
     acc = {n: np.zeros((days, 9)) for n in names}
     cut = {n: flows[n].cfg.path == "line" or flows[n].cfg.core_sub > 0 for n in names}   # a step count to vary
-    gen = torch.Generator().manual_seed(seed)
+    gen = make_gen(seed, dev)
     for x, ys, doy, tns, hi in batches:
         if ys.dim() == 4:
             ys, tns = ys[:, None], tns[:, None]
@@ -573,13 +673,16 @@ def cmd_devflow(a, rest):
     dev = torch.device(a.device)
     Dk = load_devk(a, core, a.dev_tag)
     Fm = build_flow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps, path=a.path,
-                                      core_steps=a.core_steps, core_sub=a.core_sub)).to(dev)
+                                      core_steps=a.core_steps, core_sub=a.core_sub, unet=tuple(a.unet),
+                                      unet_reps=a.unet_reps)).to(dev)
+    net_run(a, Fm)
     Te = reflow_teacher(a, Fm) if a.reflow else None
     rf = {} if Te is None else dict(teacher=Te)   # the reflow target of the day's loss
     W = int(getattr(core, "mem", 0))
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
-    tr, vr = D.Pairs(years, a.seed, hist=W, ahead=a.days), D.Pairs(va, a.seed + 1, hist=W, ahead=a.days)
+    tr = D.Pairs(years, a.seed, hist=W, ahead=a.days, device=dev, prefetch=dev.type == "cuda")
+    vr = D.Pairs(va, a.seed + 1, hist=W, ahead=a.days, device=dev)
     w = D.area_weights(cl.lat).to(dev)
     params = list(Fm.net.parameters())
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
@@ -615,25 +718,31 @@ def cmd_devflow(a, rest):
 
     def val():
         Fm.eval()
-        gv = torch.Generator().manual_seed(123)
+        gv = make_gen(123, dev)
         with torch.no_grad():
             r = np.mean([run(b, gv) for b in vx], 0)
         Fm.train()
         return [round(float(v), 4) for v in r]
 
     t0 = time.time()
-    log(dict(devflow_val_start=val(), source=a.source, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub)),
-             **(dict(reflow=a.reflow) if a.reflow else {})))
-    for it in range(1, a.iters + 1):
+    part = load_part(a, Fm.net, opt, sch, tr)
+    it0 = 0 if part is None else part["it"]
+    if part is None:
+        log(dict(devflow_val_start=val(), source=a.source, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub)),
+                 **(dict(reflow=a.reflow) if a.reflow else {})))
+    for it in range(it0 + 1, a.iters + 1):
         opt.zero_grad()
         loss = sum(run(tr(a.batch), train=True)) / a.days
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
-            log(dict(it=it, loss=round(loss, 4), val=val(), sec=round(time.time() - t0)))
+            log(dict(it=it, loss=round(loss, 4), val=val(), sec=round(time.time() - t0), **gpu_mem(dev)))
             save()  # the state so far (a run that is cut off still leaves a usable flow)
+            if a.resume:
+                save_part(a, it, 0.0, Fm.net, opt, sch, tr)
     save()
+    end_part(a)
     if Te is not None:  # both flows with the teacher's sampler: its step count is the full sampler of the diagnostic
         Fm.eval()
         n = Te.cfg.steps if Te.cfg.path == "line" else Te.cfg.core_sub
@@ -769,7 +878,7 @@ def cmd_devtune(a, rest):
         raise SystemExit(f"--tag {a.tag}: score --arms takes a deviation flow by its tag, which must start with 'devflow'")
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
-    Fm = load_devflow(a, core, a.flow_tag)
+    Fm = net_run(a, load_devflow(a, core, a.flow_tag))
     Dk = Fm.dk
     kt, kpar, bw, ck_k, dev0 = a.kernel_lr > 0, [], 0.0, None, Fm.meta["dev_tag"]
     if a.kernel_lr < 0 or (not kt and (a.kernel_out or a.kernel_band_weight >= 0)):
@@ -815,7 +924,8 @@ def cmd_devtune(a, rest):
     W = int(getattr(core, "mem", 0))
     years = D.load(pa, a.train_years)
     va = D.load(pa, [a.val_year])
-    tr, vr = D.Pairs(years, a.seed, hist=W, ahead=a.days), D.Pairs(va, a.seed + 1, hist=W, ahead=a.days)
+    tr = D.Pairs(years, a.seed, hist=W, ahead=a.days, device=dev, prefetch=dev.type == "cuda")
+    vr = D.Pairs(va, a.seed + 1, hist=W, ahead=a.days, device=dev)
     w = D.area_weights(cl.lat).to(dev)
     params = list(Fm.net.parameters())
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4) if not kt else torch.optim.AdamW(
@@ -909,7 +1019,7 @@ def cmd_devtune(a, rest):
     def val():
         """The validation mean of ES_L / n_L, and what is logged of the batch means per lead."""
         Fm.eval()
-        gv = torch.Generator().manual_seed(123)
+        gv = make_gen(123, dev)
         with torch.no_grad():
             r = np.mean([run(b, gv) for b in vx], 0)
         Fm.train()
@@ -984,7 +1094,7 @@ def cmd_tune(a, rest):
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
-    g = torch.Generator().manual_seed(a.seed)
+    g = make_gen(a.seed, dev)
 
     def draw(xm, d, tn, obs, gen=None):
         if Fm is not None:
@@ -1024,7 +1134,7 @@ def cmd_tune(a, rest):
 
     def val():
         model.eval()
-        gv = torch.Generator().manual_seed(123)
+        gv = make_gen(123, dev)
         with torch.no_grad():
             r = [run(b, Dmax, False, gv) for b in vx]
         model.train()
@@ -1071,16 +1181,19 @@ def cmd_score(a, rest):
     W = int(getattr(core, "mem", 0))
     res, raws, t_all = {}, {}, time.time()
     eps = rkt().EPS
-    clim_z = ((cl.clim - cl.mean[None, :, None, None]) / (cl.std[None, :, None, None] + eps)).astype(np.float64)
-    clim_of = lambda j: np.stack([clim_z[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] for k in j])  # noqa: E731
+    # the z-scored daily climatology of the truth's days, made for the ICs at hand (the whole table in float64 is
+    # 5.7 GB on the 1.5 deg grid); the same numbers as z-scoring the table first
+    cm, cs = cl.mean[dyn][:, None, None], cl.std[dyn][:, None, None] + eps
+    clim_of = lambda j: np.stack([(cl.clim[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] - cm) / cs  # noqa: E731
+                                  for k in j]).astype(np.float64)
     for arm in a.arms:
-        g = torch.Generator().manual_seed(a.seed)
+        g = make_gen(a.seed, dev)
         Dk, Df = None, None
         if arm.startswith("devflow"):  # flow matching from the deviation kernel: M independent members
-            Df = load_devflow(a, core, arm, pairs=M)
+            Df = net_run(a, load_devflow(a, core, arm, pairs=M))
             step, m = None, M
         elif arm.startswith("devk"):  # the entropy deviation kernel: its own rollout (mean + deviations)
-            Dk = load_devk(a, core, arm)
+            Dk = net_run(a, load_devk(a, core, arm))
             step, m = None, 2 * Dk.cfg.pairs
         elif arm == "core":  # the core's own day (a memory core: its memory update, then the day)
             step, m = (lambda x, d, tn: core_step(K.core, x, d, tn)), 1
@@ -1110,8 +1223,10 @@ def cmd_score(a, rest):
                 ens, hk = rollout(step, x0, torch.tensor(j, device=dev), tis, m, L,
                                   kernel=K if (m > 1 and a.kernel_entropy) else None, gen=g, hist=hist,
                                   start=None if arm == "persistence" else K.start)
-            sc.update(ens.cpu().numpy().astype(np.float64), truth.astype(np.float64),
-                      None if hk is None else hk.cpu().numpy(), clim=clim_of(j))
+            ens, hk, cj = ens.cpu().numpy(), None if hk is None else hk.cpu().numpy(), clim_of(j)
+            for b in range(len(j)):  # one IC at a time: the float64 copies of a 1.5 deg batch are GBs
+                sc.update(ens[b:b + 1].astype(np.float64), truth[b:b + 1].astype(np.float64),
+                          None if hk is None else hk[b:b + 1], clim=cj[b:b + 1])
         res[arm] = sc.summary()
         raws[arm] = sc.raw()
         res[arm]["members"], res[arm]["sec"] = m, round(time.time() - t0)
@@ -1139,6 +1254,8 @@ def cmd_score(a, rest):
 def main(argv=None):
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
+    st = sub.add_parser("stats")
+    common(st)
     c = sub.add_parser("core")
     common(c)
     c.add_argument("--iters", type=int, default=3000)
@@ -1223,6 +1340,12 @@ def main(argv=None):
     d.add_argument("--core-out", default="",
                    help="--core-lr: tag of the tuned core's checkpoint (default <core-tag>_<tag>); never the core's own")
     d.add_argument("--hidden", type=int, default=32)
+    d.add_argument("--unet", type=int, nargs="*", default=[],
+                   help="widths (fine to coarse) of a multi-scale trunk for the r-net and the correction net (the + "
+                        "version: e.g. 32 64 128 192, levels at 1.5 / 3 / 6 / 12 deg); none = ClimODE's trunk (--hidden)")
+    d.add_argument("--unet-reps", type=int, default=2)
+    d.add_argument("--noise-cells", type=int, default=3,
+                   help="cells of the smoothed noise (3 = 17 deg at 5.625 deg; 11 = the same at 1.5 deg)")
     d.add_argument("--iters", type=int, default=800)
     d.add_argument("--batch", type=int, default=4)
     d.add_argument("--lr", type=float, default=1e-3)
@@ -1239,6 +1362,10 @@ def main(argv=None):
     df.add_argument("--batch", type=int, default=4)
     df.add_argument("--lr", type=float, default=5e-4)
     df.add_argument("--hidden", type=int, default=64)
+    df.add_argument("--unet", type=int, nargs="*", default=[],
+                    help="widths (fine to coarse) of a multi-scale trunk for the flow's net (the + version: e.g. "
+                         "64 96 128 192); none = ClimODE's trunk (--hidden, blocks 2 2 2)")
+    df.add_argument("--unet-reps", type=int, default=2)
     df.add_argument("--steps", type=int, default=6)
     df.add_argument("--path", default="line", choices=["line", "core"],
                     help="line: the straight line in a pseudo time; core: the tendency core's flow over the day "
@@ -1339,10 +1466,11 @@ def main(argv=None):
     s.add_argument("--kernel-entropy", action="store_true", help="also the kernel's entropy along every trajectory")
     a, rest = p.parse_known_args(argv)
     rest = [r for r in rest if r != "--"]
+    years_of(a)
     if a.threads:
         torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
-    {"core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "devflow": cmd_devflow,
+    {"stats": cmd_stats, "core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "devflow": cmd_devflow,
      "devtune": cmd_devtune, "score": cmd_score}[a.cmd](a, rest)
 
 

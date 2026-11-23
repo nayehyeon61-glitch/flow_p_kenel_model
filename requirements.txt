@@ -1,4 +1,6 @@
 numpy
+tqdm
+ruamel.yaml
 torch
 netCDF4
 xarray

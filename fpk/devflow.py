@@ -50,10 +50,8 @@ import torch.nn as nn
 from .devkernel import HALF_LOG_2PIE, EntropyDeviationKernel
 from .env import time_features
 from .flow import tau_features
-from .kernel import smooth_noise
-from pgcfm.core import Net  # noqa: E402
-from pgcfm.kai_tend import stateless_norm  # noqa: E402
-from pgcfm.seqdct import _NetCfg  # noqa: E402
+from .kernel import rand, randn, smooth_noise
+from .nets import make_net, run_net
 
 
 @dataclass
@@ -69,6 +67,8 @@ class DevFlowConfig:
     #                          tendency over 1 / N day; 0 = the core's own substeps (its trained solver)
     core_sub: int = 0        # path = core: 0 = one Euler step of the learned part a grid step (the network sees z_k);
     #                          M >= 1 = the learned part of a grid step is a line flow after the core's step, M Heun steps
+    unet: tuple = ()         # the + version: widths of a multi-scale trunk (fpk.nets.make_net); () = ClimODE's trunk
+    unet_reps: int = 2
 
 
 class DeviationFlow(nn.Module):
@@ -81,7 +81,8 @@ class DeviationFlow(nn.Module):
         n_g = core.gscale.shape[1] if dk.gfeat else 0
         # z_tau, xbar, G(xbar), H, static, time of year, lead, tau
         self.c_in = c_in = 66 + 66 + n_g + 66 + core.static.shape[0] + 4 + 1 + 4
-        self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
+        self.net = make_net(c_in, 66, cfg.hidden, cfg.blocks, cfg.unet, cfg.unet_reps)
+        self.net_dtype, self.net_ckpt = None, False  # fpk.nets.set_run
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -105,7 +106,7 @@ class DeviationFlow(nn.Module):
         noise of the kernel's predicted size sig (B, 1, 66, H, W) (the same variance, none of the equation's
         directions)."""
         if self.cfg.source == "gauss":
-            return smooth_noise(tuple(e.shape), e, gen) * self.dk.keep.unsqueeze(0) * (1.0 if sig is None else sig)
+            return smooth_noise(tuple(e.shape), e, gen, getattr(self.dk.cfg, "noise_cells", 3)) * self.dk.keep.unsqueeze(0) * (1.0 if sig is None else sig)
         return e
 
     def sigma(self, H):
@@ -116,7 +117,7 @@ class DeviationFlow(nn.Module):
 
     def velocity(self, z, tau, cond, sig):
         Hh, Ww = z.shape[-2:]
-        return self.net(torch.cat([z / sig, cond, tau_features(tau, Hh, Ww)], 1)) * sig * self.dk.keep
+        return run_net(self.net, torch.cat([z / sig, cond, tau_features(tau, Hh, Ww)], 1), self) * sig * self.dk.keep
 
     def loss(self, e, xbar, truth, cond, H, w, gen=None, teacher=None):
         """Flow-matching loss of one lead: every one of the P deviations is a source draw for the same target.
@@ -131,9 +132,9 @@ class DeviationFlow(nn.Module):
         c, sig = cond.repeat_interleave(P, 0), self.sigma(H).repeat_interleave(P, 0)
         if teacher is not None:
             z1 = teacher.integrate(z0, c, sig)
-        tau = torch.rand(B * P, generator=gen).to(z0)
+        tau = rand(B * P, z0, gen)
         t = tau.view(-1, 1, 1, 1)
-        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * sig * torch.randn(z0.shape, generator=gen).to(z0) * self.dk.keep
+        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * sig * randn(z0.shape, z0, gen) * self.dk.keep
         sq = ((self.velocity(zt, tau, c, sig) - (z1 - z0)) / sig) ** 2
         m = self.dk.keep * w
         return (sq * m).sum() / m.expand_as(sq).sum()

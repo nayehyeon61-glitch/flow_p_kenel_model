@@ -41,15 +41,56 @@ MEM_STATE = ("m", "prev", "gprev", "fc", "z", "M", "PD")  # a memory core's tens
 ADV_STATE = ("m", "z", "M")                                # ... the ones its day (``_advance``) reads
 
 
-def smooth_noise(shape, like: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:
-    """White noise smoothed over 3 x 3 cells (lon circular, lat reflect), rescaled to unit variance."""
-    xi = torch.randn(shape, generator=gen, device="cpu").to(like)
+def randn(shape, like: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:
+    """Unit normals of ``shape`` with like's device and dtype. They are drawn by ``gen`` on the generator's own device,
+    so a CPU generator keeps the draws of the CPU runs and a CUDA generator draws on the GPU. Without ``gen`` they
+    come from the default generator of like's device."""
+    dev = gen.device if gen is not None else like.device
+    return torch.randn(tuple(shape), generator=gen, device=dev).to(like)
+
+
+def rand(n: int, like: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:
+    """Uniform [0, 1) draws, as ``randn``."""
+    dev = gen.device if gen is not None else like.device
+    return torch.rand(n, generator=gen, device=dev).to(like)
+
+
+def make_gen(seed: int, device) -> torch.Generator:
+    """A seeded generator on ``device``: the validation draws on the GPU stay on the GPU."""
+    return torch.Generator(device=torch.device(device)).manual_seed(int(seed))
+
+
+def _box_lat(H: int, k: int, like: torch.Tensor) -> torch.Tensor:
+    """(H, H): the k-row mean along the latitudes with reflected rows at the two edges (as F.pad "reflect"), each row
+    scaled so that the k x k mean of unit white noise has unit variance there (the reflected rows repeat neighbours,
+    which raises the variance of the edge rows)."""
+    r = k // 2
+    M = torch.zeros(H, H, dtype=torch.float64)
+    for i in range(H):
+        for j in range(i - r, i + r + 1):
+            jj = -j if j < 0 else (2 * (H - 1) - j if j > H - 1 else j)
+            M[i, jj] += 1.0 / k
+    var = M.pow(2).sum(1) / k                      # the longitudes: k independent values, variance 1 / k
+    return (M / var.sqrt()[:, None]).to(like)
+
+
+def smooth_noise(shape, like: torch.Tensor, gen: Optional[torch.Generator] = None, cells: int = 3) -> torch.Tensor:
+    """White noise smoothed over ``cells`` x ``cells`` cells (lon circular, lat reflect), rescaled to unit variance.
+    3 cells: 17 deg on the 5.625 deg grid; the same scale on the 1.5 deg grid is 11 cells (``noise_cells``)."""
+    xi = randn(shape, like, gen)
     xi = xi.reshape(-1, *shape[-3:])
-    xi = F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect")
-    out = F.avg_pool2d(xi, 3, 1) * 3.0
-    # the reflected halo repeats the neighbour row in the two edge rows: variance 15/9 there, back to 1
-    out[..., 0, :] *= 3.0 / math.sqrt(15.0)
-    out[..., -1, :] *= 3.0 / math.sqrt(15.0)
+    if cells == 3:
+        xi = F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect")
+        out = F.avg_pool2d(xi, 3, 1) * 3.0
+        # the reflected halo repeats the neighbour row in the two edge rows: variance 15/9 there, back to 1
+        out[..., 0, :] *= 3.0 / math.sqrt(15.0)
+        out[..., -1, :] *= 3.0 / math.sqrt(15.0)
+        return out.reshape(shape)
+    if cells % 2 == 0 or cells < 1 or cells >= shape[-2]:
+        raise ValueError(f"smooth_noise: cells = {cells}, an odd number below the {shape[-2]} rows")
+    r = cells // 2
+    lon = F.avg_pool2d(F.pad(xi, (r, r, 0, 0), mode="circular"), (1, cells), 1)
+    out = torch.einsum("ij,...jw->...iw", _box_lat(shape[-2], cells, xi), lon)
     return out.reshape(shape)
 
 

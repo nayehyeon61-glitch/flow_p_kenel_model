@@ -109,12 +109,12 @@ def main():
     corr = np.sqrt((a.members + 1) / a.members)
     md = [f"기준: `{a.ref}` (결정론). 선행 1 / 3 / 5 / 7 / 10일. 이득 % 는 + 가 좋아짐. 95 % 구간은 IC 에 대한 paired "
           f"bootstrap(500회), 10일 값.", ""]
-    md += ["### 한눈에: core 대비 RMSE 이득 % (앙상블 평균)", "", "| 변수 | " + " | ".join(NAME[x] for x in arms) + " |",
+    md += ["### 한눈에: core 대비 RMSE 이득 % (앙상블 평균)", "", "| 변수 | " + " | ".join(NAME.get(x, x) for x in arms) + " |",
            "| --- |" + " --- |" * len(arms)]
     for c in CHANS:
         md.append(f"| {c} | " + " | ".join(f(E[x][c]["gain"]) for x in arms) + " |")
     md += ["", "### 한눈에: CRPS (물리 단위), 결정론 core 는 |오차| 의 평균", "",
-           "| 변수 | core | " + " | ".join(NAME[x] for x in arms) + " |", "| --- | --- |" + " --- |" * len(arms)]
+           "| 변수 | core | " + " | ".join(NAME.get(x, x) for x in arms) + " |", "| --- | --- |" + " --- |" * len(arms)]
     for c in CHANS:
         if c.startswith("wind"):
             continue
@@ -133,10 +133,10 @@ def main():
             ci = f"{e['lo'][9]:+.1f} ~ {e['hi'][9]:+.1f}".replace("-", "−")
             acc = f(e["acc"], 3, False) if "acc" in e else ""
             act = f"{e['act'][9]:.2f}" if "act" in e else ""
-            ss = f((1.0 if x in PAIRS else corr) * e["spread"] / e["rmse"], 2, False) if "spread" in e else ""
+            ss = f((1.0 if (x in PAIRS or x.startswith("devk")) else corr) * e["spread"] / e["rmse"], 2, False) if "spread" in e else ""
             H = f(e["H"], 2, False) if "H" in e else ""
             co = f(e["corr"], 2, False) if "corr" in e else ""
-            md.append(f"| {NAME[x]} | {f(e['rmse'], 2, False)} | {f(e['gain'])} | {f(e.get('info', np.zeros(10)))} | "
+            md.append(f"| {NAME.get(x, x)} | {f(e['rmse'], 2, False)} | {f(e['gain'])} | {f(e.get('info', np.zeros(10)))} | "
                       f"{f(e.get('amp', np.zeros(10)))} | {ci} | {acc} | {act} | {ss} | {H} | {co} |")
     text = "\n".join(md)
     print(text)
