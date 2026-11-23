@@ -128,6 +128,7 @@ GPU 가 두 장 비어 있으면 본 실험과 동시에 돌려도 됩니다. �
 | `CORE_ITERS` | 6000 | core 반복. 5.625° 16년 3000 과 같은 epoch 수 |
 | `CORE_SUBSTEPS` | 4 | core 의 하루 substep. 2로 하면 core·kernel·flow 가 모두 약 2배 빨라짐 (이전 1.5° 실행은 4) |
 | `DEVK1_ITERS`, `DEVK2_ITERS`, `FLOW_ITERS` | 800, 400, 600 | 5.625° 와 같음 |
+| `CORE_BATCH` | 8 | core 의 batch |
 | `DEVK_BATCH`, `FLOW_BATCH` | 4, 4 | GPU 메모리가 모자라면 2 |
 | `THROUGH` | 10 | devk2 의 평균 경로 gradient 일수. 메모리가 모자라면 5 |
 | `NET_CKPT` | 0 | 1이면 kernel·flow 망의 activation 을 backward 때 다시 계산 (메모리 ↓, 시간 약 30% ↑) |
@@ -156,6 +157,12 @@ devk2 의 선택(correction, 10일 gradient, 띠별 entropy, 구면조화 noise,
 
 - **GPU 메모리 부족 (CUDA out of memory)**: `NET_CKPT=1` → `THROUGH=5` → `DEVK_BATCH=2` 순서로 시도합니다.
   smoke 로그의 `gpu_gb` 가 90 에 가까우면 미리 조정합니다.
+  - 가장 큰 단계는 devk2 입니다. 1.5° 에서 CPU(fp32)로 잰 크기(2026-11-24, 가짜 1.5° 자료): batch 하나에 3 GB 이상,
+    여기에 pair 하나마다 1.3 GB, 평균 경로 gradient 하루마다 0.65 GB 가 더 듭니다. 기본값(batch 4, pair 4, 10일)이면
+    activation 만 약 50–80 GB 로 추정되어 96 GB 에 들어가지만 여유는 크지 않습니다. `THROUGH=5` 는 약 13 GB,
+    `DEVK_BATCH=2` 는 약 절반을 줄입니다. pair 수는 모형의 일부라 바꾸지 않습니다.
+  - 같은 가짜 자료로 stats, core, devk1, spec, flow, score 는 1.5° 격자에서 끝까지 돌았습니다. devk2 는 이 검사 기계
+    (15 GB)에서 batch 1 로도 메모리를 넘어 크기만 쟀습니다. 그래서 devk2 가 실제로 도는지는 GPU smoke 가 처음 확인합니다.
 - **자료 검사 실패 (`--check` 가 NOT OK)**: 원 자료의 변수나 파일 이름이 다른 것입니다. `logs/data.log` 의 출력을 보내 주세요.
 - **"stats.npz is for a 32 x 64 grid"**: `OUT` 이 5.625° 결과 폴더입니다. 다른 폴더를 씁니다.
 - 실패한 단계는 사슬이 멈추고, `runs/fpk_plus/logs/<단계>.log` 의 끝을 `chain.log` 에 보여 줍니다.

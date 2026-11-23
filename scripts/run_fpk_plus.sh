@@ -44,7 +44,7 @@ CORE=core_u64$SFX; K1=devk_m$SFX; K2=devk_band_sph$SFX; F=devflow_line$SFX
 # the 1.5 deg architecture: the core's U-Net (levels 1.5 / 3 / 6 deg), the kernel's and the flow's U-Nets (down to
 # 12 deg), the noise and the entropy's smoothing at the physical sizes of the 5.625 deg runs (17 deg and 28 deg)
 CORE_SUBSTEPS=${CORE_SUBSTEPS:-4}
-CORE_ARCH="--core-mem 8 --core-mz --core-trunk unet --core-unet-dims 64 128 192 --core-substeps $CORE_SUBSTEPS --batch 8"
+CORE_ARCH="--core-mem 8 --core-mz --core-trunk unet --core-unet-dims 64 128 192 --core-substeps $CORE_SUBSTEPS --batch ${CORE_BATCH:-8}"
 DEVK_ARCH="--unet 32 64 128 192 --noise-cells 11 --smooth 19 --batch $DEVK_BATCH"
 FLOW_ARCH="--unet 64 96 128 192 --batch $FLOW_BATCH"
 GPU="--core-ckpt --amp --resume"            # core substeps recomputed in the backward pass; the nets in bf16
