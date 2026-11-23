@@ -473,6 +473,21 @@ def load_devk(a, core, tag):
 
 
 # ------------------------------------------------------------------------------------------------------- devflow
+G_FLOW_DEFAULTS = dict(gcond=True, gmember=False, gdirect=False)
+
+
+def flow_ckpt_cfg(Fm):
+    """The flow's cfg as its checkpoint stores it: the straight line without the path's keys, and the G-flow keys
+    only when they are not the default (a flow without them is saved exactly as it always was)."""
+    cfg = dict(Fm.cfg.__dict__)
+    if cfg["path"] == "line":
+        cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+    for k, v in G_FLOW_DEFAULTS.items():
+        if cfg.get(k) == v:
+            cfg.pop(k)
+    return cfg
+
+
 def reflow_teacher(a, Fm):
     """The teacher of ``devflow --reflow TAG``: the trained flow TAG, built on the student's kernel. It must have
     been trained on the same kernel and core (the same sources) with the student's architecture and path; the
@@ -487,7 +502,7 @@ def reflow_teacher(a, Fm):
     cfg = dict(ck["cfg"])
     cfg["blocks"] = tuple(cfg["blocks"])
     tc = DevFlowConfig(**cfg)
-    keys = ("hidden", "blocks", "source", "path") + (("core_steps", "core_sub") if tc.path == "core" else ())
+    keys = ("hidden", "blocks", "source", "path", *G_FLOW_DEFAULTS) + (("core_steps", "core_sub") if tc.path == "core" else ())
     diff = {k: [getattr(Fm.cfg, k), getattr(tc, k)] for k in keys if getattr(Fm.cfg, k) != getattr(tc, k)}
     if diff:
         raise SystemExit(f"--reflow {a.reflow}: the student is not the teacher's flow, [student, teacher] = {diff}")
@@ -573,7 +588,8 @@ def cmd_devflow(a, rest):
     dev = torch.device(a.device)
     Dk = load_devk(a, core, a.dev_tag)
     Fm = build_flow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps, path=a.path,
-                                      core_steps=a.core_steps, core_sub=a.core_sub)).to(dev)
+                                      core_steps=a.core_steps, core_sub=a.core_sub, gcond=not a.no_gcond,
+                                      gmember=a.gmember, gdirect=a.gdirect)).to(dev)
     Te = reflow_teacher(a, Fm) if a.reflow else None
     rf = {} if Te is None else dict(teacher=Te)   # the reflow target of the day's loss
     W = int(getattr(core, "mem", 0))
@@ -582,15 +598,20 @@ def cmd_devflow(a, rest):
     tr, vr = D.Pairs(years, a.seed, hist=W, ahead=a.days), D.Pairs(va, a.seed + 1, hist=W, ahead=a.days)
     w = D.area_weights(cl.lat).to(dev)
     params = list(Fm.net.parameters())
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
-    sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.iters, pct_start=0.05)
+    if Fm.cfg.gdirect:  # the physics channel A: its own step size (one number per channel, from zero), no decay
+        gpar = [p_ for n_, p_ in Fm.net.named_parameters() if n_ == "g_direct"]
+        groups = [dict(params=[p_ for n_, p_ in Fm.net.named_parameters() if n_ != "g_direct"], lr=a.lr),
+                  dict(params=gpar, lr=a.lr * a.g_lr, weight_decay=0.0)]
+        opt = torch.optim.AdamW(groups, lr=a.lr, weight_decay=1e-4)
+        sch = torch.optim.lr_scheduler.OneCycleLR(opt, [g_["lr"] for g_ in groups], total_steps=a.iters, pct_start=0.05)
+    else:
+        opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
+        sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.iters, pct_start=0.05)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
 
     def save():
-        cfg = dict(Fm.cfg.__dict__)
-        if cfg["path"] == "line":  # the straight line's checkpoint as it always was (the path's keys only with a path)
-            cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+        cfg = flow_ckpt_cfg(Fm)  # the straight line's checkpoint as it always was (path / G keys only when used)
         torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, dev_tag=a.dev_tag, core_tag=a.core_tag,
                         **(dict(reflow_of=a.reflow) if a.reflow else {})), os.path.join(a.out, f"{a.tag}.pt"))
 
@@ -622,7 +643,8 @@ def cmd_devflow(a, rest):
         return [round(float(v), 4) for v in r]
 
     t0 = time.time()
-    log(dict(devflow_val_start=val(), source=a.source, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub)),
+    gx = {k: getattr(Fm.cfg, k) for k, v in G_FLOW_DEFAULTS.items() if getattr(Fm.cfg, k) != v}   # G-flow options
+    log(dict(devflow_val_start=val(), source=a.source, **gx, **({} if a.path == "line" else dict(path=a.path, core_steps=Fm.N, core_sub=a.core_sub)),
              **(dict(reflow=a.reflow) if a.reflow else {})))
     for it in range(1, a.iters + 1):
         opt.zero_grad()
@@ -631,7 +653,8 @@ def cmd_devflow(a, rest):
         opt.step()
         sch.step()
         if it % a.log_every == 0 or it == a.iters:
-            log(dict(it=it, loss=round(loss, 4), val=val(), sec=round(time.time() - t0)))
+            log(dict(it=it, loss=round(loss, 4), val=val(), sec=round(time.time() - t0),
+                     **({} if Fm.g_report() is None else dict(g_direct=Fm.g_report()))))
             save()  # the state so far (a run that is cut off still leaves a usable flow)
     save()
     if Te is not None:  # both flows with the teacher's sampler: its step count is the full sampler of the diagnostic
@@ -826,9 +849,7 @@ def cmd_devtune(a, rest):
     scale = np.ones(a.days)  # n_L, set by the first validation
 
     def save():
-        cfg = dict(Fm.cfg.__dict__)
-        if cfg["path"] == "line":  # the straight line's checkpoint format (no path keys)
-            cfg.pop("path"), cfg.pop("core_steps"), cfg.pop("core_sub")
+        cfg = flow_ckpt_cfg(Fm)  # the straight line's checkpoint format (no path keys, G keys only when used)
         keep = {k: v for k, v in Fm.meta.items() if k not in ("tuned_from", "tune")}   # dev_tag, core_tag, reflow_of
         files = []
         if kt:  # the tuned kernel first (the flow never names a kernel that is not there): the original's checkpoint
@@ -1252,6 +1273,17 @@ def main(argv=None):
                          "grid step is a line flow after the core's step, M Heun steps (2 M network calls)")
     df.add_argument("--val-batches", type=int, default=4)
     df.add_argument("--log-every", type=int, default=50)
+    df.add_argument("--gmember", action="store_true",
+                    help="G-flow: the member's own physics dG = G(xbar + s z_tau) - G(xbar) as an input at every tau "
+                         "(the line path, a kernel whose core has G(x))")
+    df.add_argument("--gdirect", action="store_true",
+                    help="G-flow: + A (.) dG in the velocity on the u, v, T, q channels, A per channel learned from zero "
+                         "(logged as g_direct)")
+    df.add_argument("--g-lr", type=float, default=20.0,
+                    help="--gdirect: the step size of A as a multiple of --lr (A is 66 numbers learned from zero; at "
+                         "--lr alone Adam moves it at most about lr per iteration)")
+    df.add_argument("--no-gcond", action="store_true",
+                    help="no G(xbar) of the mean in the flow's conditioning (the control of G in the flow, same kernel)")
     df.add_argument("--reflow", default="",
                     help="reflow: the tag of a trained deviation flow on --dev-tag (the teacher). The student starts "
                          "from it and learns its (source, transported endpoint) pairs: straighter paths, the same "
