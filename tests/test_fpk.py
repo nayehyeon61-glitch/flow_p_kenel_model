@@ -1696,7 +1696,7 @@ def test_devtune_lowers_the_energy_score_and_keeps_the_checkpoint_format(mcore, 
     R, Dk, base = _cli(mcore, tmp_path, monkeypatch, fixed=True)
     kw = dict(line=dict(steps=3), core=dict(path="core", core_steps=2, core_sub=2), core0=dict(path="core", core_steps=3))[path]
     Fm = _flow_with_a_head(Dk, **kw)
-    cfg = dict(Fm.cfg.__dict__)
+    cfg = {k: v for k, v in Fm.cfg.__dict__.items() if k not in ("gcond", "gmember", "gdirect")}  # G keys only when used
     if path == "line":   # the straight line's checkpoint has no path keys
         cfg = {k: cfg[k] for k in ("hidden", "blocks", "sigma_min", "steps", "source")}
     src = {k: v.clone() for k, v in Fm.net.state_dict().items()}

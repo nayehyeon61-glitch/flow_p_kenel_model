@@ -19,6 +19,17 @@ The kernel's own deviations go on through the equation (the flow transports each
 back), so training (sources from the kernel's rollout) and forecasting see the same source distribution.
 ``source="gauss"``: the control, smooth unit Gaussian noise as the source with the same conditioning (H included).
 
+G-flow (``gmember`` / ``gdirect``): G(xbar) above is the operator's tendency at the MEAN, one field for all members.
+The tendency core read G at its own state; the flow's analogue is G at the member's state along the path,
+
+    dG(z_tau) = G(xbar + s z_tau) - G(xbar)        (no gradient, units of G's ERA5 RMS, as the core's input)
+    v = sigma v_theta(z_tau, tau | c, dG) + A (.) dG        (gdirect: A per u, v, T, q channel, zero at the start)
+
+dG is how the equation's tendency of this member differs from the mean's: to first order J s z_tau, the
+tangent-linear dynamics of the deviation. It is still a function of the inputs (z_tau, xbar), a hint and no new
+information, as G was for the core. A is read after training (``g_report``): how much of the transport the
+operator's own term carries, per variable and level. ``gcond=False``: no G at all in the flow (the control).
+
 Two uses of a trained flow (scripts/run_fpk.py):
   * reflow (``devflow --reflow TEACHER``): the same loss with the target of every source row replaced by the
     teacher's transported endpoint of that row, z1 = T_teacher(z0). The coupling (z0, z1) is then a map, the
@@ -69,6 +80,29 @@ class DevFlowConfig:
     #                          tendency over 1 / N day; 0 = the core's own substeps (its trained solver)
     core_sub: int = 0        # path = core: 0 = one Euler step of the learned part a grid step (the network sees z_k);
     #                          M >= 1 = the learned part of a grid step is a line flow after the core's step, M Heun steps
+    # The physical field in the flow (G-flow, 감자 2026-11-23; the straight line only, a kernel whose core has G(x)):
+    gcond: bool = True       # G(xbar) of the day's mean in the conditioning, the same for every member (as it always
+    #                          was); False = the flow reads no G of the mean (the control of G in the flow, same kernel)
+    gmember: bool = False    # the member's own physics as an input at every tau: dG = G(xbar + s z_tau) - G(xbar)
+    gdirect: bool = False    # the physics channel in the velocity: + A (.) dG on the u, v, T, q channels, A per channel,
+    #                          zero at the start (the flow starts as without it), read after training (``g_direct``)
+
+
+def g_direct_index(n_g: int):
+    """The physics channel's map: (src, dst) with dG channel src[i] (G's own order, dyncore.G_EQS x the 12 levels:
+    u, v, T, q from 50 to 1000 hPa) onto the dynamic channel dst[i] of the same variable and level (index into DYN).
+    The first 48 of the core's n_g physical terms are those (extra terms of a core, if any, have no channel)."""
+    from pgcfm import contract
+    from pgcfm.dyncore import G_EQS
+    from .env import DYN
+    if n_g < len(G_EQS) * len(contract.LEVELS_HPA):
+        raise ValueError(f"the physics channel needs the 48 operator tendencies, the core has {n_g} physical terms")
+    src, dst = [], []
+    for i, q in enumerate(G_EQS):
+        for j, p in enumerate(contract.LEVELS_HPA):
+            src.append(i * len(contract.LEVELS_HPA) + j)
+            dst.append(DYN.index(contract.CHANNEL_INDEX[f"{q.lower()}{p}"]))
+    return torch.tensor(src), torch.tensor(dst)
 
 
 class DeviationFlow(nn.Module):
@@ -78,10 +112,24 @@ class DeviationFlow(nn.Module):
         for p in dk.parameters():
             p.requires_grad_(False)
         core = dk.core
+        g_opts = (not cfg.gcond) or cfg.gmember or cfg.gdirect
+        if g_opts and cfg.path != "line":
+            raise ValueError("gcond / gmember / gdirect are options of the straight line (path = line)")
+        if (cfg.gmember or cfg.gdirect) and not dk.gfeat:
+            raise ValueError("gmember / gdirect read the core's operator G(x): the kernel's core has no G(x) input")
         n_g = core.gscale.shape[1] if dk.gfeat else 0
-        # z_tau, xbar, G(xbar), H, static, time of year, lead, tau
-        self.c_in = c_in = 66 + 66 + n_g + 66 + core.static.shape[0] + 4 + 1 + 4
+        self.n_gc = n_g if cfg.gcond else 0       # G(xbar) channels of the conditioning
+        self.n_gm = n_g if cfg.gmember else 0     # dG channels of the network's input
+        # z_tau, xbar, G(xbar), H, static, time of year, lead, [dG], tau
+        self.c_in = c_in = 66 + 66 + self.n_gc + 66 + core.static.shape[0] + 4 + 1 + self.n_gm + 4
         self.net = stateless_norm(Net(c_in, 66, _NetCfg(cfg.hidden, tuple(cfg.blocks))))
+        if cfg.gdirect:
+            # A sits on the network module so that everything that handles the flow's weights (the optimizer, the
+            # checkpoint's state, a reflow teacher, devtune) carries it unchanged; the network's forward ignores it
+            self.net.register_parameter("g_direct", nn.Parameter(torch.zeros(1, 66, 1, 1)))
+            src, dst = g_direct_index(n_g)
+            self.register_buffer("g_src", src, persistent=False)
+            self.register_buffer("g_dst", dst, persistent=False)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -95,7 +143,7 @@ class DeviationFlow(nn.Module):
         B, _, Hh, Ww = xbar.shape
         core = self.dk.core
         with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
-            parts = [xbar] + ([core.features(xbar)] if self.dk.gfeat else []) + [
+            parts = [xbar] + ([core.features(xbar)] if self.n_gc else []) + [
                 H * self.dk.keep, core.static.expand(B, -1, -1, -1), time_features(doy.float() * 24.0, Hh, Ww),
                 xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
             return torch.cat(parts, 1)
@@ -114,9 +162,41 @@ class DeviationFlow(nn.Module):
         k = self.dk.keep
         return torch.exp(H.detach().clamp(-6.0, 6.0)) * k + (1 - k)
 
+    def member_g(self, z, cond):
+        """dG (R, n_g, H, W) = G(xbar + s z) - G(xbar): the change of the operator's tendency (units of its ERA5 RMS,
+        clamped as the core's input) at the member's state z (units of s around the mean xbar = cond[:, :66]). No
+        gradient (the operator's, as everywhere). G(xbar) is the conditioning's own channels when it has them."""
+        core = self.dk.core
+        with torch.no_grad():
+            xbar = cond[:, :66].detach()
+            g0 = cond[:, 66:66 + self.n_gc].detach() if self.n_gc else core.features(xbar)
+            return core.features(xbar + self.dk.s * (z.detach() * self.dk.keep)) - g0
+
+    def physics(self, dg):
+        """The physics channel A (.) dG on the dynamic channels (R, 66, H, W), units of s (no factor sigma: dG
+        already grows with the member's deviation; zero on z, sp, t2m, ..., which have no operator tendency)."""
+        out = dg.new_zeros(dg.shape[0], 66, *dg.shape[-2:])
+        out[:, self.g_dst] = dg[:, self.g_src]
+        return self.net.g_direct * out
+
     def velocity(self, z, tau, cond, sig):
         Hh, Ww = z.shape[-2:]
-        return self.net(torch.cat([z / sig, cond, tau_features(tau, Hh, Ww)], 1)) * sig * self.dk.keep
+        if not (self.cfg.gmember or self.cfg.gdirect):
+            return self.net(torch.cat([z / sig, cond, tau_features(tau, Hh, Ww)], 1)) * sig * self.dk.keep
+        dg = self.member_g(z, cond)
+        v = self.net(torch.cat([z / sig, cond] + ([dg] if self.cfg.gmember else []) + [tau_features(tau, Hh, Ww)], 1)) * sig
+        if self.cfg.gdirect:
+            v = v + self.physics(dg)
+        return v * self.dk.keep
+
+    def g_report(self):
+        """What the physics channel learned: A per variable and level (u, v, T, q x 12 levels, 50 -> 1000 hPa)."""
+        if not self.cfg.gdirect:
+            return None
+        from pgcfm import contract
+        from pgcfm.dyncore import G_EQS
+        a = self.net.g_direct.detach().flatten()[self.g_dst].view(len(G_EQS), -1).cpu()
+        return {"levels": contract.LEVELS_HPA, **{q: [round(float(v), 5) for v in a[i]] for i, q in enumerate(G_EQS)}}
 
     def loss(self, e, xbar, truth, cond, H, w, gen=None, teacher=None):
         """Flow-matching loss of one lead: every one of the P deviations is a source draw for the same target.
