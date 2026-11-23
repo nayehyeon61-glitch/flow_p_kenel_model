@@ -121,6 +121,23 @@ def test_pairs_read_once_per_sample_and_prefetch_the_same_batches(tmp_path):
             assert torch.allclose(u.float(), v.float(), atol=1e-5) and torch.equal(v, w)
 
 
+def test_prefetch_with_another_size_and_a_resume_draws_the_batches_of_the_plain_pairs(tmp_path):
+    from fpk.data import LazyYear, Pairs
+    from fpk.env import rkt
+    R = rkt()
+    mm, mean, std = _year(tmp_path)
+    lazy = {2000: LazyYear(mm, mean, std, R.EPS)}
+    ref = Pairs(lazy, seed=5, hist=2, device="cpu")
+    pre = Pairs(lazy, seed=5, hist=2, device="cpu", prefetch=True)
+    for B in (3, 3, 2, 2, 4):                                        # a size change undoes the batch drawn ahead
+        assert all(torch.equal(u, v) for u, v in zip(ref(B), pre(B)) if u is not None)
+    st = pre.state()                                                 # where the next batch begins
+    nxt = [t for t in ref(3) if t is not None]
+    cont = Pairs(lazy, seed=99, hist=2, device="cpu", prefetch=True)  # a continued run
+    cont.set_state(st)
+    assert all(torch.equal(u, v) for u, v in zip(nxt, [t for t in cont(3) if t is not None]))
+
+
 @pytest.fixture(scope="module")
 def pole_core():
     torch.manual_seed(0)
