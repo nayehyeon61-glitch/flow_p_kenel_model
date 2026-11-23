@@ -87,9 +87,11 @@ def log(d):
 
 # ---------------------------------------------------------------------------------------------------------- core
 def cmd_core(a, rest):
-    """Train the tendency core with PG-CFM's own script: plain core, GroupNorm, physical terms G(x)."""
-    argv = ["--arm", "core", "--tag", a.core_tag, "--core-norm", "gn", "--core-gfeat", "--log-every", "250",
-            "--iters", str(a.iters), "--seed", str(a.seed)] + list(rest)
+    """Train the tendency core with PG-CFM's own script: plain core, GroupNorm, physical terms G(x).
+    ``--no-gfeat``: the control without the physical field, the same core with no G(x) inputs (the kernel and the
+    flow built on it then read no G(x) either: fpk.devkernel / fpk.devflow follow the core's gfeat)."""
+    argv = ["--arm", "core", "--tag", a.core_tag, "--core-norm", "gn"] + ([] if a.no_gfeat else ["--core-gfeat"]) + [
+            "--log-every", "250", "--iters", str(a.iters), "--seed", str(a.seed)] + list(rest)
     pa = pargs(a, argv)
     os.makedirs(pa.out, exist_ok=True)
     R = rkt()
@@ -1140,6 +1142,7 @@ def main(argv=None):
     c = sub.add_parser("core")
     common(c)
     c.add_argument("--iters", type=int, default=3000)
+    c.add_argument("--no-gfeat", action="store_true", help="the control without the physical field G(x)")
     k = sub.add_parser("kernel")
     common(k)
     k.add_argument("--tag", default="kernel")
