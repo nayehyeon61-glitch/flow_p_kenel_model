@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 
 from .env import time_features
-from .kernel import PhysicsKernel, smooth_noise
+from .kernel import PhysicsKernel, rand, randn, smooth_noise
 from pgcfm.core import Net  # noqa: E402
 from pgcfm.kai_tend import stateless_norm  # noqa: E402
 from pgcfm.seqdct import _NetCfg  # noqa: E402
@@ -99,9 +99,9 @@ class KernelFlow(nn.Module):
         z0, cond = self.source(xd, doy, tisr, gen, observe)
         z1 = (yd - xd) / self.s * self.keep
         B = xd.shape[0]
-        tau = torch.rand(B, generator=gen).to(xd)
+        tau = rand(B, xd, gen)
         t = tau.view(B, 1, 1, 1)
-        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * torch.randn(z0.shape, generator=gen).to(z0) * self.keep
+        zt = (1 - t) * z0 + t * z1 + self.cfg.sigma_min * randn(z0.shape, z0, gen) * self.keep
         v = self.velocity(zt, tau, cond)
         m = self.keep * w
         sq = (v - (z1 - z0)) ** 2

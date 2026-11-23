@@ -84,7 +84,7 @@ import torch
 
 from .devflow import DevFlowConfig, DeviationFlow
 from .devkernel import EntropyDeviationKernel
-from .kernel import ADV_STATE
+from .kernel import ADV_STATE, rand, randn
 
 
 class CoreFlow(DeviationFlow):
@@ -238,15 +238,15 @@ class CoreFlow(DeviationFlow):
         if z1 is None:
             z1 = ((truth - xb) / dk.s * dk.keep)[c.bidx]
         if k is None:
-            k = torch.randint(0, N, (R,), generator=gen)
+            k = torch.randint(0, N, (R,), generator=gen, device=gen.device if gen is not None else c.z0.device)
         k = k.to(c.z0.device)
         if self.cfg.core_sub > 0:
-            tau = (torch.rand(R, generator=gen) if tau is None else tau).to(c.z0)
+            tau = (rand(R, c.z0, gen) if tau is None else tau).to(c.z0)
         else:
             tau = None
         noise = None
         if self.cfg.sigma_min > 0:
-            noise = self.cfg.sigma_min * c.sig * torch.randn(c.z0.shape, generator=gen).to(c.z0) * dk.keep
+            noise = self.cfg.sigma_min * c.sig * randn(c.z0.shape, c.z0, gen) * dk.keep
         z, ut = self.target(c, self.zero_path(c), z1, k, noise, tau)
         t = (k.float() + (0.0 if tau is None else tau)) / N
         return SimpleNamespace(z=z, t=t, k=k, ut=ut, z1=z1)

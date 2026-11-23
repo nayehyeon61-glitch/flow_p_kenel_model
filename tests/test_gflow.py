@@ -176,3 +176,16 @@ def test_G_flow_needs_the_operator_and_the_straight_line():
     Dg = _kernel(_core(True))
     with pytest.raises(ValueError):
         DeviationFlow(Dg, DevFlowConfig(hidden=8, blocks=(1,), path="core", gdirect=True))
+
+
+def test_G_flow_on_the_U_Net_of_the_plus_version(gcore):
+    """G-flow and the + version's U-Net together: the dG input and A on the multi-scale trunk, a zero start."""
+    Dk = _kernel(gcore)
+    Fm = _flow(Dk, unet=(8, 16), gmember=True, gdirect=True)
+    assert Fm.net.g_direct.shape == (1, 66, 1, 1)
+    xd, xb, e1, H1, doy, tis, c = _ctx(Dk, Fm)
+    v = Fm.velocity(c.z0, torch.full((c.z0.shape[0],), 0.5), c.cd, c.sig)
+    assert v.shape == c.z0.shape and float(v.abs().max()) == 0.0
+    import run_fpk as R
+    cfg = R.flow_ckpt_cfg(Fm)
+    assert cfg["unet"] == (8, 16) and cfg["gmember"] and cfg["gdirect"]

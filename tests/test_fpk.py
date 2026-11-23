@@ -1667,7 +1667,7 @@ def _cli(mcore, tmp_path, monkeypatch, fixed=False):
         real, kept = R.D.Pairs, {}
 
         class Fixed:
-            def __init__(self, years, seed=0, hist=0, ahead=1):
+            def __init__(self, years, seed=0, hist=0, ahead=1, **kw):  # device, prefetch: the real Pairs on the CPU
                 self.p = real(years, 0, hist=hist, ahead=ahead)
 
             def __call__(self, B):
@@ -1696,7 +1696,7 @@ def test_devtune_lowers_the_energy_score_and_keeps_the_checkpoint_format(mcore, 
     R, Dk, base = _cli(mcore, tmp_path, monkeypatch, fixed=True)
     kw = dict(line=dict(steps=3), core=dict(path="core", core_steps=2, core_sub=2), core0=dict(path="core", core_steps=3))[path]
     Fm = _flow_with_a_head(Dk, **kw)
-    cfg = {k: v for k, v in Fm.cfg.__dict__.items() if k not in ("gcond", "gmember", "gdirect")}  # G keys only when used
+    cfg = {k: v for k, v in Fm.cfg.__dict__.items() if k not in ("gcond", "gmember", "gdirect", "unet", "unet_reps")}  # only when used
     if path == "line":   # the straight line's checkpoint has no path keys
         cfg = {k: cfg[k] for k in ("hidden", "blocks", "sigma_min", "steps", "source")}
     src = {k: v.clone() for k, v in Fm.net.state_dict().items()}

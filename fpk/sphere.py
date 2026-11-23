@@ -1,8 +1,14 @@
 """Spherical harmonic transform on the lat-lon grid of the data, and fields built degree by degree.
 
-The grid is equiangular (H latitudes, W = 2 H longitudes, no poles). The transform keeps the triangular truncation
-l <= lmax = H - 1 and uses, per order m, the weighted least-squares inverse of the synthesis matrix: exact for every
-field of degree <= lmax (the analysis of a synthesis is the identity), and the area-weighted best fit otherwise.
+The grid is equiangular: H latitudes and W longitudes (``nlon``; default 2 H without the poles, 2 (H - 1) with them,
+the contract's two grids, ``grid_lat``), either cell centres without the poles
+(the 5.625 deg grid, 32 x 64) or including both pole rows (the KAI 1.5 deg grid, 121 x 240). The transform keeps the
+triangular truncation l <= lmax and uses, per order m, the weighted least-squares inverse of the synthesis matrix:
+exact for every field of degree <= lmax (the analysis of a synthesis is the identity), and the area-weighted best fit
+otherwise. Default lmax: H - 1 without poles; H - 3 with them (on a pole row P_lm = 0 for every m >= 1 and the row's
+area weight is 0, so H - 2 rows carry the fit: m = 0 is then a square, well-conditioned system on the interior rows
+and m >= 1 an overdetermined one); never above W / 2 - 1 (the Nyquist order of the longitude FFT). The construction
+checks itself (analysis of synthesis = identity) and refuses a singular truncation.
 
     SHT(lat).analysis(x)        (..., H, W)  -> complex (..., lmax + 1, lmax + 1)     [l, m], m >= 0
     SHT(lat).synthesis(c)       complex (..., L, L) -> (..., H, W)
@@ -52,16 +58,45 @@ def _legendre(lmax: int, x: np.ndarray) -> np.ndarray:
     return P
 
 
+def has_poles(lat_deg) -> bool:
+    """True if the latitudes include both poles (the KAI grid), False for cell centres."""
+    a = np.abs(np.asarray(lat_deg, dtype=np.float64))
+    return bool(np.isclose(a.max(), 90.0, atol=1e-6))
+
+
+def grid_lat(H: int, W: int) -> np.ndarray:
+    """The latitudes (deg, south to north) of the contract's equiangular grids, from the shape: W = 2 (H - 1) is
+    KAI's grid with the two pole rows (1.5 deg: 121 x 240, scripts/local_era5_to_kai.py --grid 1.5), W = 2 H the
+    cell centres without poles (ClimODE's 5.625 deg: 32 x 64)."""
+    if W == 2 * (H - 1):
+        return np.linspace(-90.0, 90.0, H)
+    if W == 2 * H:
+        return -90.0 + 180.0 / H * (np.arange(H) + 0.5)
+    raise ValueError(f"grid {H} x {W}: neither W = 2 (H - 1) (with poles) nor W = 2 H (cell centres)")
+
+
 class SHT(torch.nn.Module):
-    def __init__(self, lat_deg, lmax: Optional[int] = None, radius: float = A_EARTH):
+    def __init__(self, lat_deg, lmax: Optional[int] = None, radius: float = A_EARTH, nlon: Optional[int] = None):
         super().__init__()
         self.radius = float(radius)
-        lat = np.deg2rad(np.asarray(lat_deg, dtype=np.float64))
+        lat_deg = np.asarray(lat_deg, dtype=np.float64)
+        lat = np.deg2rad(lat_deg)
         H = lat.shape[0]
-        L = (H - 1 if lmax is None else int(lmax)) + 1
-        self.H, self.W, self.L = H, 2 * H, L
+        poles = has_poles(lat_deg)
+        # the contract's grids (``grid_lat``): 2 (H - 1) longitudes with the poles, 2 H without
+        W = (2 * (H - 1) if poles else 2 * H) if nlon is None else int(nlon)
+        if lmax is None:
+            lmax = min(H - 3 if poles else H - 1, W // 2 - 1)
+        L = int(lmax) + 1
+        if L > W // 2:
+            raise ValueError(f"lmax {L - 1} needs at least {2 * L} longitudes, the grid has {W}")
+        if poles and L > H - 2:
+            raise ValueError(f"lmax {L - 1} on {H} latitudes with the poles: at most {H - 3} (pole rows carry no fit)")
+        self.H, self.W, self.L, self.poles = H, W, L, poles
         P = _legendre(L - 1, np.sin(lat))  # (L, L, H)
         w = np.cos(lat)
+        if poles:
+            w[np.isclose(np.abs(lat_deg), 90.0, atol=1e-6)] = 0.0   # cos(+-pi/2) = 6e-17 in floating point
         w = w / w.sum()  # area weights of the rows (the mean over a row is taken by the FFT)
         syn = np.zeros((L, H, L))  # per m: (H, L) synthesis matrix over l (zero for l < m)
         ana = np.zeros((L, L, H))
@@ -72,6 +107,10 @@ class SHT(torch.nn.Module):
             G = A.T @ Aw
             ana[m, m:, :] = np.linalg.solve(G, Aw.T)
             syn[m, :, m:] = A
+            err = np.abs(ana[m, m:, :] @ A - np.eye(L - m)).max()
+            if not err < 1e-6:
+                raise ValueError(f"SHT: order {m} is singular on these {H} latitudes (|ana syn - I| = {err:.2e}); "
+                                 f"lower lmax ({L - 1})")
         self.register_buffer("syn", torch.tensor(syn, dtype=torch.float32))   # (M, H, L)
         self.register_buffer("ana", torch.tensor(ana, dtype=torch.float32))   # (M, L, H)
         self.register_buffer("deg", torch.arange(L, dtype=torch.float32))
@@ -83,11 +122,12 @@ class SHT(torch.nn.Module):
         eps = np.sqrt(np.maximum(ll ** 2 - mm ** 2, 0) / np.maximum(4.0 * ll ** 2 - 1, 1.0))   # (L + 1, M)
         dsyn, csyn = np.zeros((L, H, L)), np.zeros((L, H, L))
         hel = np.zeros((L, 2 * L, 2 * H), dtype=np.complex128)
+        cosr = np.where(w > 0, np.cos(lat), np.inf)                             # the pole rows: 0, not x / 6e-17
         for m in range(L):
             for l in range(m, L):
                 lo = P1[l - 1, m] if l > m else 0.0
-                dsyn[m, :, l] = ((l + 1) * eps[l, m] * lo - l * eps[l + 1, m] * P1[l + 1, m]) / np.cos(lat)
-                csyn[m, :, l] = m * P1[l, m] / np.cos(lat)
+                dsyn[m, :, l] = ((l + 1) * eps[l, m] * lo - l * eps[l + 1, m] * P1[l + 1, m]) / cosr
+                csyn[m, :, l] = m * P1[l, m] / cosr
             # the wind of (psi_l, chi_l) of order m at the H latitudes, radius 1:
             #   u = -sum psi_l dP_l + i sum chi_l C_l,   v = i sum psi_l C_l + sum chi_l dP_l,   C = m P / cos(phi)
             k = np.arange(max(m, 1), L)                                         # l = 0 has no gradient
@@ -146,10 +186,11 @@ class SHT(torch.nn.Module):
         """Unit Gaussian coefficients (*shape, L, M) of a real field: E|c_lm|^2 = 1 for m <= l (m = 0 real), zero
         above; the power of degree l is 2 l + 1."""
         L = self.L
-        z = torch.randn(tuple(shape) + (L, L, 2), generator=gen, device="cpu").to(like)
+        dev = gen.device if gen is not None else like.device                     # a CUDA generator draws on the GPU
+        z = torch.randn(tuple(shape) + (L, L, 2), generator=gen, device=dev).to(like)
         c = torch.complex(z[..., 0], z[..., 1]) / math.sqrt(2.0)
         c[..., 0] = torch.complex(z[..., 0, 0], torch.zeros_like(z[..., 0, 0]))  # m = 0 real
-        tri = (torch.arange(L)[None, :] <= torch.arange(L)[:, None]).to(like)   # m <= l
+        tri = (torch.arange(L, device=like.device)[None, :] <= torch.arange(L, device=like.device)[:, None]).to(like)   # m <= l
         return c * tri
 
     # ---- differential operators (coefficients (..., L, M), radius a)
@@ -212,4 +253,4 @@ def bands(L: int, n: Optional[int] = None):
     return torch.tensor(j), int(j.max()) + 1
 
 
-__all__ = ["SHT", "bands", "A_EARTH", "OMEGA"]
+__all__ = ["SHT", "bands", "grid_lat", "has_poles", "A_EARTH", "OMEGA"]
