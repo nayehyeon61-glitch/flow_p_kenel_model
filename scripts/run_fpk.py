@@ -575,7 +575,21 @@ def load_devk(a, core, tag):
 
 
 # ------------------------------------------------------------------------------------------------------- devflow
-G_FLOW_DEFAULTS = dict(gcond=True, gmember=False, gdirect=False)
+G_FLOW_DEFAULTS = dict(gcond=True, gmember=False, gdirect=False, gop="")
+
+
+def g_operator(a, tag):
+    """The outside operator of a flow (``--g-core TAG``, the checkpoint's cfg ``gop``): G(x) of the core TAG with its
+    ERA5 scale (fpk.devflow.OuterG), for a flow on a kernel whose core reads no G(x) (감자 2026-11-24). "" = None."""
+    if not tag:
+        return None
+    from fpk.devflow import OuterG
+    pa = pargs(a)
+    cl = D.climate(pa)
+    g = rkt().build_core(pa, cl.mean, cl.std, cl.inc, cl.lat, tag=tag)
+    if not getattr(g.cfg, "gfeat", False):
+        raise SystemExit(f"--g-core {tag}: that core has no operator features G(x)")
+    return OuterG(g)
 
 
 def flow_ckpt_cfg(Fm):
@@ -610,7 +624,7 @@ def reflow_teacher(a, Fm):
     diff = {k: [getattr(Fm.cfg, k), getattr(tc, k)] for k in keys if getattr(Fm.cfg, k) != getattr(tc, k)}
     if diff:
         raise SystemExit(f"--reflow {a.reflow}: the student is not the teacher's flow, [student, teacher] = {diff}")
-    Te = build_flow(Fm.dk, tc).to(a.device)
+    Te = build_flow(Fm.dk, tc, gop=Fm.gop).to(a.device)
     Te.net.load_state_dict(ck["state"])
     Fm.net.load_state_dict(ck["state"])
     for p_ in Te.net.parameters():
@@ -694,7 +708,8 @@ def cmd_devflow(a, rest):
     Fm = build_flow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps, path=a.path,
                                       core_steps=a.core_steps, core_sub=a.core_sub, unet=tuple(a.unet),
                                       unet_reps=a.unet_reps, gcond=not a.no_gcond, gmember=a.gmember,
-                                      gdirect=a.gdirect)).to(dev)
+                                      gdirect=a.gdirect, gop=a.g_core),
+                   gop=g_operator(a, a.g_core)).to(dev)
     net_run(a, Fm)
     Te = reflow_teacher(a, Fm) if a.reflow else None
     rf = {} if Te is None else dict(teacher=Te)   # the reflow target of the day's loss
@@ -786,7 +801,8 @@ def load_devflow(a, core, tag, pairs=0):
         Dk.cfg.pairs = pairs  # independent members of the forecast (the kernel's parameters do not depend on P)
     cfg = ck["cfg"]
     cfg["blocks"] = tuple(cfg["blocks"])
-    Fm = build_flow(Dk, DevFlowConfig(**cfg))  # the checkpoint's path: the straight line (no key) or the core's flow
+    Fm = build_flow(Dk, DevFlowConfig(**cfg), gop=g_operator(a, cfg.get("gop", "")))  # the checkpoint's path: the
+    #                                                  straight line (no key) or the core's flow; its outside G(x), if any
     Fm.net.load_state_dict(ck["state"])
     Fm.meta = {k: v for k, v in ck.items() if k not in ("state", "cfg")}  # dev_tag, core_tag, reflow_of, tuned_from
     return Fm.to(a.device).eval()
@@ -1413,6 +1429,9 @@ def main(argv=None):
     df.add_argument("--g-lr", type=float, default=20.0,
                     help="--gdirect: the step size of A as a multiple of --lr (A is 66 numbers learned from zero; at "
                          "--lr alone Adam moves it at most about lr per iteration)")
+    df.add_argument("--g-core", default="",
+                    help="G-flow on a kernel whose core has no G(x) (the control without physics): the tag of a core "
+                         "whose operator G(x) and its scale the flow reads (e.g. core_gngmz8W); saved in the flow's cfg")
     df.add_argument("--no-gcond", action="store_true",
                     help="no G(xbar) of the mean in the flow's conditioning (the control of G in the flow, same kernel)")
     df.add_argument("--reflow", default="",

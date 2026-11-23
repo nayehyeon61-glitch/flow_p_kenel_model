@@ -86,6 +86,24 @@ class DevFlowConfig:
     gmember: bool = False    # the member's own physics as an input at every tau: dG = G(xbar + s z_tau) - G(xbar)
     gdirect: bool = False    # the physics channel in the velocity: + A (.) dG on the u, v, T, q channels, A per channel,
     #                          zero at the start (the flow starts as without it), read after training (``g_direct``)
+    gop: str = ""            # the tag of another core whose operator G(x) (and its ERA5 scale) the flow reads when the
+    #                          kernel's core has no G(x) input (감자 2026-11-24: G-flow on the kernel without physics);
+    #                          the caller builds it (``OuterG``) and passes it to the flow; "" = the kernel's core's own
+
+
+class OuterG:
+    """G(x) from another core (``DevFlowConfig.gop``): that core's operator features, scaled by its ERA5 RMS and
+    clamped as its own input, for a flow on a kernel whose core reads no G(x). The core is held as a plain attribute
+    (not a submodule): its weights are not the flow's and are not saved with it; only the operator is used."""
+
+    def __init__(self, core):
+        if not getattr(core.cfg, "gfeat", False) or core.features is None:
+            raise ValueError("OuterG needs a core with the operator features G(x) (gfeat)")
+        self.core = core
+        self.n_g = int(core.gscale.shape[1])
+
+    def __call__(self, x):
+        return self.core.features(x)
 
 
 def g_direct_index(n_g: int):
@@ -106,18 +124,25 @@ def g_direct_index(n_g: int):
 
 
 class DeviationFlow(nn.Module):
-    def __init__(self, dk: EntropyDeviationKernel, cfg: DevFlowConfig = DevFlowConfig()):
+    def __init__(self, dk: EntropyDeviationKernel, cfg: DevFlowConfig = DevFlowConfig(), gop: Optional[OuterG] = None):
         super().__init__()
         self.dk, self.cfg = dk, cfg
         for p in dk.parameters():
             p.requires_grad_(False)
         core = dk.core
-        g_opts = (not cfg.gcond) or cfg.gmember or cfg.gdirect
+        g_opts = (not cfg.gcond) or cfg.gmember or cfg.gdirect or bool(cfg.gop)
         if g_opts and cfg.path != "line":
-            raise ValueError("gcond / gmember / gdirect are options of the straight line (path = line)")
-        if (cfg.gmember or cfg.gdirect) and not dk.gfeat:
-            raise ValueError("gmember / gdirect read the core's operator G(x): the kernel's core has no G(x) input")
-        n_g = core.gscale.shape[1] if dk.gfeat else 0
+            raise ValueError("gcond / gmember / gdirect / gop are options of the straight line (path = line)")
+        if bool(cfg.gop) != (gop is not None):
+            raise ValueError(f"cfg.gop = {cfg.gop!r} and the operator passed ({gop is not None}) must go together")
+        if gop is not None and dk.gfeat:
+            raise ValueError("gop: an outside operator is for a kernel whose core has no G(x) input of its own")
+        self.gop = gop
+        has_g = dk.gfeat or gop is not None
+        if (cfg.gmember or cfg.gdirect) and not has_g:
+            raise ValueError("gmember / gdirect read the core's operator G(x): the kernel's core has no G(x) input "
+                             "(give an outside operator, gop)")
+        n_g = (core.gscale.shape[1] if dk.gfeat else gop.n_g) if has_g else 0
         self.n_gc = n_g if cfg.gcond else 0       # G(xbar) channels of the conditioning
         self.n_gm = n_g if cfg.gmember else 0     # dG channels of the network's input
         # z_tau, xbar, G(xbar), H, static, time of year, lead, [dG], tau
@@ -137,6 +162,10 @@ class DeviationFlow(nn.Module):
         self.dk.eval()
         return self
 
+    def gfeat(self, x):
+        """G(x) as the flow reads it: the kernel's core's operator, or the outside one (``gop``)."""
+        return self.dk.core.features(x) if self.gop is None else self.gop(x)
+
     def cond(self, xbar, H, doy, lead: int, grad: bool = False):
         """The conditioning at a lead: xbar (B, 66, H, W) the mean of that day, H its predicted entropy field,
         doy (B,) the day of year of that day, lead = days since the IC. ``grad``: with the graph of xbar and H (the
@@ -144,7 +173,7 @@ class DeviationFlow(nn.Module):
         B, _, Hh, Ww = xbar.shape
         core = self.dk.core
         with torch.set_grad_enabled(grad and torch.is_grad_enabled()):
-            parts = [xbar] + ([core.features(xbar)] if self.n_gc else []) + [
+            parts = [xbar] + ([self.gfeat(xbar)] if self.n_gc else []) + [
                 H * self.dk.keep, core.static.expand(B, -1, -1, -1), time_features(doy.float() * 24.0, Hh, Ww),
                 xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
             return torch.cat(parts, 1)
@@ -167,11 +196,10 @@ class DeviationFlow(nn.Module):
         """dG (R, n_g, H, W) = G(xbar + s z) - G(xbar): the change of the operator's tendency (units of its ERA5 RMS,
         clamped as the core's input) at the member's state z (units of s around the mean xbar = cond[:, :66]). No
         gradient (the operator's, as everywhere). G(xbar) is the conditioning's own channels when it has them."""
-        core = self.dk.core
         with torch.no_grad():
             xbar = cond[:, :66].detach()
-            g0 = cond[:, 66:66 + self.n_gc].detach() if self.n_gc else core.features(xbar)
-            return core.features(xbar + self.dk.s * (z.detach() * self.dk.keep)) - g0
+            g0 = cond[:, 66:66 + self.n_gc].detach() if self.n_gc else self.gfeat(xbar)
+            return self.gfeat(xbar + self.dk.s * (z.detach() * self.dk.keep)) - g0
 
     def physics(self, dg):
         """The physics channel A (.) dG on the dynamic channels (R, 66, H, W), units of s (no factor sigma: dG

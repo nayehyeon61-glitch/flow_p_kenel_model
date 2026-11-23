@@ -149,7 +149,7 @@ def test_a_G_flow_checkpoint_keeps_its_options_and_a_plain_one_is_saved_as_befor
                     cfg=dict(Dk.cfg.__dict__), core_tag="c"), tmp_path / "devk.pt")
     a = SimpleNamespace(out=str(tmp_path), core_tag="c", device="cpu")
     plain = R.flow_ckpt_cfg(_flow(Dk))
-    assert not {"path", "core_steps", "core_sub", "gcond", "gmember", "gdirect"} & set(plain)
+    assert not {"path", "core_steps", "core_sub", "gcond", "gmember", "gdirect", "gop"} & set(plain)
     Fm = _flow(Dk, gmember=True, gdirect=True)
     with torch.no_grad():
         Fm.net.g_direct.normal_(0, 0.5)
@@ -189,3 +189,50 @@ def test_G_flow_on_the_U_Net_of_the_plus_version(gcore):
     import run_fpk as R
     cfg = R.flow_ckpt_cfg(Fm)
     assert cfg["unet"] == (8, 16) and cfg["gmember"] and cfg["gdirect"]
+
+
+def test_an_outside_operator_gives_the_G_flow_to_a_kernel_without_G(gcore, tmp_path, monkeypatch):
+    """감자 2026-11-24: G-flow on the kernel of the core without physics, G(x) from another core (OuterG, --g-core):
+    the same G(xbar), dG and A as on a kernel whose core has G, and a checkpoint that brings its operator back."""
+    from types import SimpleNamespace
+    from fpk.devflow import DevFlowConfig, DeviationFlow, OuterG
+    import run_fpk as R
+    Dn = _kernel(_core(False))
+    gop = OuterG(gcore)
+    assert gop.n_g == 48
+    with pytest.raises(ValueError):
+        OuterG(_core(False))                                                                # no operator there
+    with pytest.raises(ValueError):
+        DeviationFlow(Dn, DevFlowConfig(hidden=8, blocks=(1,), gop="g"))                   # the tag without it
+    with pytest.raises(ValueError):
+        DeviationFlow(Dn, DevFlowConfig(hidden=8, blocks=(1,), gmember=True), gop=gop)     # it without the tag
+    with pytest.raises(ValueError):
+        DeviationFlow(_kernel(gcore), DevFlowConfig(hidden=8, blocks=(1,), gop="g"), gop=gop)  # a kernel with its own G
+    with pytest.raises(ValueError):
+        DeviationFlow(Dn, DevFlowConfig(hidden=8, blocks=(1,), path="core", gop="g"), gop=gop)
+    torch.manual_seed(5)
+    Fm = DeviationFlow(Dn, DevFlowConfig(hidden=8, blocks=(1,), steps=2, gop="g", gmember=True, gdirect=True), gop=gop)
+    assert Fm.n_gc == 48 and Fm.n_gm == 48
+    assert Fm.c_in == 66 + 66 + 48 + 66 + Dn.core.static.shape[0] + 4 + 1 + 48 + 4
+    xd, xb, e1, H1, doy, tis, c = _ctx(Dn, Fm)
+    xbar = c.cd[:, :66]
+    assert torch.allclose(c.cd[:, 66:114], _fake_operator(xbar), atol=1e-6)          # G(xbar) in the conditioning
+    want = _fake_operator(xbar + Dn.s * c.z0 * Dn.keep) - _fake_operator(xbar)
+    assert torch.allclose(Fm.member_g(c.z0, c.cd), want, atol=1e-6)                    # the member's dG
+    v = Fm.velocity(c.z0, torch.full((c.z0.shape[0],), 0.3), c.cd, c.sig)
+    assert v.shape == c.z0.shape and float(v.abs().max()) == 0.0                       # starts as the kernel
+    torch.save(dict(state={k: v for k, v in Dn.state_dict().items() if not k.startswith("core.")},
+                    cfg=dict(Dn.cfg.__dict__), core_tag="c"), tmp_path / "devk.pt")
+    with torch.no_grad():
+        Fm.net.g_direct.normal_(0, 0.5)
+        [p.normal_(0, 0.05) for p in list(Fm.net.parameters())[-2:]]
+    cfg = R.flow_ckpt_cfg(Fm)
+    assert cfg["gop"] == "g" and "gop" not in R.flow_ckpt_cfg(DeviationFlow(Dn, DevFlowConfig(hidden=8, blocks=(1,))))
+    torch.save(dict(state=Fm.net.state_dict(), cfg=cfg, dev_tag="devk", core_tag="c"), tmp_path / "devflow_go.pt")
+    monkeypatch.setattr(R, "g_operator", lambda a, tag: gop if tag == "g" else None)
+    a = SimpleNamespace(out=str(tmp_path), core_tag="c", device="cpu")
+    F2 = R.load_devflow(a, Dn.core, "devflow_go", pairs=3)
+    assert F2.gop is gop and F2.cfg.gop == "g" and torch.equal(F2.net.g_direct, Fm.net.g_direct)
+    one = Fm.rollout(xd, doy, tis, 2, gen=torch.Generator().manual_seed(4))[0]
+    two = F2.rollout(xd, doy, tis, 2, gen=torch.Generator().manual_seed(4))[0]
+    assert torch.allclose(one, two, atol=1e-6) and float((one - one[:, :1]).abs().max()) > 0

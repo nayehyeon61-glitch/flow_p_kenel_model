@@ -342,10 +342,11 @@ class CoreFlow(DeviationFlow):
         raise NotImplementedError("the core path needs the day's start: use day_transport")
 
 
-def build_flow(dk: EntropyDeviationKernel, cfg: DevFlowConfig):
-    """The deviation flow of a configuration: the straight line (DeviationFlow) or the core's flow (CoreFlow)."""
+def build_flow(dk: EntropyDeviationKernel, cfg: DevFlowConfig, gop=None):
+    """The deviation flow of a configuration: the straight line (DeviationFlow) or the core's flow (CoreFlow).
+    ``gop``: the outside operator G(x) of ``cfg.gop`` (fpk.devflow.OuterG; the straight line only)."""
     if cfg.path == "line":
-        return DeviationFlow(dk, cfg)
+        return DeviationFlow(dk, cfg, gop=gop)
     if cfg.path == "core":
         return CoreFlow(dk, cfg)
     raise ValueError(f"path = {cfg.path!r}: line or core")
