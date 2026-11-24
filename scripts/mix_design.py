@@ -24,7 +24,7 @@ ap.add_argument("--drop", nargs="*", default=[], help="kernels left out of the s
 ap.add_argument("--sets", nargs="*", default=[], help="mixtures reported in full: kernel names joined by ','")
 ap.add_argument("--json", default="")
 A = ap.parse_args()
-F, T = np.load(A.fit), np.load(A.test)
+F, T = ({k: v[k] for k in v.files} for v in (np.load(A.fit), np.load(A.test)))      # in memory: an npz reads the file at every access
 names = [str(x) for x in T["names"]]
 assert names == [str(x) for x in F["names"]]
 ch = [str(x) for x in T["channels"]]
@@ -39,17 +39,17 @@ use = [i for i, n in enumerate(names) if n not in A.drop]
 def crps_ic(d, w):
     """w (NL, K) -> (N, NL): mean over the 65 channels."""
     a = np.einsum("lk,nklc->nlc", w, d["a"])
-    q = np.einsum("lp,npqlc,lq->nlc", w, d["D"], w)
+    q = np.einsum("lp,npqlc,lq->nlc", w, d["D"], w, optimize=True)
     return (a - 0.5 * q)[:, :, SC].mean(-1)
 
 
 def mse_ic(d, w):
-    return np.einsum("lp,npqlc,lq->nlc", w, d["C"], w)                              # (N, NL, 66)
+    return np.einsum("lp,npqlc,lq->nlc", w, d["C"], w, optimize=True)                              # (N, NL, 66)
 
 
 def spread2_ic(d, w):
     diag = np.einsum("nkklc->nklc", d["Mm"])
-    return np.einsum("lk,nklc->nlc", w, d["V"] + diag) - np.einsum("lp,npqlc,lq->nlc", w, d["Mm"], w)
+    return np.einsum("lk,nklc->nlc", w, d["V"] + diag) - np.einsum("lp,npqlc,lq->nlc", w, d["Mm"], w, optimize=True)
 
 
 def summary(d, w):
@@ -123,10 +123,9 @@ for i, n in enumerate(names):
         mixv = np.einsum("lk,kl->l", wb, a) - np.einsum("lp,pl->l", wb, Dw)
         val[key] = (a[i] - Dw[i] - mixv).round(5).tolist()
     # e fitted on the fit year per lead (a 1-d convex problem)
-    e = np.zeros(NL)
-    for l in range(NL):
-        best = min(np.linspace(0, 1, 201), key=lambda t: crps_ic(F, (1 - t) * wb + t * onehot(i))[:, l].mean())
-        e[l] = best
+    grid = np.linspace(0, 1, 201)
+    sc = np.stack([crps_ic(F, (1 - t) * wb + t * onehot(i)).mean(0) for t in grid])     # (201, NL)
+    e = grid[sc.argmin(0)]
     w = (1 - e)[:, None] * wb + e[:, None] * onehot(i)
     out["value"][n] = dict(slope=val, share=e.round(3).tolist(), test=summary(T, w), crps_diff=diff_ci(w, wb))
     print(f"{n:44s} slope fit {np.round(np.array(val['fit']) * 1e3, 2)} test {np.round(np.array(val['test']) * 1e3, 2)}  share {e.round(2)}  "
@@ -165,7 +164,7 @@ for n, g in out["geometry"].items():
 
 def crps_grp(d, w):
     aa = np.einsum("lk,nklc->nlc", w, d["a"])
-    q = np.einsum("lp,npqlc,lq->nlc", w, d["D"], w)
+    q = np.einsum("lp,npqlc,lq->nlc", w, d["D"], w, optimize=True)
     x = (aa - 0.5 * q).mean(0)
     return {g: x[:, ix].mean(-1).round(4).tolist() for g, ix in GRP.items()}
 

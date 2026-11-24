@@ -9,12 +9,22 @@ from the others (d_ij large) for what it costs in accuracy (a_i): this script me
 of candidate kernels on the same ICs, mix_design.py then finds the weights (fitted on one year, scored on another).
 
 Candidates:
-    core:arm            a learned deviation kernel (devk*, e.g. core_gngmz8W:devk_band_sphW_p), its 2 P antithetic members
+    core:arm            a learned deviation kernel (devk*, e.g. core_gngmz8W:devk_band_sphW_p), its 2 P antithetic members,
+                        or a deviation flow (devflow*): --members independent members
     clim                the invariant measure itself, K(x, .) = mu: 10-day pieces of the record of the same season
     kaf                 the analog kernel: the futures of the nearest analogs (math_core.py --kind kaf, <year>_kaf_nbr.npz)
     dress:TAG[+TAG]     a mean of diag_cond.py / math_core.py / slow_core.py fields (several: their average) read with one
                         strength g per lead and channel, dressed with its own errors on the --pool years (whole error
                         trajectories of other dates): the empirical-error kernel of that mean
+    gdress:TAG[+TAG]    the same mean with Gaussian noise of the errors' standard deviation at every point (lead, channel,
+                        grid point): what of dress: is the width map alone, and what the shape of the errors
+    sdress:TAG[+TAG]    dress: with the errors of the same season only (+- --season days)
+    core:arm@c{glob,lat,pt}   with --cal-maps: the learned kernel with its deviations from the mean rescaled so that its
+                        variance equals the mean's squared error on another year (the second-moment condition
+                        E[(y - m)^2] = E[V]), as one factor per lead and channel (cglob), per latitude too (clat) or per
+                        grid point (cpt). A run with --save-maps writes these maps (the kernel's variance and the mean's
+                        squared error at every point, averaged over its ICs). The variants share their kernel's noise:
+                        never mix a kernel with its own variant (their cross distance is that of dependent members).
 
     python scripts/mix_matrix.py --year 2017 --pool 2016 2020 --learned core_gngmz8W:devk_band_sphW_p \\
         core_ngmz8W:devk_band_sphNW_p --synth clim kaf dress:lim dress:slow --npz runs/fpk/cond/mixmat_2017.npz
@@ -38,9 +48,13 @@ ap.add_argument("--pool", type=int, nargs="+", default=[2016, 2020])
 ap.add_argument("--pool-stride", type=int, default=2)
 ap.add_argument("--members", type=int, default=8)
 ap.add_argument("--window", type=int, default=15, help="clim: +- days of the season")
+ap.add_argument("--season", type=int, default=45, help="sdress: +- days of the season")
 ap.add_argument("--dir", default="runs/fpk/cond")
 ap.add_argument("--npz", required=True)
 ap.add_argument("--max-ics", type=int, default=0)
+ap.add_argument("--save-maps", default="", help="write the learned kernels' variance and error maps here (npz)")
+ap.add_argument("--cal-maps", default="", help="maps of another year: add the rescaled variants --cal of the learned kernels found there")
+ap.add_argument("--cal", nargs="*", default=["glob", "lat", "pt"], choices=["glob", "lat", "pt"])
 ap.add_argument("--threads", type=int, default=4)
 ap.add_argument("--seed", type=int, default=0)
 A, PASS = ap.parse_known_args()
@@ -62,10 +76,14 @@ def grab(a, rest):
     if arm == "core":
         base.update(a=a, pa=pa, cl=cl)
         return
-    if not arm.startswith("devk"):
-        raise SystemExit(f"{arm}: a deviation kernel (devk*)")
-    m = R.net_run(a, R.load_devk(a, core, arm))
-    sides.append(dict(a=a, core=core, model=m, pairs=m.cfg.pairs, name=f"{a.core_tag}:{arm}", gen=R.make_gen(a.seed, torch.device(a.device))))
+    if arm.startswith("devflow"):                      # a deviation flow: --members independent members, its mean is not known
+        m, pairs, kw = R.net_run(a, R.load_devflow(a, core, arm, pairs=a.members)), 0, dict(steps=a.steps)
+    elif arm.startswith("devk"):
+        m = R.net_run(a, R.load_devk(a, core, arm))
+        pairs, kw = m.cfg.pairs, {}
+    else:
+        raise SystemExit(f"{arm}: a deviation kernel (devk*) or a deviation flow (devflow*)")
+    sides.append(dict(a=a, core=core, model=m, pairs=pairs, kw=kw, name=f"{a.core_tag}:{arm}", gen=R.make_gen(a.seed, torch.device(a.device))))
 
 
 R.cmd_score = grab
@@ -88,6 +106,8 @@ w = np.cos(np.deg2rad(cl.lat))
 w = torch.tensor(w / w.mean(), dtype=torch.float32)[:, None]
 am = lambda x: (x * w).mean((-2, -1))  # noqa: E731
 rng = np.random.default_rng(A.seed + 100)
+rng2 = np.random.default_rng(A.seed + 200)             # the kernels added later draw apart, so the first ones keep their members
+tg = torch.Generator().manual_seed(A.seed + 300)
 M = A.members
 meta = json.load(open(f"{A.dir}/{A.year}_meta.json"))
 ROW = {k: i for i, k in enumerate(meta["ics"])}
@@ -120,16 +140,23 @@ if "kaf" in A.synth:
         raise SystemExit(f"the analogs index the record of {nz['years'][0]}-{nz['years'][-1]}, the archive here is "
                          f"{ameta['years'][0]}-{ameta['years'][-1]}: give the same --train-years (and remove {A.dir}/archive_*)")
     NBR = nz["rows"]
-DRESS, POOL_O, POOL_ROWS = {}, None, {}
+DRESS, POOL_O, POOL_ROWS, POOL_DOY = {}, None, {}, None
 Zc = [contract.CHANNEL_NAMES[c] for c in DYN].index("z500")
-if any(s.startswith("dress:") for s in A.synth):
+is_dress = lambda s: s.split(":")[0] in ("dress", "gdress", "sdress")  # noqa: E731
+if any(is_dress(s) for s in A.synth):
+    doy = []
     for y in A.pool:
-        POOL_ROWS[y] = np.arange(0, len(json.load(open(f"{A.dir}/{y}_meta.json"))["ics"]), A.pool_stride)
+        pm = json.load(open(f"{A.dir}/{y}_meta.json"))["ics"]
+        POOL_ROWS[y] = np.arange(0, len(pm), A.pool_stride)
+        doy.append(np.asarray(pm)[POOL_ROWS[y]])
+    POOL_DOY = np.concatenate(doy)                                                     # the day of the year of every pool IC
     POOL_O = np.concatenate([np.load(f"{A.dir}/{y}_o.npy", mmap_mode="r")[POOL_ROWS[y]][:, Q] for y in A.pool])   # (n, 5, 66, H, W) f16
 for spec in A.synth:
-    if not spec.startswith("dress:"):
+    if not is_dress(spec):
         continue
-    tags = spec[6:].split("+")
+    if spec.split(":", 1)[1] in DRESS:
+        continue
+    tags = spec.split(":", 1)[1].split("+")
     pf = sum(np.concatenate([np.asarray(np.load(f"{A.dir}/{y}_{t}.npy", mmap_mode="r")[POOL_ROWS[y]][:, Q], dtype=np.float32) for y in A.pool])
              for t in tags) / len(tags)
     sf, sff = 0, 0
@@ -137,7 +164,13 @@ for spec in A.synth:
         f, oo = torch.from_numpy(pf[i:i + 32]), f32(POOL_O[i:i + 32])
         sf, sff = sf + am(f * oo).sum(0).double(), sff + am(f * f).sum(0).double()
     g = (sf / sff.clamp_min(1e-30)).float().clamp(0.0, 1.5)                                 # (5, 66) the strength
-    DRESS[spec] = dict(g=g, f=pf.astype(np.float16), cur=[np.load(f"{A.dir}/{A.year}_{t}.npy", mmap_mode="r") for t in tags])
+    d = dict(g=g, f=pf.astype(np.float16), cur=[np.load(f"{A.dir}/{A.year}_{t}.npy", mmap_mode="r") for t in tags])
+    if any(x == "gdress:" + spec.split(":", 1)[1] for x in A.synth):                       # the errors' width at every point
+        s2 = 0
+        for i in range(0, len(pf), 32):
+            s2 = s2 + ((f32(POOL_O[i:i + 32]) - g[:, :, None, None] * torch.from_numpy(pf[i:i + 32])) ** 2).sum(0).double()
+        d["sd"] = (s2 / len(pf)).sqrt().float()                                           # (5, 66, H, W)
+    DRESS[spec.split(":", 1)[1]] = d
     del pf
     print(json.dumps(dict(dress=spec, pool=int(len(POOL_O)), g_z500=[round(float(v), 3) for v in g[:, Zc]])), flush=True)
 
@@ -152,16 +185,41 @@ def synth(spec, k):
     if spec == "kaf":
         r = np.sort(NBR[ROW[k]][:M])
         return torch.stack([f32(ARCH[r + l]) for l in LD], 1), None, "atoms"
-    d = DRESS[spec]
+    kind, tag = spec.split(":", 1)
+    d = DRESS[tag]
     g = d["g"][:, :, None, None]
     mean = g * sum(f32(x[ROW[k]][Q]) for x in d["cur"]) / len(d["cur"])
-    p = np.sort(rng.choice(len(d["f"]), M, replace=False))
+    if kind == "gdress":
+        return mean[None] + d["sd"][None] * torch.randn((M,) + tuple(d["sd"].shape), generator=tg), mean, "indep"
+    if kind == "sdress":
+        dd = np.abs(POOL_DOY - k)
+        p = np.sort(rng2.choice(np.nonzero(np.minimum(dd, 365 - dd) <= A.season)[0], M, replace=False))
+    else:
+        p = np.sort(rng.choice(len(d["f"]), M, replace=False))
     res = f32(POOL_O[p]) - g * f32(d["f"][p])
     return mean[None] + res, mean, "indep"
 
 
-names = [s["name"] for s in sides] + list(A.synth)
+CAL = {}
+if A.cal_maps:
+    cz = np.load(A.cal_maps)
+    for s in sides:
+        if "V::" + s["name"] not in cz.files:
+            continue
+        Vm, Em = torch.from_numpy(cz["V::" + s["name"]]).double(), torch.from_numpy(cz["E::" + s["name"]]).double()   # (5, 66, H, W)
+        wl = w.double()
+        c = dict(glob=((Em * wl).mean((-2, -1), keepdim=True) / (Vm * wl).mean((-2, -1), keepdim=True).clamp_min(1e-30)).sqrt(),
+                 lat=(Em.mean(-1, keepdim=True) / Vm.mean(-1, keepdim=True).clamp_min(1e-30)).sqrt(), pt=(Em / Vm.clamp_min(1e-30)).sqrt())
+        CAL[s["name"]] = [(k, c[k].clamp(0.3, 3.0).float()) for k in A.cal]
+        print(json.dumps(dict(cal=s["name"], maps_ics=int(cz["n"]), z500_glob=[round(float(v), 3) for v in c["glob"][:, Zc, 0, 0]],
+                              z500_lat_min_max=[round(float(c["lat"][-1, Zc].min()), 2), round(float(c["lat"][-1, Zc].max()), 2)],
+                              pt_q05_q95_day10=[round(float(v), 2) for v in np.quantile(c["pt"][-1].numpy(), [0.05, 0.95])])), flush=True)
+names = []
+for s in sides:
+    names += [s["name"]] + [f"{s['name']}@c{k}" for k, _ in CAL.get(s["name"], [])]
+names += list(A.synth)
 K = len(names)
+MAPS = {s["name"]: [0, 0] for s in sides} if A.save_maps else {}
 ST = {k: [] for k in ("a", "D", "C", "Mm", "V", "oo")}
 t0 = time.time()
 for i in range(0, len(ics), 2):
@@ -174,21 +232,35 @@ for i in range(0, len(ics), 2):
         Wm = int(getattr(s["core"], "mem", 0))
         hist = torch.from_numpy(np.stack([te[np.maximum(np.arange(k - Wm, k), 0)][:, dyn] for k in j])).to(dev) if Wm else None
         with torch.no_grad():
-            e = s["model"].rollout(torch.from_numpy(te[j][:, dyn]).to(dev), torch.tensor(j, device=dev), tis, L, hist=hist, gen=s["gen"])[0]
+            e = s["model"].rollout(torch.from_numpy(te[j][:, dyn]).to(dev), torch.tensor(j, device=dev), tis, L, hist=hist, gen=s["gen"], **s["kw"])[0]
         learned.append(e.float().cpu()[:, :, Q] - torch.from_numpy(cj[:, Q])[:, None])           # (B, M, 5, 66, H, W) anomalies
     for b, k in enumerate(j):
         y = torch.from_numpy(truth[b][Q] - cj[b][Q])
         X, MU, KIND = [], [], []
         for n, s in enumerate(sides):
-            X.append(learned[n][b]); MU.append(learned[n][b].mean(0)); KIND.append("pairs")
+            kind = "pairs" if s["pairs"] else "sample"
+            x = learned[n][b]
+            mu = x.mean(0)
+            X.append(x); MU.append(mu); KIND.append(kind)
+            for _, c in CAL.get(s["name"], []):                                                  # the same noise, another width
+                X.append(mu[None] + c[None] * (x - mu[None])); MU.append(mu); KIND.append(kind)
+            if MAPS:
+                MAPS[s["name"]][0] = MAPS[s["name"]][0] + ((x - mu) ** 2).sum(0).double() / (x.shape[0] - (kind == "sample"))
+                MAPS[s["name"]][1] = MAPS[s["name"]][1] + ((mu - y) ** 2).double() - (((x - mu) ** 2).sum(0).double() / (x.shape[0] - 1) / x.shape[0] if kind == "sample" else 0)
         for spec in A.synth:
             x, mu, kind = synth(spec, int(k))
             X.append(x); MU.append(x.mean(0) if mu is None else mu); KIND.append(kind)
         a_ = torch.stack([am((x - y).abs().mean(0)) for x in X])                                 # (K, 5, 66)
-        V = torch.stack([am(((x - mu) ** 2).mean(0)) for x, mu in zip(X, MU)])
+        # the variance inside a kernel; "sample" = independent members and an unknown mean: the unbiased variance, and
+        # the noise of the member mean (V / M) leaves the diagonals of C and Mm (E[(m^ - y)^2] = (m - y)^2 + V / M)
+        V = torch.stack([am(((x - mu) ** 2).sum(0)) / (x.shape[0] - (kind == "sample")) for x, mu, kind in zip(X, MU, KIND)])
         E = [mu - y for mu in MU]
         Cc = torch.stack([torch.stack([am(E[p] * E[q]) for q in range(K)]) for p in range(K)])
         Mm = torch.stack([torch.stack([am(MU[p] * MU[q]) for q in range(K)]) for p in range(K)])
+        for p in range(K):
+            if KIND[p] == "sample":
+                Cc[p, p] -= V[p] / X[p].shape[0]
+                Mm[p, p] -= V[p] / X[p].shape[0]
         D = torch.zeros(K, K, len(Q), C)
         for p in range(K):
             for q in range(p, K):
@@ -210,4 +282,7 @@ for i in range(0, len(ics), 2):
 np.savez_compressed(A.npz, **{k: np.stack(v) for k, v in ST.items()}, names=np.array(names), kinds=np.array(KIND), ics=ics,
                     leads=np.array(LD), std=cl.std[dyn], channels=np.array([contract.CHANNEL_NAMES[c] for c in DYN]),
                     year=A.year, pool=np.array(A.pool), members=M)
+if MAPS:
+    np.savez_compressed(A.save_maps, n=len(ics), year=A.year, **{f"V::{k}": (v[0] / len(ics)).float().numpy() for k, v in MAPS.items()},
+                        **{f"E::{k}": (v[1] / len(ics)).float().numpy() for k, v in MAPS.items()})
 print("done", K, names, round(time.time() - t0))
