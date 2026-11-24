@@ -12,6 +12,7 @@ anomalies (fields of scripts/diag_cond.py); theta per lead and channel by least 
     bias       a constant field per lead (spherical harmonics l <= 4): the drift of the model and the climate trend
     geo        the strength as a smooth field on the sphere: bands x spherical harmonics l <= lg (storm tracks, land)
     prev       the forecast of the day before, banded (a filter in the lead)
+    math       the mathematical cores of math_core.py (--math lim,kaf), banded: one weight per core and band
     level      the other variables at the same level, banded (z, t, u, v, q): balance between the fields
     vert       the same variable at the neighbouring levels, banded
 
@@ -41,6 +42,7 @@ ap.add_argument("--days", type=int, nargs="+", default=[10])
 ap.add_argument("--exps", nargs="+", default=["bands"])
 ap.add_argument("--cores", default="core_gngmz8W,core_ngmz8W")
 ap.add_argument("--third", default="core_gngmz8L")
+ap.add_argument("--math", default="", help="math cores (math_core.py tags) for the candidate 'math'")
 ap.add_argument("--ridge", type=float, default=1e-4)
 ap.add_argument("--batch", type=int, default=12)
 ap.add_argument("--threads", type=int, default=4)
@@ -54,6 +56,7 @@ A = ap.parse_args()
 torch.set_num_threads(A.threads)
 CORES = A.cores.split(",")
 CW, CN = CORES[0], CORES[1]
+MATH = [t for t in A.math.split(",") if t]
 YEARS = list(dict.fromkeys(A.fit + [A.test]))
 
 
@@ -61,7 +64,7 @@ def load(y):
     m = json.load(open(f"{A.dir}/{y}_meta.json"))
     d = dict(meta=m, o=np.load(f"{A.dir}/{y}_o.npy", mmap_mode="r"), x0=np.load(f"{A.dir}/{y}_x0.npy", mmap_mode="r"),
              ics=np.asarray(m["ics"]))
-    for t in dict.fromkeys(m["cores"] + CORES + [A.third]):
+    for t in dict.fromkeys(m["cores"] + CORES + [A.third] + MATH):
         if os.path.exists(f"{A.dir}/{y}_{t}.npy"):                                    # other dumps may be linked in
             d[t] = np.load(f"{A.dir}/{y}_{t}.npy", mmap_mode="r")
     d["n"] = min(len(d["ics"]), A.max_ics or 10 ** 9)
@@ -152,6 +155,8 @@ def extra(name, P):
         return P["B"](CW)
     if name == "free":
         return torch.cat([P["B"](t) for t in CORES[:-1]], 2)
+    if name == "math":
+        return torch.cat([P["B"](t) for t in MATH], 2)
     if name == "free3":
         return torch.cat([P["B"](CW), P["B"](A.third)], 2)
     if name.startswith("season"):
