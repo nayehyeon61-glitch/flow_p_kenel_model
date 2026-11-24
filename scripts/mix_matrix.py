@@ -315,13 +315,13 @@ for i in range(0, len(ics), 2):
             for _, c in CAL.get(s["name"], []):                                                  # the same noise, another width
                 X.append(mu[None] + c[None] * (x - mu[None])); MU.append(mu); KIND.append(kind)
             if n in FLOWP:                                                                       # the flow read on the conditioned mean
-                dev = x - core_mean(s["a"].core_tag, int(k))[None]
+                fdev = x - core_mean(s["a"].core_tag, int(k))[None]
                 mp = learned[FLOWP[n]][b].mean(0)
                 for kk in [None] + list(KAP.get(n, {})):
-                    xv = mp[None] + (dev if kk is None else KAP[n][kk][None] * dev)
+                    xv = mp[None] + (fdev if kk is None else KAP[n][kk][None] * fdev)
                     X.append(xv); MU.append(xv.mean(0)); KIND.append("sample")
                 if MAPS:
-                    MAPS[s["name"]][2] = MAPS[s["name"]][2] + (dev ** 2).mean(0).double()
+                    MAPS[s["name"]][2] = MAPS[s["name"]][2] + (fdev ** 2).mean(0).double()
             if MAPS:
                 MAPS[s["name"]][0] = MAPS[s["name"]][0] + ((x - mu) ** 2).sum(0).double() / (x.shape[0] - (kind == "sample"))
                 MAPS[s["name"]][1] = MAPS[s["name"]][1] + ((mu - y) ** 2).double() - (((x - mu) ** 2).sum(0).double() / (x.shape[0] - 1) / x.shape[0] if kind == "sample" else 0)
