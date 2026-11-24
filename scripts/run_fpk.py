@@ -386,8 +386,9 @@ def cmd_devk(a, rest):
                                                noise_mult=a.noise_mult, noise_spec=a.noise_spec,
                                                bal_vert=a.bal_vert, fdt=a.fdt, fdt_bmin=a.fdt_bmin,
                                                bal_lmin=a.bal_lmin, aam_fix=a.aam_fix, unet=tuple(a.unet),
-                                               unet_reps=a.unet_reps, noise_cells=a.noise_cells),
-                                std=cl.std).to(dev)
+                                               unet_reps=a.unet_reps, noise_cells=a.noise_cells,
+                                               eq_kernel=a.eq_kernel, eq_core=a.eq_core, eq_clamp=a.eq_clamp),
+                                std=cl.std, eqop=eq_operator(a, a.eq_core)).to(dev)
     net_run(a, Dk)
     if a.fdt_weight and not a.fdt:
         raise SystemExit("--fdt-weight needs the climatological band power: --fdt clim_bands.json")
@@ -416,7 +417,8 @@ def cmd_devk(a, rest):
         log(dict(total_energy_daily_change_std=round(sig_E, 3)))
     params = [p_ for p_ in Dk.parameters() if p_.requires_grad]
     cn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_.startswith("cnet.")]
-    rest_ = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and not n_.startswith("cnet.")]
+    eqa = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_ == "eq_a"]
+    rest_ = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and not n_.startswith("cnet.") and n_ != "eq_a"]
     cw, cpar, th0, n0, ck_core = {}, [], [], 1.0, None
     if a.core_lr > 0:  # after the kernel's own lists: the core's weights are a group and a clipping of their own
         ck_core = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -430,7 +432,9 @@ def cmd_devk(a, rest):
         log(dict(core_tuned=a.core_out, tuned_from=a.core_tag, core_weights=len(cpar), core_params=sum(p_.numel() for p_ in cpar),
                  core_lr=a.core_lr, core_anchor=a.core_anchor, through=a.through))
     opt = torch.optim.AdamW([dict(params=rest_, lr=a.lr)] + ([dict(params=cn, lr=a.lr_correct or a.lr)] if cn else [])
-                            + ([dict(params=cpar, lr=a.core_lr, weight_decay=0.0)] if cpar else []), weight_decay=1e-4)
+                            + ([dict(params=cpar, lr=a.core_lr, weight_decay=0.0)] if cpar else [])
+                            # A of the kernelized equation: 66 numbers from zero, a step of its own (as G-flow's A)
+                            + ([dict(params=eqa, lr=a.lr * a.eq_lr, weight_decay=0.0)] if eqa else []), weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
@@ -554,7 +558,7 @@ def cmd_devk(a, rest):
                      prod_eq=[round(p_[0], 3) for p_ in prod], prod_noise=[round(p_[1], 3) for p_ in prod],
                      r=[round(p_[2], 3) for p_ in prod],
                      h=round(float(Dk.h().mean()), 4), **fdt, **ct, sec=round(time.time() - t0),
-                     **gpu_mem(dev)))
+                     **gpu_mem(dev), **({} if Dk.eq_report() is None else dict(eq_a=Dk.eq_report()))))
             if a.resume:
                 save_part(a, it, best, Dk, opt, sch, tr)
     end_part(a)
@@ -568,7 +572,7 @@ def load_devk(a, core, tag):
     cfg["blocks"] = tuple(cfg["blocks"])
     if getattr(a, "cloud_mean", False):  # diagnostic: a kernel fitted on the core's trajectory, scored with the cloud's mean
         cfg["cloud_mean"] = True
-    Dk = EntropyDeviationKernel(core, DevConfig(**cfg))
+    Dk = EntropyDeviationKernel(core, DevConfig(**cfg), eqop=eq_operator(a, cfg.get("eq_core", "")))
     miss = Dk.load_state_dict(ck["state"], strict=False)
     assert not miss.unexpected_keys and all(k.startswith("core.") for k in miss.missing_keys), miss
     return Dk.to(a.device).eval()
@@ -576,6 +580,15 @@ def load_devk(a, core, tag):
 
 # ------------------------------------------------------------------------------------------------------- devflow
 G_FLOW_DEFAULTS = dict(gcond=True, gmember=False, gdirect=False, gop="")
+
+
+def eq_operator(a, tag):
+    """The operator of the kernelized equation for a kernel whose core has no G(x) (``devk --eq-core TAG``, the
+    checkpoint's cfg ``eq_core``): fpk.devkernel.EqOperator of the core TAG (its operator and scale only). "" = None."""
+    if not tag:
+        return None
+    from fpk.devkernel import EqOperator
+    return EqOperator(g_operator(a, tag).core)
 
 
 def g_operator(a, tag):
@@ -1385,6 +1398,17 @@ def main(argv=None):
                    help="widths (fine to coarse) of a multi-scale trunk for the r-net and the correction net (the + "
                         "version: e.g. 32 64 128 192, levels at 1.5 / 3 / 6 / 12 deg); none = ClimODE's trunk (--hidden)")
     d.add_argument("--unet-reps", type=int, default=2)
+    d.add_argument("--eq-kernel", action="store_true",
+                   help="the kernelized equation (감자 2026-11-24): the operator's own day of the deviation pairs "
+                        "p_G = [G(xbar + s e) - G(xbar - s e)] / 2s x 1 day, its entropy production and growth rate as "
+                        "inputs of the entropy and correction nets, and + A (.) p_G in the direction (A from zero)")
+    d.add_argument("--eq-core", default="",
+                   help="--eq-kernel on a core without G(x): the tag of a core whose operator G(x) the kernel reads "
+                        "(e.g. core_gngmz8W; its operator and scale only)")
+    d.add_argument("--eq-clamp", type=float, default=5.0,
+                   help="--eq-kernel: |p_G| <= this x the deviations' local size (soft)")
+    d.add_argument("--eq-lr", type=float, default=20.0,
+                   help="--eq-kernel: the step size of A as a multiple of --lr")
     d.add_argument("--noise-cells", type=int, default=3,
                    help="cells of the smoothed noise (3 = 17 deg at 5.625 deg; 11 = the same at 1.5 deg)")
     d.add_argument("--iters", type=int, default=800)

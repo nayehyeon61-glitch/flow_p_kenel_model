@@ -135,6 +135,14 @@ class DevConfig:
     #                           of the sphere noise's spectrum): 3 = 17 deg at 5.625 deg; 11 = the same at 1.5 deg
     aam_fix: bool = False     # balanced noise: the day's WHOLE new part (the remainder's u too) carries no axial angular
     #                           momentum: on every level u - c cos(phi), c = <u cos(phi)> / <cos^2(phi)> (``aam_neutral``)
+    # The kernelized equation (감자 2026-11-24: as the tendency core learned on top of the equation G(x), the kernel
+    # learns on top of the equation in its distributional form; ``EqOperator``, ``day``):
+    eq_kernel: bool = False   # the equation's own day of the deviations p_G and its entropy production as the kernel's
+    #                           inputs, and + A (.) p_G in the deviations' direction (A per channel, zero at the start)
+    eq_core: str = ""         # the tag of a core whose operator G(x) (and its ERA5 scale) the kernel reads when its own
+    #                           core has none (the control without physics); "" = the kernel's core's own operator
+    eq_clamp: float = 5.0     # |p_G| <= eq_clamp x the deviations' local size (soft, tanh): one explicit day of the
+    #                           instantaneous operator moves a deviation by more than a cell (advection ~ 3 e a day)
 
 
 def core_weights(core):
@@ -146,13 +154,50 @@ def core_weights(core):
     return dict(core.named_parameters())
 
 
+class EqOperator:
+    """The primitive-equation operator G(x) of a core as the kernelized equation reads it: the tendency of u, v, T, q
+    on the 12 levels in units of the state's z-score PER DAY on the 66 dynamic channels (zero on the channels without
+    an operator tendency: z, the surface fields, tisr). From the core's operator features (G / its ERA5 RMS, clamped
+    at 5, zero below ground, no gradient: what the core reads) times that RMS (SI per second) x 86400 s / the
+    channel's z-score std. ``core``: a core with gfeat (the kernel's own, or another core's for a kernel whose core
+    has none: ``DevConfig.eq_core``). Held as a plain attribute, nothing of it is a parameter of the kernel."""
+
+    def __init__(self, core):
+        from pgcfm import contract
+        from pgcfm.dyncore import G_EQS
+        from .env import DYN
+        f = getattr(core, "features", None)
+        base = getattr(f, "feats", f)  # kai_tend.CachedFeatures wraps the OperatorFeatures
+        if not getattr(core.cfg, "gfeat", False) or base is None or not hasattr(base, "phys"):
+            raise ValueError("the kernelized equation needs a core with the operator features G(x) (gfeat, gsource op)")
+        self.core, self.f = core, f
+        n = len(G_EQS) * len(contract.LEVELS_HPA)
+        src, dst = [], []
+        for i, q in enumerate(G_EQS):
+            for j, lev in enumerate(contract.LEVELS_HPA):
+                src.append(i * len(contract.LEVELS_HPA) + j)
+                dst.append(DYN.index(contract.CHANNEL_INDEX[f"{q.lower()}{lev}"]))
+        self.n, self.src, self.dst = n, torch.tensor(src), torch.tensor(dst)
+        std = base.phys.std.reshape(-1).float()                       # (66,) z-score std of the channels (SI)
+        self.unit = (core.gscale.reshape(-1)[:n].float()[self.src] * 86400.0 / std[self.dst]).view(1, -1, 1, 1)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """x (N, 66, H, W) normalized -> G(x) (N, 66, H, W), z-score units per day, no gradient."""
+        with torch.no_grad():
+            g = self.f(x.detach())[:, :self.n].float()
+            out = x.new_zeros(x.shape)
+            out[:, self.dst.to(x.device)] = g[:, self.src.to(x.device)] * self.unit.to(x.device)
+        return out
+
+
 class EntropyDeviationKernel(nn.Module):
     # the fixed buffers that the balanced noise and the fdt settings derive from the configuration of the run
     CFG_BUFFERS = ("bal_unit", "bal_k", "psi_amp", "bal_vert", "bal_dlnp", "fdt_c", "fdt_rho")
 
-    def __init__(self, core, cfg: DevConfig = DevConfig(), std=None):
+    def __init__(self, core, cfg: DevConfig = DevConfig(), std=None, eqop: Optional[EqOperator] = None):
         """``std`` (66 or 67 values): the z-score std of the channels, needed by the balanced noise (SI units);
-        None = the contract's reference values. A checkpoint carries the constants derived from it."""
+        None = the contract's reference values. A checkpoint carries the constants derived from it. ``eqop``: the
+        operator of the kernelized equation when the core has none of its own (``cfg.eq_core``, built by the caller)."""
         super().__init__()
         self.core, self.cfg = core, cfg
         self.through = 0  # training: days of the gradient through the mean's path of the equation (0 = none)
@@ -161,11 +206,27 @@ class EntropyDeviationKernel(nn.Module):
         self.gfeat = bool(getattr(core.cfg, "gfeat", False))
         self.net_dtype, self.net_ckpt = None, False  # how the nets run (fpk.nets.set_run: bf16, recomputation)
         n_g = core.gscale.shape[1] if self.gfeat else 0
+        if bool(cfg.eq_core) != (eqop is not None):
+            raise ValueError(f"cfg.eq_core = {cfg.eq_core!r} and the operator passed ({eqop is not None}) go together")
+        if eqop is not None and (self.gfeat or not cfg.eq_kernel):
+            raise ValueError("eq_core: an outside operator is for the kernelized equation on a core without G(x)")
+        if cfg.eq_kernel and eqop is None and not self.gfeat:
+            raise ValueError("eq_kernel on a core without G(x) needs an outside operator (eq_core)")
+        self.eqop = (eqop or EqOperator(core)) if cfg.eq_kernel else None
+        n_eq = 2 * 66 if cfg.eq_kernel else 0  # the equation's entropy production and its growth rate per channel
         self.mem = int(getattr(core, "mem", 0))
         self.mem_ch = int(core.mem_ch) if self.mem else 0
         # xbar, G(xbar), (Phi(xbar) - xbar) / s, log size before / after the equation's day, static, time, lead, m
-        c_in = 66 + n_g + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch
+        c_in = 66 + n_g + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch + n_eq
         self.net = make_net(c_in, 66, cfg.hidden, cfg.blocks, cfg.unet, cfg.unet_reps)  # zero head: r = bias
+        if cfg.eq_kernel:
+            # A: how much of the equation's own day of the deviations goes into their direction, per channel (only
+            # the 48 with an operator tendency move), zero at the start: the kernel starts as without it
+            self.eq_a = nn.Parameter(torch.zeros(1, 66, 1, 1))
+            m = torch.zeros(1, 66, 1, 1)
+            m[0, self.eqop.dst, 0, 0] = 1.0
+            self.register_buffer("eq_mask", m, persistent=False)
+        self._pG = None
         self.r_bias = nn.Parameter(torch.zeros(1, 66, 1, 1))
         self.h_raw = nn.Parameter(torch.full((66,), math.log(math.expm1(cfg.h0))))
         if cfg.noise_mult > 0:
@@ -219,7 +280,7 @@ class EntropyDeviationKernel(nn.Module):
             # the equation's own nonlinear correction), the day's tendency, log size before / after, the entropy
             # H, static, time, lead, m. Out: delta (mean, units of the cloud's size exp(H)) and r2 (entropy); zero
             # head, so the chain starts as the uncorrected kernel
-            c2 = 66 + n_g + 66 + 66 + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch
+            c2 = 66 + n_g + 66 + 66 + 66 + 66 + 66 + core.static.shape[0] + 4 + 1 + self.mem_ch + n_eq
             self.cnet = make_net(c2, 132, cfg.hidden, cfg.blocks, cfg.unet, cfg.unet_reps)
 
     def _init_balanced(self, std):
@@ -461,6 +522,15 @@ class EntropyDeviationKernel(nn.Module):
         g = core.features(xbar) if self.gfeat else None
         n = 2 * P
         xs = (xbar[:, None] + self.s.unsqueeze(0) * torch.cat([e, -e], 1)).flatten(0, 1)
+        self._pG = None
+        if self.eqop is not None:
+            # the kernelized equation: the operator's own day of the deviations, p_G = [G(xbar + s e) - G(xbar - s e)] / 2s
+            # x 1 day (to first order J_G e: the tangent-linear primitive equations), units of s, softly bounded by
+            # eq_clamp x the deviations' local size
+            gx = self.eqop(xs).view(B, n, *xbar.shape[1:])
+            pG = (gx[:, :P] - gx[:, P:]) / (2 * self.s.unsqueeze(0)) * self.keep.unsqueeze(0)
+            c = self.cfg.eq_clamp * torch.exp(self.size(e))[:, None]
+            self._pG = (c * torch.tanh(pG / c)).detach()
         rep = lambda t: None if t is None else t.repeat_interleave(n, 0)  # noqa: E731
         if self.mem:
             keep = {k: getattr(core, k, None) for k in ADV_STATE}
@@ -505,6 +575,18 @@ class EntropyDeviationKernel(nn.Module):
             zin = e
             phi0, p, g, shift = self._equation(xbar, e, doy, tisr)
             q = p + hxi
+        eqf = []
+        if self.eqop is not None:
+            pG = self._pG
+            # the direction: + A (.) p_G (A zero at the start; its gradient comes from the day's log score through q)
+            add = self.eq_a * self.eq_mask * pG
+            p, q = p + add, q + add
+            # the equation's distributional form as inputs: its entropy production 1/2 log <(z + p_G)^2> / <z^2>
+            # (the stretching of the cloud by one explicit day of the operator) and its growth rate <z p_G> / <z^2>
+            # (Hutchinson's estimate of the diagonal of J_G, Liouville's tr J), z the deviations that entered the day
+            hG = (self.size(zin + pG) - self.size(zin)) * self.eq_mask
+            rate = ((zin * pG).mean(1) / (zin.pow(2).mean(1) + 1e-8)).clamp(-self.cfg.eq_clamp, self.cfg.eq_clamp) * self.eq_mask
+            eqf = [hG.detach(), rate.detach()]
         if self.cfg.noise_mult > 0:
             L_ = self.sht.L
             amp = torch.zeros(L_, device=xbar.device)
@@ -521,6 +603,7 @@ class EntropyDeviationKernel(nn.Module):
                                                            xbar.new_full((B, 1, Hh, Ww), lead / 10.0)]
         if self.mem:
             parts.append(self.core.m)
+        parts += eqf
         u = run_net(self.net, torch.cat(parts, 1), self) + self.r_bias
         if self.cfg.r_dissip:
             r = -self.cfg.r_max * torch.tanh(F.softplus(-u) / self.cfg.r_max) * self.keep
@@ -535,6 +618,7 @@ class EntropyDeviationKernel(nn.Module):
                 time_features((doy.float() + 1.0) * 24.0, Hh, Ww), xbar.new_full((B, 1, Hh, Ww), (lead + 1) / 10.0)]
             if self.mem:
                 new.append(self.core.m)
+            new += eqf
             out = run_net(self.cnet, torch.cat(new, 1), self)
             # bounded: the corrected x_t goes back into the equation, so an unbounded correction compounds over
             # the chain (first run: day-10 RMSE 1.50 -> 1.71 s after 150 iterations)
@@ -558,6 +642,16 @@ class EntropyDeviationKernel(nn.Module):
         self.last = dict(p=p, hxi=q - p, r=r, prod=((lp - le).detach(), (lq - lp).detach(), r.detach()),
                          zin=zin.detach())
         return phi0, e_next, Hn, (lq - le, r)
+
+    def eq_report(self):
+        """What the kernelized equation's direction term learned: A per variable and level (u, v, T, q x 12 levels,
+        50 -> 1000 hPa); None without eq_kernel."""
+        if self.eqop is None:
+            return None
+        from pgcfm import contract
+        from pgcfm.dyncore import G_EQS
+        a = self.eq_a.detach().flatten()[self.eqop.dst].view(len(G_EQS), -1).cpu()
+        return {"levels": contract.LEVELS_HPA, **{q: [round(float(v), 5) for v in a[i]] for i, q in enumerate(G_EQS)}}
 
     def ign(self, H, xbar, truth, w):
         """The Gaussian log score of the truth around the mean with entropy H (without 1/2 log 2 pi), area-weighted,
