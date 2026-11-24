@@ -9,13 +9,16 @@ so  IGN = 0.5 (log v^ - g1) + e^2 / (2 v^ g2)  is unbiased (s from the area mean
 Check: the full mixture (k = 8) and the half one (k = 4, TAG_h) are the SAME distribution and must then agree.
 
     python scripts/mix_ign.py mixk_W_NW devk_band_sphW devk_band_sphNW docs/results/mixk_W_NW_ign.json
+
+The folder: $FPK_OUT, else runs/fpk. An arm without its own score file is read from the mixture's file (its sides,
+P = half the mixture's pairs).
 """
-import json, sys
+import json, os, sys
 import numpy as np
 from scipy import integrate, special, stats
 
 T, A, B = sys.argv[1], sys.argv[2], sys.argv[3]
-R = "runs/fpk/"
+R = os.environ.get("FPK_OUT", "runs/fpk").rstrip("/") + "/"
 SC = [i for i in range(66) if i != 62]
 Q = [0, 2, 4, 6, 9]
 
@@ -53,8 +56,11 @@ rt, rh = np.load(R + f"score_{T}_raw.npz"), np.load(R + f"score_{T}_h_raw.npz")
 PT = json.load(open(R + f"score_{T}.json"))["scores"][T]["pairs"]
 U = {T: unbiased(rt, T, PT, True)[0], T + "_h": unbiased(rh, T + "_h", PT // 2, True)[0]}
 for arm in (A, B):
-    r = np.load(R + f"score_{arm}_raw.npz")
-    P = json.load(open(R + f"score_{arm}.json"))["scores"][arm]["members"] // 2
+    if os.path.exists(R + f"score_{arm}_raw.npz"):
+        r = np.load(R + f"score_{arm}_raw.npz")
+        P = json.load(open(R + f"score_{arm}.json"))["scores"][arm]["members"] // 2
+    else:   # a side of the mixture, in its file
+        r, P = rt, PT // 2
     U[arm] = unbiased(r, arm, P, False)[0]
     out[f"scorer_ign_{arm}"] = r[f"{arm}__IGN"][:, :, SC].mean((0, 2))[Q].round(4).tolist()
 out["scorer_ign_mix_full_half"] = [rt[f"{T}__IGN"][:, :, SC].mean((0, 2))[Q].round(4).tolist(), rh[f"{T}_h__IGN"][:, :, SC].mean((0, 2))[Q].round(4).tolist()]

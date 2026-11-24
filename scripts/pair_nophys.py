@@ -2,14 +2,25 @@
 IGN and the predicted entropy H (test minus reference), plus the json summaries of both arms.
 
     python scripts/pair_nophys.py devk_band_sphW devk_band_sphNW docs/results/kernel_nophys.json
+    FPK_OUT=runs/fpk_plus python scripts/pair_nophys.py score_plus:devk_band_sph mixkp_plus out.json
+
+An arm is ARM (its own score file score_ARM.json / score_ARM_raw.npz) or FILE:ARM (the arm ARM inside FILE.json /
+FILE_raw.npz, e.g. score_plus of the + chain, or a mixture's file holding its sides). The folder: $FPK_OUT, else
+runs/fpk.
 """
-import json, sys
+import json, os, sys
 import numpy as np
 
-A, B = sys.argv[1], sys.argv[2]   # ref arm (physics), test arm (no physics)
-R = "runs/fpk/"
-ra, rb = np.load(R + f"score_{A}_raw.npz"), np.load(R + f"score_{B}_raw.npz")
-ja, jb = json.load(open(R + f"score_{A}.json")), json.load(open(R + f"score_{B}.json"))
+R = os.environ.get("FPK_OUT", "runs/fpk").rstrip("/") + "/"
+
+
+def src(spec):
+    f, arm = spec.split(":", 1) if ":" in spec else (f"score_{spec}", spec)
+    return np.load(R + f"{f}_raw.npz"), json.load(open(R + f"{f}.json")), arm
+
+
+ra, ja, A = src(sys.argv[1])   # ref arm (physics)
+rb, jb, B = src(sys.argv[2])   # test arm (no physics)
 assert np.array_equal(ra["ics"], rb["ics"])
 TISR_DYN = 62
 sc = [i for i in range(66) if i != TISR_DYN]

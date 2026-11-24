@@ -7,6 +7,11 @@
 
     python scripts/score_mix.py mixk_W_NW core_gngmz8W:devk_band_sphW core_ngmz8W:devk_band_sphNW
     python scripts/score_mix.py mixg_W_NW core_gngmz8W:devflow_gW core_ngmz8W:devflow_gNW --members 4
+    python scripts/score_mix.py mixkp_plus core_u64:devk_band_sph_p core_u64_ng:devk_band_sph_ng_p \
+        --data-root data/era5_1p5 --out runs/fpk_plus --train-range 1984 2015 --device cuda --ic-batch 1
+
+Options it does not know go to ``run_fpk.py score`` of both sides (the data, the folder, the years, the device, the
+IC batch: on the 1.5 deg grid --ic-batch 1, about 10 GB of host memory per IC for the float64 statistics).
 
 Each side is rolled out as its own ``score`` run does (IC batches and members: a deviation kernel its 2 P antithetic
 members, a flow ``--members`` independent ones); side A with the scorer's seed, so its numbers written next to the
@@ -53,7 +58,7 @@ ap.add_argument("--proj", default="", help="a proj_<year>.npz of scripts/diag_pr
                 "climatology + g (.) (mean - climatology), g per lead, channel and band fitted on that file's year for the "
                 "side's core, and its deviations are scaled by the fitted error ratio (the invariant-measure condition)")
 ap.add_argument("--seed-b", type=int, default=1, help="side B's seed = the scorer's + this (0 = the same draws: only to reproduce score_<arm>)")
-A = ap.parse_args()
+A, PASS = ap.parse_known_args()   # the rest goes to ``run_fpk.py score``: --data-root --out --train-range --device --ic-batch ...
 sides = []
 
 
@@ -80,12 +85,13 @@ for spec in (A.a, A.b):
     # their members are correlated pair by pair, and the cross term C, the variance's count and the means' noise
     # are all wrong (measured: CRPS of the half mixture 0.0014 above the full one, 2026-11-24)
     R.main(["score", "--core-tag", ct, "--arms", arm, "--members", str(A.members), "--leads", str(A.leads),
-            "--max-ics", str(A.max_ics), "--threads", str(A.threads)]
+            "--max-ics", str(A.max_ics), "--threads", str(A.threads)] + PASS
            + (["--seed", str(sides[0]["a"].seed + A.seed_b)] if sides else []))
 sa, sb = sides
 if bool(sa["pairs"]) != bool(sb["pairs"]):
     raise SystemExit("two kernels or two flows")
 a0, cl, pa = sa["a"], sa["cl"], sa["pa"]
+dev = torch.device(a0.device)
 te = R.D.load(pa, [a0.test_year])[a0.test_year]
 L = a0.leads
 ics = np.arange(a0.ic_start, len(te) - L, a0.ic_stride)[: a0.max_ics or None]
@@ -192,14 +198,14 @@ t0 = time.time()
 for i in range(0, len(ics), a0.ic_batch):
     j = ics[i:i + a0.ic_batch]
     truth = np.stack([te[k + 1:k + 1 + L][:, dyn] for k in j]).astype(np.float64)
-    tis = torch.from_numpy(np.stack([te[k + 1:k + 1 + L, TISR] for k in j]))
+    tis = torch.from_numpy(np.stack([te[k + 1:k + 1 + L, TISR] for k in j])).to(dev)
     cj = clim_of(j)
     ens = []
     for s in (sa, sb):
         Wm = int(getattr(s["core"], "mem", 0))
-        hist = torch.from_numpy(np.stack([te[np.maximum(np.arange(k - Wm, k), 0)][:, dyn] for k in j])) if Wm else None
+        hist = torch.from_numpy(np.stack([te[np.maximum(np.arange(k - Wm, k), 0)][:, dyn] for k in j])).to(dev) if Wm else None
         with torch.no_grad():
-            ens.append(s["run"](torch.from_numpy(te[j][:, dyn]), torch.tensor(j), tis, hist, s["gen"]).cpu().numpy())
+            ens.append(s["run"](torch.from_numpy(te[j][:, dyn]).to(dev), torch.tensor(j, device=dev), tis, hist, s["gen"]).cpu().numpy())
         if PROJ is not None:
             ens[-1] = readout(ens[-1], cj, *PROJ[len(ens) - 1])
     for b in range(len(j)):

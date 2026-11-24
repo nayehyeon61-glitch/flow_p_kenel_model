@@ -8,7 +8,12 @@
 #   nohup bash scripts/gpu_free.sh bash scripts/run_fpk_plus.sh > runs/fpk_plus/chain.log 2>&1 &
 #   STEPS="data stats" bash scripts/run_fpk_plus.sh       # only these steps (still in the chain's order)
 #   DRYRUN=1 bash scripts/run_fpk_plus.sh                 # print the commands, run nothing
-#   NOPHYS=1 bash scripts/run_fpk_plus.sh                 # the control without G(x): the same chain, tags *_ng
+#   NOPHYS=1 bash scripts/run_fpk_plus.sh                 # the core without G(x): the same chain, tags *_ng
+#
+# The + model is the MIXED kernel under the invariant-measure condition (docs/results/mix_kernel.md; 5.625 deg: CRPS
+# day 10 -5.4 %, z500 733 -> 718): the kernels of the two chains (core with G(x), core without) as one distribution,
+# each kernel's forecast read out under the condition fitted on the validation year. So BOTH chains are run (two GPUs
+# at once, or one after the other); the chain without NOPHYS ends with the mixture's steps once both kernels exist.
 #
 # A step that finished has the marker $OUT/done/<step> (<step>_ng for NOPHYS=1); it is skipped when the chain runs again. The training steps
 # (core, devk1, devk2, flow) save their state at every log step and go on from it after a kill (--resume), so the
@@ -25,6 +30,13 @@
 #         flow    flow matching from the kernel's deviations (straight path)
 #         score   2017, 60 ICs x 8 members, 10 days: persistence, core, both kernels, the flow
 #         report  the per-variable table (RMSE, CRPS, spread / skill, paired bootstrap against the core)
+#  then, in the chain without NOPHYS, when both chains' devk2 are done (it waits for a running NOPHYS chain):
+#         proj    the strength of the condition: both cores' trajectories on the validation year (178 ICs), per lead,
+#                 channel and band (scripts/diag_projection.py stats)
+#         projk   each kernel with its forecast read out under the condition: devk_band_sph_p, devk_band_sph_ng_p
+#         mix     2017: the mixed kernel and the mixed kernel under the condition (scripts/score_mix.py), each with
+#                 both sides
+#         mixrep  the table runs/fpk_plus/mix_plus.md, paired comparisons, the IGN without the member-count bias
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PY=${PY:-python}
@@ -101,9 +113,55 @@ do_smoke() {  # every stage at the full grid and batch, a few iterations, in its
         --e0-spec "$SM/spec.json" $DEVK_ARCH $GPU || return 1
     $FPK devflow $S --tag devflow_s --dev-tag devk_s2 --iters 2 --val-batches 1 --log-every 1 $FLOW_ARCH $GPU || return 1
     $FPK score $S --arms persistence core devk_s2 devflow_s --max-ics 2 --score-tag score_s || return 1
+    # the mixture's steps, with the smoke's one core on both sides
+    $PY scripts/diag_projection.py stats --cores core_s,core_s --year "$VAL" --ic-stride 90 --npz "$SM/proj.npz" \
+        --data-root "$DATA" --out "$SM" $YRS || return 1
+    $FPK projk $S --dev-tag devk_s2 --tag devk_s2_p --proj-init "$SM/proj.npz" || return 1
+    $PY scripts/score_mix.py mix_s core_s:devk_s2 core_s:devk_s2_p --data-root "$DATA" --out "$SM" $YRS \
+        --max-ics 2 --ic-batch 1 || return 1
     echo "== smoke: GPU memory (GB) and seconds of the logged iterations"
     grep -ho '"gpu_gb": [0-9.]*' "$OUT/logs/smoke$SFX.log" | sort -t: -k2 -n | tail -1 || true   # none on the CPU
 }
+
+# the mixed kernel and the condition (both chains' kernels; the folder and the years of this chain)
+CP=core_u64; CN=core_u64_ng; KP=devk_band_sph; KN=devk_band_sph_ng
+RA="--data-root $DATA --out $OUT $YRS"
+PROJ=$OUT/proj_$VAL.npz
+
+do_projk() {
+    local c k
+    for ck in "$CP:$KP" "$CN:$KN"; do
+        c=${ck%%:*}; k=${ck#*:}
+        [ -f "$OUT/${k}_p.pt" ] && continue
+        $FPK projk --data-root "$DATA" --out "$OUT" --core-tag "$c" --dev-tag "$k" --tag "${k}_p" --proj-init "$PROJ" || return 1
+    done
+}
+
+do_mix() {   # one IC at a time: the float64 statistics of a 1.5 deg IC take about 10 GB of host memory
+    $PY scripts/score_mix.py mixk_plus "$CP:$KP" "$CN:$KN" $RA --ic-batch 1 || return 1
+    $PY scripts/score_mix.py mixkp_plus "$CP:${KP}_p" "$CN:${KN}_p" $RA --ic-batch 1
+}
+
+do_mixrep() {
+    export FPK_OUT=$OUT
+    local P="$PY scripts/pair_nophys.py"
+    $P "score_mixk_plus:$KN" score_mixkp_plus:mixkp_plus "$OUT/pair_mixkp_vs_ng.json" > /dev/null || return 1
+    $P "score_mixk_plus:$KP" score_mixkp_plus:mixkp_plus "$OUT/pair_mixkp_vs_phys.json" > /dev/null || return 1
+    $P score_mixk_plus:mixk_plus score_mixkp_plus:mixkp_plus "$OUT/pair_mixkp_vs_mixk.json" > /dev/null || return 1
+    $P "score_mixk_plus:$KN" score_mixk_plus:mixk_plus "$OUT/pair_mixk_vs_ng.json" > /dev/null || return 1
+    $PY scripts/mix_ign.py mixk_plus "$KP" "$KN" "$OUT/mix_ign_mixk.json" > /dev/null || return 1
+    $PY scripts/mix_ign.py mixkp_plus "${KP}_p" "${KN}_p" "$OUT/mix_ign_mixkp.json" > /dev/null || return 1
+    $PY scripts/mix_report.py "$OUT/mix_plus.md" "score_mixk_plus:$KP=kernel, core with G(x)" \
+        "score_mixk_plus:$KN=kernel, core without G(x)" "score_mixkp_plus:${KP}_p=kernel with G(x) + condition" \
+        "score_mixkp_plus:${KN}_p=kernel without G(x) + condition" "score_mixk_plus:mixk_plus=mixed kernel" \
+        "score_mixkp_plus:mixkp_plus=mixed kernel + condition (the + model)" \
+        --pairs "the + model - the kernel without G(x)=$OUT/pair_mixkp_vs_ng.json" \
+        "the + model - the kernel with G(x)=$OUT/pair_mixkp_vs_phys.json" \
+        "the + model - the mixed kernel=$OUT/pair_mixkp_vs_mixk.json" \
+        "the mixed kernel - the kernel without G(x)=$OUT/pair_mixk_vs_ng.json"
+}
+
+mix_ready() { [ -f "$OUT/done/devk2" ] && [ -f "$OUT/done/devk2_ng" ]; }
 
 do_report() {
     $PY scripts/eval_fpk_vars.py "$OUT/score_plus$SFX" --ref core --arms $K1 $K2 $F --out "$OUT/vars_plus$SFX.md" \
@@ -122,3 +180,22 @@ step flow   $FPK devflow $C --tag $F --dev-tag $K2 --iters "$FLOW_ITERS" $FLOW_A
 step score  $FPK score $C --arms persistence core $K1 $K2 $F --score-tag score_plus$SFX
 step report do_report
 echo "[$(date '+%m-%d %H:%M')] chain finished: $OUT/score_plus$SFX.json, $OUT/vars_plus$SFX.md"
+
+# ---- the + model: the mixed kernel under the condition (needs the kernels of both chains)
+[ "${NOPHYS:-0}" = 1 ] && { echo "the mixture's steps run in the chain without NOPHYS (it waits for this one's devk2)"; exit 0; }
+if ! mix_ready && [ "${DRYRUN:-0}" != 1 ] && [ "${MIX_WAIT:-1}" = 1 ] && [ -f "$OUT/logs/core_ng.log" ]; then
+    echo "[$(date '+%m-%d %H:%M')] waiting for the chain without G(x) (done/devk2_ng)"
+    # it waits while that chain writes its logs; 6 hours without a line ends the wait (that chain stopped)
+    while ! mix_ready && [ -n "$(find "$OUT/logs" -name '*_ng.log' -mmin -360 2>/dev/null)" ]; do sleep 600; done
+fi
+if mix_ready || [ "${DRYRUN:-0}" = 1 ]; then
+    step proj   $PY scripts/diag_projection.py stats --cores "$CP,$CN" --year "$VAL" --ic-stride 2 --npz "$PROJ" $RA
+    step projk  do_projk
+    step mix    do_mix
+    step mixrep do_mixrep
+    echo "[$(date '+%m-%d %H:%M')] the + model: $OUT/mix_plus.md, $OUT/score_mixkp_plus.json"
+else
+    echo "the + model (the mixed kernel) needs the kernel of the chain without G(x) too:"
+    echo "  NOPHYS=1 nohup bash scripts/gpu_free.sh bash scripts/run_fpk_plus.sh > $OUT/chain_ng.log 2>&1 &"
+    echo "and, when it is done, this chain again (the finished steps are skipped)."
+fi

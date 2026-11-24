@@ -208,3 +208,37 @@ def test_devk_cli_proj_trains_the_strength_starts_from_a_fit_and_reloads(mcore, 
             R.main(pk + bad)
     with pytest.raises(SystemExit):                                       # not twice
         R.main(pk[:6] + ["--dev-tag", "a_p", "--proj-init", str(tmp_path / "proj.npz"), "--tag", "a_pp"])
+
+
+def test_the_readout_on_the_pole_grid_of_the_plus_version(tmp_path):
+    """On a grid with the poles (as 121 x 240): every band and the grid's rest read out at strength g (all 0.5 here:
+    clim + 0.5 anomaly exactly), the spread readout, and the projection file's band count is the kernel's."""
+    from test_plus import HP, WP, _spec
+    from fpk.devkernel import DevConfig, EntropyDeviationKernel
+    from fpk.sphere import bands
+    from pgcfm.core import static_features
+    from pgcfm.kai_tend import make_core
+    from fpk.env import contract
+    torch.manual_seed(1)
+    lat = np.linspace(-90, 90, HP)
+    lon = np.linspace(0, 360, WP, endpoint=False)
+    contract.register_latitudes(lat)
+    st = static_features(lat, lon, np.random.rand(HP, WP).astype(np.float32), np.random.rand(HP, WP).astype(np.float32))
+    core = make_core(st, np.full(67, 0.3), np.zeros(67), np.ones(67), lat, hidden=8, blocks=(1,), norm="gn").eval()
+    core.pm = None
+    Dk = EntropyDeviationKernel(core, DevConfig(pairs=2, hidden=8, blocks=(1,), smooth=5, noise="sphere", band_scale=True,
+                                                e0_spec=_spec(tmp_path, HP - 2), noise_cells=5, proj=True))
+    assert Dk.sht.L == HP - 2 and Dk.n_bands == bands(HP - 2)[1] and tuple(Dk.g_mean.shape) == (10, 66, Dk.n_bands)
+    cl = (0.5 * np.random.default_rng(0).standard_normal((366, 66, HP, WP))).astype(np.float32)
+    Dk.set_clim(cl)
+    x = torch.randn(2, 66, HP, WP)
+    doy = torch.tensor([3, 200])
+    with torch.no_grad():
+        Dk.g_mean.fill_(math.log(0.5))
+        Dk.g_spread.fill_(math.log(0.9))
+    c = torch.from_numpy(cl[[3, 200]])
+    y = Dk.read(x, doy, 4)
+    assert torch.allclose(y[:, KEPT], (c + 0.5 * (x - c))[:, KEPT], atol=1e-5) and torch.equal(y[:, TISR_DYN], x[:, TISR_DYN])
+    xd, tis = torch.randn(2, 66, HP, WP), torch.zeros(2, 2, HP, WP)
+    ens, ent = Dk.rollout(xd, doy, tis, 2, gen=torch.Generator().manual_seed(1))
+    assert ens.shape == (2, 4, 2, 66, HP, WP) and torch.isfinite(ens).all() and torch.isfinite(ent).all()

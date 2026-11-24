@@ -20,6 +20,10 @@ fitted by least squares on one year and scored on another (the gains never see t
     python scripts/diag_projection.py stats --cores core_gngmz8W,core_ngmz8W --year 2016 --ic-stride 3
     python scripts/diag_projection.py stats --cores core_gngmz8W,core_ngmz8W --year 2017
     python scripts/diag_projection.py fit --fit runs/fpk/proj_2016.npz --test runs/fpk/proj_2017.npz --json docs/results/projection.json
+
+stats: options it does not know go to ``run_fpk.py score`` (the + version: --data-root data/era5_1p5 --out
+runs/fpk_plus --train-range 1984 2015 --device cuda); the file is --npz, else <out>/proj_<years>.npz. The kernels read
+the strengths of such a file with ``run_fpk.py projk`` / ``devk --proj-init`` (a year the kernels were not trained on).
 """
 import argparse
 import json
@@ -34,14 +38,16 @@ import torch
 ap = argparse.ArgumentParser()
 ap.add_argument("mode", choices=["stats", "fit"])
 ap.add_argument("--cores", default="core_gngmz8W,core_ngmz8W")
-ap.add_argument("--year", type=int, nargs="+", default=[2017], help="stats: one year, or several into one file (--out)")
+ap.add_argument("--year", type=int, nargs="+", default=[2017], help="stats: one year, or several into one file (--npz)")
 ap.add_argument("--ic-stride", type=int, default=6)
-ap.add_argument("--out", default="")
+ap.add_argument("--npz", default="", help="stats: the file (default <out>/proj_<years>.npz)")
 ap.add_argument("--fit", default="runs/fpk/proj_2016.npz")
 ap.add_argument("--test", default="runs/fpk/proj_2017.npz")
 ap.add_argument("--json", default="")
 ap.add_argument("--ridge", type=float, default=1e-3, help="relative ridge of the free weights (toward the average of the cores)")
-A = ap.parse_args()
+A, PASS = ap.parse_known_args()
+if PASS and A.mode != "stats":
+    ap.error(f"unrecognized arguments: {' '.join(PASS)}")
 Q = [0, 2, 4, 6, 9]
 
 if A.mode == "stats":
@@ -54,7 +60,7 @@ if A.mode == "stats":
     tags = A.cores.split(",")
     SS, CC, OO, ICS, YR = [], [], [], [], []
     t0 = time.time()
-    am = lambda x: (x * w).mean((-2, -1))  # noqa: E731
+    am = lambda x: (x * w).mean((-2, -1)).cpu()  # noqa: E731
 
     def comps(f):
         """(B, L, 66, H, W) anomaly -> (B, L, 66, nb, H, W): its bands; what the fit of the transform leaves goes to the last."""
@@ -72,8 +78,9 @@ if A.mode == "stats":
 
         R.cmd_score = grab
         for t in tags:
-            R.main(["score", "--core-tag", t, "--arms", "core", "--threads", "4", "--test-year", str(year), "--ic-stride", str(A.ic_stride)])
+            R.main(["score", "--core-tag", t, "--arms", "core", "--threads", "4"] + PASS + ["--test-year", str(year), "--ic-stride", str(A.ic_stride)])
         a0, cl, pa = S[0]["a"], S[0]["cl"], S[0]["pa"]
+        dev = torch.device(a0.device)
         te = R.D.load(pa, [a0.test_year])[a0.test_year]
         L = a0.leads
         ics = np.arange(a0.ic_start, len(te) - L, a0.ic_stride)
@@ -81,39 +88,39 @@ if A.mode == "stats":
         eps = R.rkt().EPS
         cm, cs = cl.mean[dyn][:, None, None], cl.std[dyn][:, None, None] + eps
         w = np.cos(np.deg2rad(cl.lat))
-        w = torch.tensor(w / w.mean(), dtype=torch.float64)[:, None]
-        sht = SHT(cl.lat)
+        w = torch.tensor(w / w.mean(), dtype=torch.float64, device=dev)[:, None]
+        sht = SHT(cl.lat).to(dev)
         bj, nb = bands(sht.L)
-        masks = [(bj == b).float()[:, None] for b in range(nb)]              # (L, 1) over the degree
+        masks = [(bj == b).float().to(dev)[:, None] for b in range(nb)]     # (L, 1) over the degree
         for i in range(0, len(ics), 2):                                       # 2 ICs at a time: X is 12 fields per channel and lead
             j = ics[i:i + 2]
-            truth = torch.from_numpy(np.stack([te[k + 1:k + 1 + L][:, dyn] for k in j]))
-            clim = torch.from_numpy(np.stack([(cl.clim[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] - cm) / cs for k in j]).astype(np.float32))
-            tis = torch.from_numpy(np.stack([te[k + 1:k + 1 + L, R.TISR] for k in j]))
+            truth = torch.from_numpy(np.stack([te[k + 1:k + 1 + L][:, dyn] for k in j])).to(dev)
+            clim = torch.from_numpy(np.stack([(cl.clim[np.minimum(np.arange(k + 1, k + 1 + L), 365)][:, dyn] - cm) / cs for k in j]).astype(np.float32)).to(dev)
+            tis = torch.from_numpy(np.stack([te[k + 1:k + 1 + L, R.TISR] for k in j])).to(dev)
             X = []
             for s in S:
                 core, K = s["core"], s["K"]
                 W = int(getattr(core, "mem", 0))
-                hist = torch.from_numpy(np.stack([te[np.maximum(np.arange(k - W, k), 0)][:, dyn] for k in j])) if W else None
+                hist = torch.from_numpy(np.stack([te[np.maximum(np.arange(k - W, k), 0)][:, dyn] for k in j])).to(dev) if W else None
                 with torch.no_grad():
-                    ens, _ = rollout(lambda x, d, tn: R.core_step(K.core, x, d, tn), torch.from_numpy(te[j][:, dyn]), torch.tensor(j), tis, 1, L,
-                                     hist=hist, start=K.start)
+                    ens, _ = rollout(lambda x, d, tn: R.core_step(K.core, x, d, tn), torch.from_numpy(te[j][:, dyn]).to(dev),
+                                     torch.tensor(j, device=dev), tis, 1, L, hist=hist, start=K.start)
                     X.append(comps(ens[:, 0].float() - clim))
             X = torch.cat(X, 3)                                              # (B, L, 66, n, H, W), n = cores x bands
             o = (truth - clim).double()
             HW, nX = X.shape[-1] * X.shape[-2], X.shape[3]
             Xw = (X * w).reshape(len(j), L * X.shape[2], nX, HW)
-            SS.append(np.stack([(Xw[b] @ X[b].reshape(L * X.shape[2], nX, HW).transpose(1, 2)).reshape(L, X.shape[2], nX, nX).numpy() for b in range(len(j))]) / HW)
+            SS.append(np.stack([(Xw[b] @ X[b].reshape(L * X.shape[2], nX, HW).transpose(1, 2)).reshape(L, X.shape[2], nX, nX).cpu().numpy() for b in range(len(j))]) / HW)
             CC.append(am(X * o[:, :, :, None]).numpy())
             OO.append(am(o * o).numpy())
             print(json.dumps(dict(year=year, ics=int(i + len(j)), sec=round(time.time() - t0), rss_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)), flush=True)
         ICS.append(ics)
         YR.append(np.full(len(ics), year))
         del te, S
-    out = A.out or f"{a0.out}/proj_{'_'.join(str(y) for y in A.year)}.npz"
+    out = A.npz or f"{a0.out}/proj_{'_'.join(str(y) for y in A.year)}.npz"
     np.savez_compressed(out, S=np.concatenate(SS), c=np.concatenate(CC), oo=np.concatenate(OO), ics=np.concatenate(ICS), year=np.concatenate(YR),
                         std=cl.std[dyn], cores=np.array(tags),
-                        nb=nb, band=bj.numpy(), channels=np.array([contract.CHANNEL_NAMES[c] for c in DYN]))
+                        nb=nb, band=bj.cpu().numpy(), channels=np.array([contract.CHANNEL_NAMES[c] for c in DYN]))
     raise SystemExit(0)
 
 # ------------------------------------------------------------------------------------------------------------ fit
