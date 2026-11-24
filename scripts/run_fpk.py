@@ -40,7 +40,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from fpk import data as D  # noqa: E402
-from fpk.env import DYN, TISR, contract, pgfm_args, rkt  # noqa: E402
+from fpk.env import DYN, TISR, TISR_DYN, contract, pgfm_args, rkt  # noqa: E402
 from fpk.ensemble import Scorer, crps_torch, rollout  # noqa: E402
 from fpk.flow import FlowConfig, KernelFlow  # noqa: E402
 from fpk.devflow import DevFlowConfig, DeviationFlow  # noqa: E402,F401
@@ -387,9 +387,14 @@ def cmd_devk(a, rest):
                                                bal_vert=a.bal_vert, fdt=a.fdt, fdt_bmin=a.fdt_bmin,
                                                bal_lmin=a.bal_lmin, aam_fix=a.aam_fix, unet=tuple(a.unet),
                                                unet_reps=a.unet_reps, noise_cells=a.noise_cells,
-                                               eq_kernel=a.eq_kernel, eq_core=a.eq_core, eq_clamp=a.eq_clamp),
+                                               eq_kernel=a.eq_kernel, eq_core=a.eq_core, eq_clamp=a.eq_clamp,
+                                               proj=a.proj),
                                 std=cl.std, eqop=eq_operator(a, a.eq_core)).to(dev)
     net_run(a, Dk)
+    if a.proj:
+        Dk.set_clim(clim_z(cl))
+    elif a.proj_init:
+        raise SystemExit("--proj-init is the start of --proj")
     if a.fdt_weight and not a.fdt:
         raise SystemExit("--fdt-weight needs the climatological band power: --fdt clim_bands.json")
     if a.init:  # start from a fitted kernel (the correction's zero head keeps its forecasts)
@@ -400,6 +405,16 @@ def cmd_devk(a, rest):
             log(dict(init=a.init, fitted_on_core=ck["core_tag"], this_core=a.core_tag))
         if own:  # the options of this run decide the fixed buffers of the balanced noise / fdt, not the checkpoint
             log(dict(init=a.init, buffers_of_this_run_kept=own))
+    if a.proj_init:
+        # the start of the strength: its least-squares value on a year's trajectories of this core, and the spread
+        # follows the error that is left (g_band acts day by day on the chain's deviations: the day's own change)
+        g, kap = proj_fit(a.proj_init, a.core_tag)
+        with torch.no_grad():
+            Dk.g_mean.copy_(torch.log(torch.tensor(g, dtype=torch.float32).clamp(min=0.02)).to(dev))
+            if Dk.cfg.band_scale:
+                lk = np.log(kap)
+                Dk.g_band.add_(torch.tensor(np.diff(lk, axis=0, prepend=0.0), dtype=torch.float32)[:, :, None].to(dev))
+        log(dict(proj_init=a.proj_init, strength=Dk.proj_report(), spread_follows=bool(Dk.cfg.band_scale)))
     Dk.through = a.through
     if a.energy_weight:
         names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
@@ -418,7 +433,9 @@ def cmd_devk(a, rest):
     params = [p_ for p_ in Dk.parameters() if p_.requires_grad]
     cn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_.startswith("cnet.")]
     eqa = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_ == "eq_a"]
-    rest_ = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and not n_.startswith("cnet.") and n_ != "eq_a"]
+    gmn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_ == "g_mean"]
+    rest_ = [p_ for n_, p_ in Dk.named_parameters()
+             if p_.requires_grad and not n_.startswith("cnet.") and n_ not in ("eq_a", "g_mean")]
     cw, cpar, th0, n0, ck_core = {}, [], [], 1.0, None
     if a.core_lr > 0:  # after the kernel's own lists: the core's weights are a group and a clipping of their own
         ck_core = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -434,7 +451,9 @@ def cmd_devk(a, rest):
     opt = torch.optim.AdamW([dict(params=rest_, lr=a.lr)] + ([dict(params=cn, lr=a.lr_correct or a.lr)] if cn else [])
                             + ([dict(params=cpar, lr=a.core_lr, weight_decay=0.0)] if cpar else [])
                             # A of the kernelized equation: 66 numbers from zero, a step of its own (as G-flow's A)
-                            + ([dict(params=eqa, lr=a.lr * a.eq_lr, weight_decay=0.0)] if eqa else []), weight_decay=1e-4)
+                            + ([dict(params=eqa, lr=a.lr * a.eq_lr, weight_decay=0.0)] if eqa else [])
+                            # the strength of the condition: log g per lead, channel and band, from 0 (or --proj-init)
+                            + ([dict(params=gmn, lr=a.lr * a.proj_lr, weight_decay=0.0)] if gmn else []), weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
@@ -454,7 +473,8 @@ def cmd_devk(a, rest):
         xprev = xd
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            i, h_ = Dk.lead_loss(H, xb, e, yd[:, k], w, a.band_weight)  # the band term on e before the detach
+            xm = Dk.read(xb, doy + k + 1, k)  # the forecast (xb itself without --proj); the chain goes on from xb
+            i, h_ = Dk.lead_loss(H, xm, e, yd[:, k], w, a.band_weight)  # the band term on e before the detach
             if a.fdt_weight:  # the spread about the mean stays below the climate's variance, band by band
                 fd = Dk.fdt_penalty(e)
                 i = i + a.fdt_weight * fd
@@ -467,9 +487,9 @@ def cmd_devk(a, rest):
                 i = i + a.energy_weight * F.relu(dE.abs() / sig_E - a.energy_k).pow(2).mean()
             xprev = xb.detach()
             e = e.detach()
-            es.append((xb - yd[:, k]) / Dk.s)
+            es.append((xm - yd[:, k]) / Dk.s)
             vs.append(torch.exp(2 * H))
-            rm.append(float(((((xb - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()).detach()))
+            rm.append(float(((((xm - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()).detach()))
             if not a.through or (k + 1) % a.through == 0:
                 xb = xb.detach()  # the window of the gradient through the chain ends (--through 0: every day)
                 Dk.detach_state()
@@ -558,10 +578,43 @@ def cmd_devk(a, rest):
                      prod_eq=[round(p_[0], 3) for p_ in prod], prod_noise=[round(p_[1], 3) for p_ in prod],
                      r=[round(p_[2], 3) for p_ in prod],
                      h=round(float(Dk.h().mean()), 4), **fdt, **ct, sec=round(time.time() - t0),
-                     **gpu_mem(dev), **({} if Dk.eq_report() is None else dict(eq_a=Dk.eq_report()))))
+                     **gpu_mem(dev), **({} if Dk.eq_report() is None else dict(eq_a=Dk.eq_report())),
+                     **({} if Dk.proj_report() is None else dict(proj=Dk.proj_report()))))
             if a.resume:
                 save_part(a, it, best, Dk, opt, sch, tr)
     end_part(a)
+
+
+def no_proj_flow(Dk, tag):
+    if Dk.cfg.proj:
+        raise SystemExit(f"{tag} reads its mean out (--proj): a flow on it is not wired yet (its centre, condition and "
+                         f"target must be the read-out mean)")
+
+
+def clim_z(cl):
+    """The z-scored daily climatology of the dynamic channels, (366, 66, H, W) float32 (the scorer's clim_of of every
+    day): what a kernel with ``proj`` relaxes its forecast mean to."""
+    dyn = np.asarray(DYN)
+    return ((cl.clim[:, dyn] - cl.mean[dyn][:, None, None]) / (cl.std[dyn][:, None, None] + rkt().EPS)).astype(np.float32)
+
+
+def proj_fit(path, core_tag):
+    """The least-squares strength of the condition of one core from a ``diag_projection.py stats`` file: g (L, 66, nb)
+    per lead, channel and band (mean = climatology + sum_b g_b (xbar - climatology)_b) and kap (L, 66), the RMSE of
+    that mean over the trajectory's own (what the spread has to follow). tisr: 1."""
+    z = np.load(path)
+    cores, nb = [str(x) for x in z["cores"]], int(z["nb"])
+    if core_tag not in cores:
+        raise SystemExit(f"{path} holds the cores {cores}, not {core_tag}")
+    ix = np.arange(cores.index(core_tag) * nb, (cores.index(core_tag) + 1) * nb)
+    S, c, oo = z["S"].mean(0)[:, :, ix][:, :, :, ix], z["c"].mean(0)[:, :, ix], z["oo"].mean(0)
+    k = [i for i in range(S.shape[1]) if i != TISR_DYN]
+    g, kap = np.ones(c.shape), np.ones(oo.shape)
+    g[:, k] = np.linalg.solve(S[:, k], c[:, k][..., None])[..., 0]
+    raw = S.sum((-1, -2)) - 2 * c.sum(-1) + oo
+    new = np.einsum("lci,lcij,lcj->lc", g, S, g) - 2 * (g * c).sum(-1) + oo
+    kap[:, k] = np.sqrt(np.clip(new[:, k] / raw[:, k], 0.25, 1.0))
+    return g, kap
 
 
 def load_devk(a, core, tag):
@@ -575,6 +628,8 @@ def load_devk(a, core, tag):
     Dk = EntropyDeviationKernel(core, DevConfig(**cfg), eqop=eq_operator(a, cfg.get("eq_core", "")))
     miss = Dk.load_state_dict(ck["state"], strict=False)
     assert not miss.unexpected_keys and all(k.startswith("core.") for k in miss.missing_keys), miss
+    if Dk.cfg.proj:
+        Dk.set_clim(clim_z(D.climate(pargs(a))))
     return Dk.to(a.device).eval()
 
 
@@ -718,6 +773,7 @@ def cmd_devflow(a, rest):
     pa, cl, core = load_core(a)
     dev = torch.device(a.device)
     Dk = load_devk(a, core, a.dev_tag)
+    no_proj_flow(Dk, a.dev_tag)
     Fm = build_flow(Dk, DevFlowConfig(hidden=a.hidden, source=a.source, steps=a.steps, path=a.path,
                                       core_steps=a.core_steps, core_sub=a.core_sub, unet=tuple(a.unet),
                                       unet_reps=a.unet_reps, gcond=not a.no_gcond, gmember=a.gmember,
@@ -810,6 +866,7 @@ def load_devflow(a, core, tag, pairs=0):
     if ck.get("core_tag") not in (None, a.core_tag):
         raise SystemExit(f"deviation flow {tag} was trained on core {ck['core_tag']}, not --core-tag {a.core_tag}")
     Dk = load_devk(a, core, ck["dev_tag"])
+    no_proj_flow(Dk, ck["dev_tag"])
     if pairs:
         Dk.cfg.pairs = pairs  # independent members of the forecast (the kernel's parameters do not depend on P)
     cfg = ck["cfg"]
@@ -1418,6 +1475,14 @@ def main(argv=None):
                    help="--eq-kernel: |p_G| <= this x the deviations' local size (soft)")
     d.add_argument("--eq-lr", type=float, default=20.0,
                    help="--eq-kernel: the step size of A as a multiple of --lr")
+    d.add_argument("--proj", action="store_true",
+                   help="the invariant-measure condition (감자 2026-11-24): the forecast mean is read out as climatology + "
+                        "g (.) (xbar - climatology), g = the strength of the condition per lead, channel and band "
+                        "(from 1), learned by the log score; the chain itself is not changed")
+    d.add_argument("--proj-lr", type=float, default=10.0, help="--proj: the step size of log g as a multiple of --lr")
+    d.add_argument("--proj-init", default="",
+                   help="--proj: start g at its least-squares value of this core (a diag_projection.py stats npz of "
+                        "TRAINING years) and move the band scales by the error that is left")
     d.add_argument("--noise-cells", type=int, default=3,
                    help="cells of the smoothed noise (3 = 17 deg at 5.625 deg; 11 = the same at 1.5 deg)")
     d.add_argument("--iters", type=int, default=800)
