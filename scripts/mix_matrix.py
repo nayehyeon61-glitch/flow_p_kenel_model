@@ -18,7 +18,11 @@ Candidates:
                         trajectories of other dates): the empirical-error kernel of that mean
     gdress:TAG[+TAG]    the same mean with Gaussian noise of the errors' standard deviation at every point (lead, channel,
                         grid point): what of dress: is the width map alone, and what the shape of the errors
-    sdress:TAG[+TAG]    dress: with the errors of the same season only (+- --season days)
+    sdress:TAG[+TAG]    dress: with the errors of the same season only (+- --season days; sdress60: = +- 60 days)
+    gsdress:TAG[+TAG]   the season's errors reduced to their width map (Gaussian), as gdress is to dress
+    core:flow@p, @pk, @pklat   with --flow-proj: a deviation flow read on the conditioned mean of its core's *_p kernel
+                        (the flows were trained on the kernels before the condition; this is the read-out of the condition,
+                        as devk --proj is for a kernel). They share the flow's noise: never mix a flow with its own variant.
     core:arm@c{glob,lat,pt}   with --cal-maps: the learned kernel with its deviations from the mean rescaled so that its
                         variance equals the mean's squared error on another year (the second-moment condition
                         E[(y - m)^2] = E[V]), as one factor per lead and channel (cglob), per latitude too (clat) or per
@@ -55,6 +59,12 @@ ap.add_argument("--max-ics", type=int, default=0)
 ap.add_argument("--save-maps", default="", help="write the learned kernels' variance and error maps here (npz)")
 ap.add_argument("--cal-maps", default="", help="maps of another year: add the rescaled variants --cal of the learned kernels found there")
 ap.add_argument("--cal", nargs="*", default=["glob", "lat", "pt"], choices=["glob", "lat", "pt"])
+ap.add_argument("--cache", default="", help="folder of the learned kernels' and flows' members: rolled out and written at the first run, read afterwards "
+                "(<year>_<core>__<arm>_st<stride>_n<ICs>.npy, f16 anomalies at the five leads)")
+ap.add_argument("--flow-proj", action="store_true", help="for a deviation flow whose core also has a conditioned kernel (*_p) here: its members re-centred "
+                "on that kernel's mean (name@p); with --kappa-maps also their deviations scaled so that the second moment equals the mean's "
+                "squared error on another year, one factor per lead and channel (name@pk) or per latitude too (name@pklat)")
+ap.add_argument("--kappa-maps", default="", help="maps of another year (--save-maps of a run with the flows and --flow-proj)")
 ap.add_argument("--threads", type=int, default=4)
 ap.add_argument("--seed", type=int, default=0)
 A, PASS = ap.parse_known_args()
@@ -142,7 +152,7 @@ if "kaf" in A.synth:
     NBR = nz["rows"]
 DRESS, POOL_O, POOL_ROWS, POOL_DOY = {}, None, {}, None
 Zc = [contract.CHANNEL_NAMES[c] for c in DYN].index("z500")
-is_dress = lambda s: s.split(":")[0] in ("dress", "gdress", "sdress")  # noqa: E731
+is_dress = lambda s: s.split(":")[0].rstrip("0123456789") in ("dress", "gdress", "sdress", "gsdress")  # noqa: E731
 if any(is_dress(s) for s in A.synth):
     doy = []
     for y in A.pool:
@@ -165,39 +175,52 @@ for spec in A.synth:
         sf, sff = sf + am(f * oo).sum(0).double(), sff + am(f * f).sum(0).double()
     g = (sf / sff.clamp_min(1e-30)).float().clamp(0.0, 1.5)                                 # (5, 66) the strength
     d = dict(g=g, f=pf.astype(np.float16), cur=[np.load(f"{A.dir}/{A.year}_{t}.npy", mmap_mode="r") for t in tags])
-    if any(x == "gdress:" + spec.split(":", 1)[1] for x in A.synth):                       # the errors' width at every point
-        s2 = 0
-        for i in range(0, len(pf), 32):
-            s2 = s2 + ((f32(POOL_O[i:i + 32]) - g[:, :, None, None] * torch.from_numpy(pf[i:i + 32])) ** 2).sum(0).double()
-        d["sd"] = (s2 / len(pf)).sqrt().float()                                           # (5, 66, H, W)
+    s1, s2 = 0, 0                                                                          # the errors' mean and width at every point
+    for i in range(0, len(pf), 32):
+        r = (f32(POOL_O[i:i + 32]) - g[:, :, None, None] * torch.from_numpy(pf[i:i + 32])).double()
+        s1, s2 = s1 + r.sum(0), s2 + (r ** 2).sum(0)
+    d["bias"] = (s1 / len(pf)).float()                # (5, 66, H, W): the pool's mean error; the kernel's mean is g f + bias
+    d["sd"] = (s2 / len(pf)).sqrt().float()           # gdress: N(g f, sd^2), the second moment of the errors about g f
     DRESS[spec.split(":", 1)[1]] = d
     del pf
     print(json.dumps(dict(dress=spec, pool=int(len(POOL_O)), g_z500=[round(float(v), 3) for v in g[:, Zc]])), flush=True)
 
 
 def synth(spec, k):
-    """Members (M, 5, 66, H, W), the kernel's mean if it is known (else None), kind."""
+    """Members (M, 5, 66, H, W), the kernel's mean if it is known (else None), kind, and the number of atoms of the pool
+    the members are drawn from (0: not a pool; mix_design.py scores an empirical kernel as that finite pool)."""
     if spec == "clim":
         dd = np.abs(a_doy - k)
         cand = a_rows[np.minimum(dd, 365 - dd) <= A.window]
         r = np.sort(rng.choice(cand, M, replace=False))
-        return torch.stack([f32(ARCH[r + l]) for l in LD], 1), torch.zeros(len(Q), C, H, W), "indep"
+        return torch.stack([f32(ARCH[r + l]) for l in LD], 1), torch.zeros(len(Q), C, H, W), "indep", len(cand)
     if spec == "kaf":
         r = np.sort(NBR[ROW[k]][:M])
-        return torch.stack([f32(ARCH[r + l]) for l in LD], 1), None, "atoms"
+        return torch.stack([f32(ARCH[r + l]) for l in LD], 1), None, "atoms", 0
     kind, tag = spec.split(":", 1)
     d = DRESS[tag]
     g = d["g"][:, :, None, None]
     mean = g * sum(f32(x[ROW[k]][Q]) for x in d["cur"]) / len(d["cur"])
     if kind == "gdress":
-        return mean[None] + d["sd"][None] * torch.randn((M,) + tuple(d["sd"].shape), generator=tg), mean, "indep"
-    if kind == "sdress":
+        return mean[None] + d["sd"][None] * torch.randn((M,) + tuple(d["sd"].shape), generator=tg), mean, "indep", 0
+    if kind.startswith(("sdress", "gsdress")):                                                 # sdress60: +- 60 days
+        win = int(kind.lstrip("gsdres") or A.season)
         dd = np.abs(POOL_DOY - k)
-        p = np.sort(rng2.choice(np.nonzero(np.minimum(dd, 365 - dd) <= A.season)[0], M, replace=False))
+        cand = np.nonzero(np.minimum(dd, 365 - dd) <= win)[0]
+        s1, s2 = torch.zeros(len(Q), C, H, W, dtype=torch.float64), torch.zeros(len(Q), C, H, W, dtype=torch.float64)
+        for i in range(0, len(cand), 32):                                                     # the season's mean error and width map
+            r = (f32(POOL_O[cand[i:i + 32]]) - g * f32(d["f"][cand[i:i + 32]])).double()
+            s1, s2 = s1 + r.sum(0), s2 + (r ** 2).sum(0)
+        if kind[0] == "g":                                                                    # Gaussian with that width
+            sd = (s2 / len(cand)).sqrt().float()
+            return mean[None] + sd[None] * torch.randn((M,) + tuple(sd.shape), generator=tg), mean, "indep", 0
+        bias = (s1 / len(cand)).float()
+        p = np.sort(rng2.choice(cand, M, replace=False))
     else:
+        cand, bias = np.arange(len(d["f"])), d["bias"]
         p = np.sort(rng.choice(len(d["f"]), M, replace=False))
     res = f32(POOL_O[p]) - g * f32(d["f"][p])
-    return mean[None] + res, mean, "indep"
+    return mean[None] + res, mean + bias, "indep", len(cand)                                   # the kernel's own mean: with the pool's mean error
 
 
 CAL = {}
@@ -214,13 +237,53 @@ if A.cal_maps:
         print(json.dumps(dict(cal=s["name"], maps_ics=int(cz["n"]), z500_glob=[round(float(v), 3) for v in c["glob"][:, Zc, 0, 0]],
                               z500_lat_min_max=[round(float(c["lat"][-1, Zc].min()), 2), round(float(c["lat"][-1, Zc].max()), 2)],
                               pt_q05_q95_day10=[round(float(v), 2) for v in np.quantile(c["pt"][-1].numpy(), [0.05, 0.95])])), flush=True)
+FLOWP, KAP, DUMP = {}, {}, {}
+if A.flow_proj:
+    for n, s in enumerate(sides):
+        if not s["pairs"]:
+            q = [m for m, t in enumerate(sides) if t["pairs"] and t["a"].core_tag == s["a"].core_tag and t["name"].endswith("_p")]
+            if q:
+                FLOWP[n] = q[0]
+    if A.kappa_maps:
+        kz = np.load(A.kappa_maps)
+        for n, q in FLOWP.items():
+            fn, kn = sides[n]["name"], sides[q]["name"]
+            if "VF::" + fn in kz.files and "E::" + kn in kz.files:
+                VF, Em = torch.from_numpy(kz["VF::" + fn]).double(), torch.from_numpy(kz["E::" + kn]).double()
+                wl = w.double()
+                KAP[n] = dict(pk=((Em * wl).mean((-2, -1), keepdim=True) / (VF * wl).mean((-2, -1), keepdim=True).clamp_min(1e-30)).sqrt().clamp(0.3, 3.0).float(),
+                              pklat=(Em.mean(-1, keepdim=True) / VF.mean(-1, keepdim=True).clamp_min(1e-30)).sqrt().clamp(0.3, 3.0).float())
+                print(json.dumps(dict(kappa=fn, on=kn, maps_ics=int(kz["n"]), z500=[round(float(v), 3) for v in KAP[n]["pk"][:, Zc, 0, 0]],
+                                      mean_day10=round(float(KAP[n]["pk"][-1].mean()), 3))), flush=True)
+
+
+def core_mean(tag, k):
+    """The core's own forecast (anomaly, the five leads) from the dump of diag_cond.py."""
+    if tag not in DUMP:
+        DUMP[tag] = np.load(f"{A.dir}/{A.year}_{tag}.npy", mmap_mode="r")
+    return f32(DUMP[tag][ROW[k]][Q])
+
+
 names = []
-for s in sides:
+for n, s in enumerate(sides):
     names += [s["name"]] + [f"{s['name']}@c{k}" for k, _ in CAL.get(s["name"], [])]
+    if n in FLOWP:
+        names += [f"{s['name']}@p"] + [f"{s['name']}@{k}" for k in KAP.get(n, {})]
 names += list(A.synth)
 K = len(names)
-MAPS = {s["name"]: [0, 0] for s in sides} if A.save_maps else {}
+MAPS = {s["name"]: [0, 0, 0] for s in sides} if A.save_maps else {}
+CACHE = {}
+if A.cache:
+    os.makedirs(A.cache, exist_ok=True)
+    for n, s in enumerate(sides):
+        f = f"{A.cache}/{A.year}_{s['name'].replace(':', '__')}_st{A.ic_stride}_n{len(ics)}.npy"
+        if os.path.exists(f + ".done"):
+            CACHE[n] = ("r", np.load(f, mmap_mode="r"), f)
+        else:
+            CACHE[n] = ("w", np.lib.format.open_memmap(f, mode="w+", dtype=np.float16, shape=(len(ics), 2 * s["pairs"] or M, len(Q), C, H, W)), f)
+    print(json.dumps(dict(cache={s["name"]: CACHE[n][0] for n, s in enumerate(sides)})), flush=True)
 ST = {k: [] for k in ("a", "D", "C", "Mm", "V", "oo")}
+ATOMS = []
 t0 = time.time()
 for i in range(0, len(ics), 2):
     j = ics[i:i + 2]
@@ -228,12 +291,19 @@ for i in range(0, len(ics), 2):
     cj = np.stack([CZ[np.minimum(np.arange(k + 1, k + 1 + L), 365)] for k in j])
     tis = torch.from_numpy(np.stack([te[k + 1:k + 1 + L, TISR] for k in j])).to(dev)
     learned = []
-    for s in sides:
+    for n, s in enumerate(sides):
+        if n in CACHE and CACHE[n][0] == "r":
+            learned.append(f32(CACHE[n][1][i:i + len(j)]))
+            continue
         Wm = int(getattr(s["core"], "mem", 0))
         hist = torch.from_numpy(np.stack([te[np.maximum(np.arange(k - Wm, k), 0)][:, dyn] for k in j])).to(dev) if Wm else None
         with torch.no_grad():
             e = s["model"].rollout(torch.from_numpy(te[j][:, dyn]).to(dev), torch.tensor(j, device=dev), tis, L, hist=hist, gen=s["gen"], **s["kw"])[0]
-        learned.append(e.float().cpu()[:, :, Q] - torch.from_numpy(cj[:, Q])[:, None])           # (B, M, 5, 66, H, W) anomalies
+        x = e.float().cpu()[:, :, Q] - torch.from_numpy(cj[:, Q])[:, None]                        # (B, M, 5, 66, H, W) anomalies
+        if n in CACHE:                                                                             # the same f16 values now and when read back
+            CACHE[n][1][i:i + len(j)] = x.numpy()
+            x = f32(CACHE[n][1][i:i + len(j)])
+        learned.append(x)
     for b, k in enumerate(j):
         y = torch.from_numpy(truth[b][Q] - cj[b][Q])
         X, MU, KIND = [], [], []
@@ -244,12 +314,22 @@ for i in range(0, len(ics), 2):
             X.append(x); MU.append(mu); KIND.append(kind)
             for _, c in CAL.get(s["name"], []):                                                  # the same noise, another width
                 X.append(mu[None] + c[None] * (x - mu[None])); MU.append(mu); KIND.append(kind)
+            if n in FLOWP:                                                                       # the flow read on the conditioned mean
+                dev = x - core_mean(s["a"].core_tag, int(k))[None]
+                mp = learned[FLOWP[n]][b].mean(0)
+                for kk in [None] + list(KAP.get(n, {})):
+                    xv = mp[None] + (dev if kk is None else KAP[n][kk][None] * dev)
+                    X.append(xv); MU.append(xv.mean(0)); KIND.append("sample")
+                if MAPS:
+                    MAPS[s["name"]][2] = MAPS[s["name"]][2] + (dev ** 2).mean(0).double()
             if MAPS:
                 MAPS[s["name"]][0] = MAPS[s["name"]][0] + ((x - mu) ** 2).sum(0).double() / (x.shape[0] - (kind == "sample"))
                 MAPS[s["name"]][1] = MAPS[s["name"]][1] + ((mu - y) ** 2).double() - (((x - mu) ** 2).sum(0).double() / (x.shape[0] - 1) / x.shape[0] if kind == "sample" else 0)
+        atoms = [0] * len(X)
         for spec in A.synth:
-            x, mu, kind = synth(spec, int(k))
-            X.append(x); MU.append(x.mean(0) if mu is None else mu); KIND.append(kind)
+            x, mu, kind, na = synth(spec, int(k))
+            X.append(x); MU.append(x.mean(0) if mu is None else mu); KIND.append(kind); atoms.append(na)
+        ATOMS.append(atoms)
         a_ = torch.stack([am((x - y).abs().mean(0)) for x in X])                                 # (K, 5, 66)
         # the variance inside a kernel; "sample" = independent members and an unknown mean: the unbiased variance, and
         # the noise of the member mean (V / M) leaves the diagonals of C and Mm (E[(m^ - y)^2] = (m - y)^2 + V / M)
@@ -281,8 +361,13 @@ for i in range(0, len(ics), 2):
                           rss_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)), flush=True)
 np.savez_compressed(A.npz, **{k: np.stack(v) for k, v in ST.items()}, names=np.array(names), kinds=np.array(KIND), ics=ics,
                     leads=np.array(LD), std=cl.std[dyn], channels=np.array([contract.CHANNEL_NAMES[c] for c in DYN]),
-                    year=A.year, pool=np.array(A.pool), members=M)
+                    year=A.year, pool=np.array(A.pool), members=M, atoms=np.array(ATOMS))
 if MAPS:
     np.savez_compressed(A.save_maps, n=len(ics), year=A.year, **{f"V::{k}": (v[0] / len(ics)).float().numpy() for k, v in MAPS.items()},
-                        **{f"E::{k}": (v[1] / len(ics)).float().numpy() for k, v in MAPS.items()})
+                        **{f"E::{k}": (v[1] / len(ics)).float().numpy() for k, v in MAPS.items()},
+                        **{f"VF::{k}": (v[2] / len(ics)).float().numpy() for k, v in MAPS.items() if torch.is_tensor(v[2])})
+for n, c in CACHE.items():
+    if c[0] == "w":
+        c[1].flush()
+        open(c[2] + ".done", "w").write(str(len(ics)))
 print("done", K, names, round(time.time() - t0))

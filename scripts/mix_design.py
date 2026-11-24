@@ -22,6 +22,8 @@ ap.add_argument("--test", required=True)
 ap.add_argument("--base", nargs="+", required=True, help="the mixture of now (equal weights)")
 ap.add_argument("--drop", nargs="*", default=[], help="kernels left out of the search")
 ap.add_argument("--sets", nargs="*", default=[], help="mixtures reported in full: kernel names joined by ','")
+ap.add_argument("--infinite-pool", action="store_true", help="score the empirical kernels (dress, sdress, clim) by the fair estimate of distinct members, "
+                "i.e. as if their pool of atoms were infinite; default: as the finite pool they are drawn from")
 ap.add_argument("--json", default="")
 A = ap.parse_args()
 F, T = ({k: v[k] for k in v.files} for v in (np.load(A.fit), np.load(A.test)))      # in memory: an npz reads the file at every access
@@ -33,6 +35,37 @@ SC = [i for i in range(len(ch)) if ch[i] != "tisr"]
 Z = ch.index("z500")
 leads = T["leads"].tolist()
 K, NL = len(names), len(leads)
+
+
+def finite_pool(d):
+    """An empirical kernel is the uniform law on the n atoms of its pool: two independent draws are the same atom with
+    probability 1 / n, so its width E|X - X'| is (1 - 1/n) of the mean distance of two DIFFERENT atoms, which is what
+    members drawn without replacement measure (mix_matrix.py). Without this the kernel is scored as the population its
+    pool was drawn from: a CRPS too good by d_ii / (2 n), which is not small for a pool of one season of one year."""
+    if "atoms" in d:
+        cnt = d["atoms"].astype(float)                                              # (N, K), 0 = not a pool
+    else:                                                                          # the first matrices: the pool of mix_matrix.py's defaults
+        pool, ics, pd = np.atleast_1d(d["pool"]), d["ics"], np.arange(0, 356, 2)
+        cnt = np.zeros((len(ics), K))
+        for i, n in enumerate(names):
+            kind = n.split(":")[0]
+            if kind == "dress":
+                cnt[:, i] = len(pd) * len(pool)
+            elif kind == "sdress":
+                dd = np.abs(pd[None] - ics[:, None])
+                cnt[:, i] = (np.minimum(dd, 365 - dd) <= 45).sum(1) * len(pool)
+            elif n == "clim":
+                cnt[:, i] = 16 * 31
+    for i in range(K):
+        if cnt[:, i].min() > 0:
+            d["D"][:, i, i] *= (1 - 1 / cnt[:, i])[:, None, None]
+    return {names[i]: round(float(cnt[:, i].mean()), 1) for i in range(K) if cnt[:, i].min() > 0}
+
+
+POOLS = {}
+if not A.infinite_pool:
+    POOLS = dict(fit=finite_pool(F), test=finite_pool(T))
+    print("finite pools (atoms):", POOLS)
 use = [i for i, n in enumerate(names) if n not in A.drop]
 
 
@@ -104,7 +137,7 @@ def diff_ci(w, w0):
 base_i = [names.index(b) for b in A.base]
 wb = np.zeros((NL, K))
 wb[:, base_i] = 1.0 / len(base_i)
-out = dict(meta=dict(fit=A.fit, test=A.test, names=names, leads=leads, base=A.base, fit_ics=int(F["a"].shape[0]), test_ics=int(nT)), singles={}, value={}, pairs={})
+out = dict(meta=dict(fit=A.fit, test=A.test, names=names, leads=leads, base=A.base, fit_ics=int(F["a"].shape[0]), test_ics=int(nT), pools=POOLS), singles={}, value={}, pairs={})
 print("leads", leads)
 print(f"{'base mixture':44s}", summary(T, wb))
 out["base"] = summary(T, wb)
