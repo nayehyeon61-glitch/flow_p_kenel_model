@@ -38,6 +38,8 @@ def load(f):
         for i in range(K):
             if cnt[:, i].min() > 0:
                 d["D"][:, i, i] *= (1 - 1 / cnt[:, i])[:, None, None]
+                if "eD" in d:
+                    d["eD"][:, i, i] *= (1 - 1 / cnt[:, i])[:, None, None]
         d["cnt"] = cnt
     return d, names
 
@@ -77,6 +79,20 @@ for f in A.npz:
         q = np.einsum("lp,npqlc,lq->nlc", w, d["D"], w, optimize=True)
         return a - 0.5 * q                                                          # (N, NL, C)
 
+    kinds = [str(x) for x in d["kinds"]] if "kinds" in d else ["pairs"] * len(names)
+    indep = np.array([k in ("indep", "sample") for k in kinds])
+
+    def es_c(w):                                                                    # the energy score (the sphere's L2 norm, per channel)
+        a = np.einsum("lk,nklc->nlc", w, d["ea"])
+        q = np.einsum("lp,npqlc,lq->nlc", w, d["eD"], w, optimize=True)
+        return a - 0.5 * q
+
+    def z_sample(w, m=8):
+        """z500 RMSE of the MEMBER mean of m members shared out by w: an independent member adds its variance / (its count)."""
+        mse = np.einsum("lp,npqlc,lq->nlc", w, d["C"], w, optimize=True).mean(0)[:, Z]
+        noise = np.einsum("lk,nkl->l", w * indep[None], d["V"][..., Z]) / d["V"].shape[0] / m
+        return (np.sqrt(mse + noise) * std[Z]).round(1)
+
     def summ(w):
         m = np.einsum("lp,npqlc,lq->nlc", w, d["C"], w, optimize=True).mean(0)
         diag = np.einsum("nkklc->nklc", d["Mm"])
@@ -112,7 +128,14 @@ for f in A.npz:
             print(f"-- {spec}{tag}")
             print("   diff x1e4 " + "  ".join(f"{x.mean(0)[l] * 1e4:+.1f} [{lo[l] * 1e4:+.1f},{hi[l] * 1e4:+.1f}]" for l in range(NL)))
             print(f"   rel % {(100 * x.mean(0) / cb[:, :, SC].mean((0, 2))).round(2)}  t {t.round(1)}  dates improved % {(100 * (x < 0).mean(0)).round(0)}")
-            print(f"   z500 {z}  ss {s}  nrmse {nr}")
+            print(f"   z500 {z}  ss {s}  nrmse {nr}  | z500 of the mean of 8 drawn members {z_sample(ww)}")
+            if "ea" in d:
+                e0, e1 = es_c(wb)[:, :, SC], es_c(ww)[:, :, SC]
+                xe = (e1 - e0).mean(-1)
+                be = xe[draws].mean(1)
+                lo2, hi2 = np.percentile(be, [2.5, 97.5], axis=0)
+                rel = 100 * xe.mean(0) / e0.mean((0, 2))
+                print("   energy score rel % " + "  ".join(f"{rel[l]:+.2f} [{100 * lo2[l] / e0.mean((0, 2))[l]:+.2f},{100 * hi2[l] / e0.mean((0, 2))[l]:+.2f}]" for l in range(NL)))
             print("   by group % (day 5 | day 10): " + "  ".join(
                 f"{g} {100 * (c - cb)[:, 2, ix].mean() / cb[:, 2, ix].mean():+.2f}|{100 * (c - cb)[:, -1, ix].mean() / cb[:, -1, ix].mean():+.2f}" for g, ix in GRP.items()))
     if A.scan and first is not None:

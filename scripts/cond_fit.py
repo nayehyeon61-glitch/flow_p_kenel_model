@@ -12,6 +12,17 @@ anomalies (fields of scripts/diag_cond.py); theta per lead and channel by least 
     bias       a constant field per lead (spherical harmonics l <= 4): the drift of the model and the climate trend
     geo        the strength as a smooth field on the sphere: bands x spherical harmonics l <= lg (storm tracks, land)
     prev       the forecast of the day before, banded (a filter in the lead)
+    lagK       the lagged forecasts: the cores' average started 1 .. K days earlier, at the same verifying day (lead + k),
+               banded (needs dumps of every day, --ic-stride 1, and lead + K inside the dump; the first K starts are dropped
+               for every candidate, and the interval is a block bootstrap, --block)
+    clim16     the mean of the invariant measure itself: the daily climatology of the 16 training years (the record of
+               scripts/mix_matrix.py, +-15 days) minus the climatology in use, at the verifying day, banded
+    trend      the drift of that climatology: the linear trend of the 16 years per day of the year (+-45 days) times the
+               years from their centre to the year of the forecast, banded
+    pastN      the mean of the last N days up to the start (the slow background), banded; needs dumps of every day
+    nl         a strength that depends on the size of the forecast anomaly: f |f| per band
+    regime     a strength that depends on the state of the flow: bands x the forecast's z500 over the two polar caps
+               and the tropics (annular modes, the tropical mean)
     math       the mathematical cores of math_core.py (--math lim,kaf), banded: one weight per core and band
     level      the other variables at the same level, banded (z, t, u, v, q): balance between the fields
     vert       the same variable at the neighbouring levels, banded
@@ -50,12 +61,17 @@ ap.add_argument("--zones", type=float, nargs="+", default=[-90, -45, 0, 45, 90],
 ap.add_argument("--lb", type=int, default=4, help="bias: degrees l <= lb")
 ap.add_argument("--lg", type=int, default=2, help="geo: the strength as a field of degree l <= lg")
 ap.add_argument("--max-ics", type=int, default=0)
+ap.add_argument("--block", type=int, default=0, help="block length (ICs) of the bootstrap; 0: 1, or 15 with lagged forecasts")
 ap.add_argument("--json", default="")
 ap.add_argument("--save-theta", default="")
 A = ap.parse_args()
 torch.set_num_threads(A.threads)
 CORES = A.cores.split(",")
 CW, CN = CORES[0], CORES[1]
+PARTS = [p for e in A.exps for p in e.split("+")]
+NLAG = max([int(p[3:] or 1) for p in PARTS if p.startswith("lag")] + [0])
+PAST = sorted({int(p[4:]) for p in PARTS if p.startswith("past")})
+KLAG = max([NLAG] + [n - 1 for n in PAST])                                        # the first starts that are dropped
 MATH = [t for t in A.math.split(",") if t]
 YEARS = list(dict.fromkeys(A.fit + [A.test]))
 
@@ -68,6 +84,7 @@ def load(y):
         if os.path.exists(f"{A.dir}/{y}_{t}.npy"):                                    # other dumps may be linked in
             d[t] = np.load(f"{A.dir}/{y}_{t}.npy", mmap_mode="r")
     d["n"] = min(len(d["ics"]), A.max_ics or 10 ** 9)
+    assert not KLAG or np.all(np.diff(d["ics"]) == 1), "lagged forecasts need a dump of every day"
     return d
 
 
@@ -139,6 +156,39 @@ YLM = torch.stack(Y)                                                            
 NG = (A.lg + 1) ** 2                                                                   # geo: the fields l <= lg
 
 
+C16 = TR = None
+if "clim16" in PARTS or "trend" in PARTS:                                                                 # the 16 years' daily mean anomaly, +-15 days
+    am = json.load(open(f"{A.dir}/archive_meta.json"))
+    arc = np.load(f"{A.dir}/archive_anom.npy", mmap_mode="r")
+    acc, cnt, s0 = np.zeros((366, C, H, W), dtype=np.float64), np.zeros(366), 0
+    for nd in am["days"]:
+        acc[:nd] += np.asarray(arc[s0:s0 + nd], dtype=np.float32)
+        cnt[:nd] += 1
+        s0 += nd
+
+    def window(x, n, pad):                                                            # the mean over +-pad days of the year
+        ext = np.concatenate([x[-pad:], x, x[:pad]])
+        cex = np.concatenate([n[-pad:], n, n[:pad]])
+        cs_, cc_ = np.cumsum(np.concatenate([np.zeros_like(ext[:1]), ext]), 0), np.cumsum(np.concatenate([[0.0], cex]))
+        return ((cs_[2 * pad + 1:] - cs_[:-2 * pad - 1]) / (cc_[2 * pad + 1:] - cc_[:-2 * pad - 1])[:, None, None, None]).astype(np.float32)
+
+    C16 = window(acc, cnt, 15)
+    print(json.dumps(dict(clim16_rms_z500=float(np.sqrt((C16[:, Z] ** 2 * w.numpy()).mean())))), flush=True)
+    if "trend" in PARTS:                                                              # least squares slope per year, +-45 days
+        yc = float(np.mean(am["years"]))
+        acc[:], s0, cw = 0, 0, np.zeros(366)
+        for yy, nd in zip(am["years"], am["days"]):
+            acc[:nd] += (yy - yc) * np.asarray(arc[s0:s0 + nd], dtype=np.float32)
+            cw[:nd] += (yy - yc) ** 2
+            s0 += nd
+        TR, TRC = window(acc, cw, 45), yc
+        print(json.dumps(dict(trend_rms_z500_per_decade=float(10 * np.sqrt((TR[:, Z] ** 2 * w.numpy()).mean())))), flush=True)
+    del acc
+CAPS = [torch.tensor(((lat >= 60) / max((lat >= 60).mean(), 1e-9)), dtype=torch.float32)[:, None] * w,
+        torch.tensor(((lat <= -60) / max((lat <= -60).mean(), 1e-9)), dtype=torch.float32)[:, None] * w,
+        torch.tensor(((np.abs(lat) <= 20) / max((np.abs(lat) <= 20).mean(), 1e-9)), dtype=torch.float32)[:, None] * w]
+
+
 def season(doy, k=1):
     ph = 2 * math.pi * doy / 365.25
     return torch.tensor(np.stack([np.ones_like(ph)] + sum([[np.cos(j * ph), np.sin(j * ph)] for j in range(1, k + 1)], []), 1),
@@ -178,6 +228,18 @@ def extra(name, P):
         return (YLM[1:NG, None] * Bm[:, :, None]).flatten(2, 3)
     if name == "prev":
         return P["Bp"]
+    if name.startswith("lag"):
+        return torch.cat([P["Bl"][k] for k in range(int(name[3:] or 1))], 2)
+    if name.startswith("past"):
+        return P["Bpast"][int(name[4:])]
+    if name == "clim16":
+        return P["Bc16"]
+    if name == "trend":
+        return P["Btr"]
+    if name == "nl":
+        return Bm * Bm.abs()
+    if name == "regime":
+        return (P["idx"][:, None, :, None, None, None] * Bm[:, :, None]).flatten(2, 3)
     if name == "level":
         return gather(Bm, lev_map[:, 1:])
     if name == "vert":
@@ -210,13 +272,26 @@ def pieces(d, idx, L):
         P["Dt"] = Ds / torch.as_tensor(DBAR[L], dtype=torch.float32)[None, :, None, None]
     if any("prev" in e for e in A.exps):
         P["Bp"] = banded(sum(get(t, L - 1) for t in CORES) / len(CORES) if L else torch.from_numpy(np.asarray(d["x0"][idx], dtype=np.float32)))
+    if NLAG:                                                                          # started k days earlier, lead + k
+        P["Bl"] = [banded(sum(torch.from_numpy(np.asarray(d[t][idx - k, L + k], dtype=np.float32)) for t in CORES) / len(CORES))
+                   for k in range(1, NLAG + 1)]
+    if PAST:                                                                          # the mean of the last N days up to the start
+        P["Bpast"] = {n: banded(torch.from_numpy(np.stack([np.asarray(d["x0"][i - n + 1:i + 1], dtype=np.float32).mean(0) for i in idx])))
+                      for n in PAST}
+    if "clim16" in PARTS:
+        P["Bc16"] = banded(torch.from_numpy(C16[np.minimum(d["ics"][idx] + L + 1, 365)]))
+    if "trend" in PARTS:
+        P["Btr"] = banded(torch.from_numpy(TR[np.minimum(d["ics"][idx] + L + 1, 365)])) * (d["meta"]["year"] - TRC)
+    if "regime" in PARTS:
+        z = fm[:, Z]                                                                  # (B, H, W)
+        P["idx"] = torch.stack([(z * CAP).mean((-2, -1)) for CAP in CAPS], 1)        # (B, 3)
     if any("persist" in e for e in A.exps):
         P["B0"] = banded(torch.from_numpy(np.asarray(d["x0"][idx], dtype=np.float32)))
     return P, torch.from_numpy(np.asarray(d["o"][idx, L], dtype=np.float32))
 
 
 def batches(d):
-    for i in range(0, d["n"], A.batch):
+    for i in range(KLAG, d["n"], A.batch):
         yield np.arange(i, min(i + A.batch, d["n"]))
 
 
@@ -284,8 +359,10 @@ for day in A.days:
     nr = lambda m: float(np.sqrt(m.mean(0))[SC].mean())  # noqa: E731
     ref = MSE["bands"][(A.test, "all")] if "bands" in MSE else None
     rng = np.random.default_rng(0)
-    nT = D[A.test]["n"]
-    draws = rng.integers(0, nT, size=(2000, nT))
+    nT = D[A.test]["n"] - KLAG
+    blk = A.block or (15 if KLAG else 1)                                              # daily starts are not independent
+    nB = nT // blk
+    draws = (rng.integers(0, nB, size=(2000, nB))[:, :, None] * blk + np.arange(blk)).reshape(2000, -1)
     for e in A.exps:
         mt, m0 = MSE[e][(A.test, "all")], MSE[e][(A.test, "f0")]
         r = dict(K=int(TH[e]["all"].shape[1]), z500=rz(mt, Z), z500_fit2016=rz(m0, Z), t850=rz(mt, ch.index("t850")),

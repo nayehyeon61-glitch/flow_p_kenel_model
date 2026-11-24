@@ -20,6 +20,10 @@ Candidates:
                         grid point): what of dress: is the width map alone, and what the shape of the errors
     sdress:TAG[+TAG]    dress: with the errors of the same season only (+- --season days; sdress60: = +- 60 days)
     gsdress:TAG[+TAG]   the season's errors reduced to their width map (Gaussian), as gdress is to dress
+    bgsdress:TAG[+TAG]  gsdress: about the mean + the season's mean error, with the errors' standard deviation about it: the
+                        season's first and second moments at every point, without the shape of the errors
+    asdress:TAG[+TAG]   sdress: in antithetic pairs, mean +- (e - the season's mean error): the member mean is the kernel's
+                        mean exactly (as for a learned kernel's pairs), the odd moments of the errors are given up
     core:flow@p, @pk, @pklat   with --flow-proj: a deviation flow read on the conditioned mean of its core's *_p kernel
                         (the flows were trained on the kernels before the condition; this is the read-out of the condition,
                         as devk --proj is for a kernel). They share the flow's noise: never mix a flow with its own variant.
@@ -118,6 +122,8 @@ am = lambda x: (x * w).mean((-2, -1))  # noqa: E731
 rng = np.random.default_rng(A.seed + 100)
 rng2 = np.random.default_rng(A.seed + 200)             # the kernels added later draw apart, so the first ones keep their members
 tg = torch.Generator().manual_seed(A.seed + 300)
+rng3 = np.random.default_rng(A.seed + 400)
+tg2 = torch.Generator().manual_seed(A.seed + 500)
 M = A.members
 meta = json.load(open(f"{A.dir}/{A.year}_meta.json"))
 ROW = {k: i for i, k in enumerate(meta["ics"])}
@@ -152,7 +158,7 @@ if "kaf" in A.synth:
     NBR = nz["rows"]
 DRESS, POOL_O, POOL_ROWS, POOL_DOY = {}, None, {}, None
 Zc = [contract.CHANNEL_NAMES[c] for c in DYN].index("z500")
-is_dress = lambda s: s.split(":")[0].rstrip("0123456789") in ("dress", "gdress", "sdress", "gsdress")  # noqa: E731
+is_dress = lambda s: s.split(":")[0].rstrip("0123456789") in ("dress", "gdress", "sdress", "gsdress", "asdress", "bgsdress")  # noqa: E731
 if any(is_dress(s) for s in A.synth):
     doy = []
     for y in A.pool:
@@ -203,8 +209,8 @@ def synth(spec, k):
     mean = g * sum(f32(x[ROW[k]][Q]) for x in d["cur"]) / len(d["cur"])
     if kind == "gdress":
         return mean[None] + d["sd"][None] * torch.randn((M,) + tuple(d["sd"].shape), generator=tg), mean, "indep", 0
-    if kind.startswith(("sdress", "gsdress")):                                                 # sdress60: +- 60 days
-        win = int(kind.lstrip("gsdres") or A.season)
+    if kind.startswith(("sdress", "gsdress", "asdress", "bgsdress")):                          # sdress60: +- 60 days
+        win = int(kind.lstrip("abgsdres") or A.season)
         dd = np.abs(POOL_DOY - k)
         cand = np.nonzero(np.minimum(dd, 365 - dd) <= win)[0]
         s1, s2 = torch.zeros(len(Q), C, H, W, dtype=torch.float64), torch.zeros(len(Q), C, H, W, dtype=torch.float64)
@@ -215,6 +221,13 @@ def synth(spec, k):
             sd = (s2 / len(cand)).sqrt().float()
             return mean[None] + sd[None] * torch.randn((M,) + tuple(sd.shape), generator=tg), mean, "indep", 0
         bias = (s1 / len(cand)).float()
+        if kind[0] == "b":                                                                    # Gaussian about mean + the season's mean error
+            sd = (s2 / len(cand) - (s1 / len(cand)) ** 2).clamp_min(0).sqrt().float()
+            return mean[None] + bias[None] + sd[None] * torch.randn((M,) + tuple(sd.shape), generator=tg2), mean + bias, "indep", 0
+        if kind[0] == "a":                                                                    # antithetic pairs: mean +- (e - its mean)
+            p = np.sort(rng3.choice(cand, M // 2, replace=False))
+            res = f32(POOL_O[p]) - g * f32(d["f"][p]) - bias[None]
+            return torch.cat([mean[None] + bias[None] + res, mean[None] + bias[None] - res]), mean + bias, "apool", -len(cand)
         p = np.sort(rng2.choice(cand, M, replace=False))
     else:
         cand, bias = np.arange(len(d["f"])), d["bias"]
@@ -282,7 +295,8 @@ if A.cache:
         else:
             CACHE[n] = ("w", np.lib.format.open_memmap(f, mode="w+", dtype=np.float16, shape=(len(ics), 2 * s["pairs"] or M, len(Q), C, H, W)), f)
     print(json.dumps(dict(cache={s["name"]: CACHE[n][0] for n, s in enumerate(sides)})), flush=True)
-ST = {k: [] for k in ("a", "D", "C", "Mm", "V", "oo")}
+ST = {k: [] for k in ("a", "D", "C", "Mm", "V", "oo", "ea", "eD")}
+nrm = lambda z: am(z * z).sqrt()  # noqa: E731   (..., 5, 66): the L2 norm of a field over the sphere (the energy score's distance)
 ATOMS = []
 t0 = time.time()
 for i in range(0, len(ics), 2):
@@ -325,12 +339,15 @@ for i in range(0, len(ics), 2):
             if MAPS:
                 MAPS[s["name"]][0] = MAPS[s["name"]][0] + ((x - mu) ** 2).sum(0).double() / (x.shape[0] - (kind == "sample"))
                 MAPS[s["name"]][1] = MAPS[s["name"]][1] + ((mu - y) ** 2).double() - (((x - mu) ** 2).sum(0).double() / (x.shape[0] - 1) / x.shape[0] if kind == "sample" else 0)
-        atoms = [0] * len(X)
+        atoms, APOOL = [0] * len(X), {}
         for spec in A.synth:
             x, mu, kind, na = synth(spec, int(k))
+            if na < 0:                                   # "apool": - (the dates of its pool); its width is made exact below
+                APOOL[len(X)], na = -na, 0
             X.append(x); MU.append(x.mean(0) if mu is None else mu); KIND.append(kind); atoms.append(na)
         ATOMS.append(atoms)
         a_ = torch.stack([am((x - y).abs().mean(0)) for x in X])                                 # (K, 5, 66)
+        ea_ = torch.stack([nrm(x - y).mean(0) for x in X])                                       # E||X - y|| per lead and channel
         # the variance inside a kernel; "sample" = independent members and an unknown mean: the unbiased variance, and
         # the noise of the member mean (V / M) leaves the diagonals of C and Mm (E[(m^ - y)^2] = (m - y)^2 + V / M)
         V = torch.stack([am(((x - mu) ** 2).sum(0)) / (x.shape[0] - (kind == "sample")) for x, mu, kind in zip(X, MU, KIND)])
@@ -341,21 +358,33 @@ for i in range(0, len(ics), 2):
             if KIND[p] == "sample":
                 Cc[p, p] -= V[p] / X[p].shape[0]
                 Mm[p, p] -= V[p] / X[p].shape[0]
-        D = torch.zeros(K, K, len(Q), C)
+        D, eD = torch.zeros(K, K, len(Q), C), torch.zeros(K, K, len(Q), C)
         for p in range(K):
             for q in range(p, K):
-                tot = sum((x[None] - X[q]).abs().sum(0) for x in X[p])                           # sum over all pairs
+                tot, tot2 = 0, 0                                                                  # sums over all pairs: |.| and ||.||
+                for x in X[p]:
+                    df = x[None] - X[q]
+                    tot, tot2 = tot + df.abs().sum(0), tot2 + nrm(df).sum(0)
                 n_p, n_q = X[p].shape[0], X[q].shape[0]
                 if p != q:
                     D[p, q] = D[q, p] = am(tot / (n_p * n_q))
+                    eD[p, q] = eD[q, p] = tot2 / (n_p * n_q)
                 elif KIND[p] == "atoms":                                                          # the kernel IS these atoms
-                    D[p, p] = am(tot / (n_p * n_p))
-                elif KIND[p] == "pairs":                                                          # not the antithetic partners
+                    D[p, p], eD[p, p] = am(tot / (n_p * n_p)), tot2 / (n_p * n_p)
+                elif KIND[p] in ("pairs", "apool"):                                               # not the antithetic partners
                     P = n_p // 2
-                    D[p, p] = am((tot - 2 * (X[p][:P] - X[p][P:]).abs().sum(0)) / (n_p * (n_p - 2)))
+                    pd = X[p][:P] - X[p][P:]
+                    D[p, p] = am((tot - 2 * pd.abs().sum(0)) / (n_p * (n_p - 2)))
+                    eD[p, p] = (tot2 - 2 * nrm(pd).sum(0)) / (n_p * (n_p - 2))
+                    if KIND[p] == "apool":
+                        # the uniform law on n dates x 2 signs, exactly: two draws are the same date with probability 1 / n,
+                        # and then the same atom (distance 0) or its partner, half and half
+                        n = APOOL[p]
+                        D[p, p] = (1 - 1 / n) * D[p, p] + am(pd.abs().mean(0)) / (2 * n)
+                        eD[p, p] = (1 - 1 / n) * eD[p, p] + nrm(pd).mean(0) / (2 * n)
                 else:
-                    D[p, p] = am(tot / (n_p * (n_p - 1)))
-        for key, v in (("a", a_), ("D", D), ("C", Cc), ("Mm", Mm), ("V", V), ("oo", am(y * y))):
+                    D[p, p], eD[p, p] = am(tot / (n_p * (n_p - 1))), tot2 / (n_p * (n_p - 1))
+        for key, v in (("a", a_), ("D", D), ("C", Cc), ("Mm", Mm), ("V", V), ("oo", am(y * y)), ("ea", ea_), ("eD", eD)):
             ST[key].append(v.double().numpy())
     print(json.dumps(dict(year=A.year, ics=int(i + len(j)), of=len(ics), sec=round(time.time() - t0),
                           rss_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)), flush=True)
