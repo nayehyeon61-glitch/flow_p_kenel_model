@@ -916,7 +916,8 @@ def cmd_devtune(a, rest):
     nothing of them is logged here (score and diag_spectra of the tuned pair show them). The gradient is taken in two stages (the chain rule): the flow's part hangs on leaves of the
     day's xbar, e and H, every backward pass of the score (also --chunk's) adds to their gradients g, and one
     backward pass of kernel_lam K_L / D + <g, (xbar, e, H)> goes through the kernel's day. The kernel's parameters
-    are an optimizer group of their own (lr LR, weight decay 1e-4 as in devk) with their own clipping (norm 1); the
+    are an optimizer group of their own (lr LR, weight decay 1e-4 as in devk) with their own clipping (norm 1), and
+    the kernelized equation's A (--eq-kernel) one more (lr LR x --eq-lr, no weight decay, as in devk; logged as eq_a); the
     kernel stays in eval mode as in every flow training (its networks have no mode: GroupNorm, no Dropout). The
     graph of a kernel day (its two small networks on the batch, the band transforms of the deviations) is not in
     graph_gb.
@@ -936,7 +937,7 @@ def cmd_devtune(a, rest):
     dev = torch.device(a.device)
     Fm = net_run(a, load_devflow(a, core, a.flow_tag))
     Dk = Fm.dk
-    kt, kpar, bw, ck_k, dev0 = a.kernel_lr > 0, [], 0.0, None, Fm.meta["dev_tag"]
+    kt, knet, keq, bw, ck_k, dev0 = a.kernel_lr > 0, [], [], 0.0, None, Fm.meta["dev_tag"]
     if a.kernel_lr < 0 or (not kt and (a.kernel_out or a.kernel_band_weight >= 0)):
         raise SystemExit("--kernel-out / --kernel-band-weight belong to --kernel-lr LR > 0 (the kernel is frozen without it)")
     if kt:
@@ -951,9 +952,14 @@ def cmd_devtune(a, rest):
             (ck_k.get("tune") or ck_k.get("train") or {}).get("band_weight", 0.5 if Dk.cfg.band_scale else 0.0))
         if bw and not hasattr(Dk, "sht"):
             raise SystemExit("--kernel-band-weight > 0: this kernel has no spherical transform (no band score)")
-        kpar = list(Dk.own_parameters().values())
-        for p_ in kpar:  # frozen by the flow's constructor; the core's weights stay frozen
+        kown = Dk.own_parameters()
+        for p_ in kown.values():  # frozen by the flow's constructor; the core's weights stay frozen
             p_.requires_grad_(True)
+        # the kernelized equation's A (--eq-kernel): its own group, as in devk (lr x --eq-lr, no weight decay), so the
+        # flow's score moves how much the kernel follows the equation, not only the nets that read it
+        knet = [p_ for n_, p_ in kown.items() if n_ != "eq_a"]
+        keq = [p_ for n_, p_ in kown.items() if n_ == "eq_a"]
+    kpar = knet + keq
     if a.members > Dk.cfg.pairs:
         Dk.cfg.pairs = a.members  # more independent sources (the kernel's parameters do not depend on P)
     P = Dk.cfg.pairs
@@ -985,7 +991,8 @@ def cmd_devtune(a, rest):
     w = D.area_weights(cl.lat).to(dev)
     params = list(Fm.net.parameters())
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4) if not kt else torch.optim.AdamW(
-        [dict(params=params, lr=a.lr), dict(params=kpar, lr=a.kernel_lr)], weight_decay=1e-4)
+        [dict(params=params, lr=a.lr), dict(params=knet, lr=a.kernel_lr)]
+        + ([dict(params=keq, lr=a.kernel_lr * a.eq_lr, weight_decay=0.0)] if keq else []), weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     dyn = torch.tensor(DYN)
     vx = [vr(a.batch) for _ in range(a.val_batches)]
@@ -1096,7 +1103,8 @@ def cmd_devtune(a, rest):
     log(dict(devtune_val_start=v0, scale=rd(scale), norm=a.norm, members=M, pairs=P, flow=a.flow_tag,
              path=Fm.cfg.path, lam=a.lam, steps=n_tr, val_steps=n_va, graph_units=units, graph_gb=round(gb, 2),
              **(dict(kernel=dev0, kernel_out=a.kernel_out, kernel_lr=a.kernel_lr, kernel_lam=a.kernel_lam,
-                     kernel_band_weight=bw, kernel_params=sum(p_.numel() for p_ in kpar)) if kt else {})))
+                     kernel_band_weight=bw, kernel_params=sum(p_.numel() for p_ in kpar),
+                     **(dict(kernel_eq_lr=a.kernel_lr * a.eq_lr, eq_a=Dk.eq_report()) if keq else {})) if kt else {})))
     for it in range(1, a.iters + 1):
         opt.zero_grad()
         r = run(tr(a.batch), train=True)
@@ -1112,7 +1120,8 @@ def cmd_devtune(a, rest):
                 save()
             log(dict(it=it, es=rd(r[:, 0] / scale), anchor=round(float(r[:, 1].mean()), 4),
                      **(dict(kernel_anchor=round(float(r[:, 12].mean()), 4)) if kt else {}),
-                     **{"val_" + k: q for k, q in v.items()}, best=round(best, 4), sec=round(time.time() - t0)))
+                     **{"val_" + k: q for k, q in v.items()}, best=round(best, 4), sec=round(time.time() - t0),
+                     **(dict(eq_a=Dk.eq_report()) if kt and keq else {})))
 
 
 # ---------------------------------------------------------------------------------------------------------- tune
@@ -1505,6 +1514,9 @@ def main(argv=None):
     dt.add_argument("--kernel-out", default="",
                     help="--kernel-lr: tag of the tuned kernel's checkpoint (default <the flow's kernel>_j); never the "
                          "kernel's own. The tuned flow is recorded on it")
+    dt.add_argument("--eq-lr", type=float, default=20.0,
+                    help="--kernel-lr with a kernel of --eq-kernel: the step size of the equation's A as a multiple of "
+                         "--kernel-lr (as devk's --eq-lr; 1 = the nets' step)")
     dt.add_argument("--kernel-band-weight", type=float, default=-1.0,
                     help="--kernel-lr: the band weight of the kernel's anchor; < 0 (default) = the one stored with the "
                          "kernel's training options, else 0.5 for a kernel with band_scale and 0 without")
