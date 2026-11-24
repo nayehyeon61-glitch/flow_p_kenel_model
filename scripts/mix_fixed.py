@@ -1,6 +1,6 @@
 """Fixed-weight mixtures on the two held-out years (no fitting): CRPS change to the base per lead with a bootstrap interval,
 z500 of the mean, spread / skill, the change by variable group, and a scan of the clim share on top.
-  python final_tab.py A.npz B.npz --mix "W_p=0.3,NW_p=0.3,sdress45=0.4" [--clim 0,0,0,0.05,0.1] [--scan clim]
+  python scripts/mix_fixed.py A.npz B.npz --mix "W_p=0.3,NW_p=0.3,sdress45=0.4" [--clim 0,0,0,0.05,0.1] [--scan clim]
 Names are matched by substring (the first kernel whose name contains the key and no '@' unless the key has one)."""
 import argparse
 import numpy as np
