@@ -52,6 +52,29 @@ averages of one core give nothing (735 → 736).
   number. (The corrected IGN of the single arms: physics 0.462 / 1.036 / 1.243 / 1.354 / 1.439, no physics
   0.498 / 1.058 / 1.256 / 1.366 / 1.441; the mixture 0.440–0.460 / 1.006–1.025 / 1.206–1.223 / 1.315–1.329 / 1.390–1.404.)
 
+### The same mixture of the two G-flows (`devflow_gW`, `devflow_gNW`)
+
+`scripts/score_mix.py mixg_W_NW core_gngmz8W:devflow_gW core_ngmz8W:devflow_gNW --members 4`: 4 + 4 independent members,
+the scorer's 8 (`runs/fpk/score_mixg_W_NW*`). The 8-member mean carries the members' noise (z500 day 10: 776), so the
+mean is given as the estimate for infinitely many members, mse − (the mean's sampling variance).
+
+| | 1 | 3 | 5 | 7 | 10 |
+| --- | --- | --- | --- | --- | --- |
+| CRPS, G-flow physics / no physics (8 members) | 0.0967 / 0.0995 | 0.1687 / 0.1681 | 0.2052 / 0.2046 | 0.2266 / 0.2257 | 0.2413 / 0.2397 |
+| **CRPS, mixed G-flow** | **0.0948** | **0.1634** | **0.2006** | **0.2218** | **0.2362** |
+| CRPS diff vs the no-physics G-flow | **−0.0047** | **−0.0047** | **−0.0040** | **−0.0039** | **−0.0035** [−0.0052, −0.0019] |
+| CRPS diff vs the mixed kernel | −0.0001 | +0.0003 | +0.0005 | 0.0000 | −0.0007 [−0.0017, +0.0003] |
+| z500 RMSE∞, mixed G-flow | 150.6 | 387.0 | 557.9 | 656.4 | 715.0 [695, 734] |
+| − the mixed kernel's mean | **−4.5** | −3.7 | +0.6 | −2.6 | −7.5 [−18.3, +2.7] |
+| spread/skill (the no-physics G-flow, 8 members: 1.14 … 1.11) | 1.21 | 1.21 | 1.17 | 1.15 | 1.14 |
+
+The mixture helps the flows as it helps the kernels (CRPS −0.004 to −0.005 against either flow, every lead), and the
+mixed flow and the mixed kernel then have the same CRPS. The flows' mean of infinitely many members is 715 at day 10,
+7.5 below the mixed kernel's, not significant (day 1: −4.5, significant: the G-flow's own gain). The flows were already
+too wide and the mixture is wider (z500 spread/skill 1.18 at day 10): the between-core variance is added to a spread
+that was fitted without it. IGN by the scorer's formula: −0.019 to −0.037 against the no-physics G-flow and −0.008 to
+−0.017 against the physics one (not corrected for the member count as the kernels' above: a range, not a number).
+
 ## 2. The invariant-measure condition  μ K = μ
 
 The climate pushed through the kernel must be the climate again (the atmosphere is statistically stationary; the
