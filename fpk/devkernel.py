@@ -94,6 +94,12 @@ class DevConfig:
     #                           (r_plus = 1/2 log(1 + Q / <p^2>)), the learned residual only removes (r_minus)
     band_scale: bool = False  # entropy by scale: the deviations are rescaled per Littlewood-Paley band of degrees,
     #                           channel and lead, exp(g[lead, c, j]) (starts at 1); H is then the size of the result
+    proj: bool = False        # the strength of the condition (the invariant measure, mu K = mu: where the IC carries no
+    #                           information the mean is the climate's): the forecast mean is READ OUT as
+    #                           climatology + exp(g_mean[lead, c, j]) (.) (xbar - climatology) per band j (starts at 1).
+    #                           The chain itself (the core's trajectory, the deviations) is not changed: ``read``;
+    #                           the forecast's deviations are read out x exp(g_spread[lead, c]) (the spread follows the
+    #                           error the condition leaves; starts at 1): ``spread``
     noise_pre: bool = False   # the new part composed with the equation: the Gaussian field is added to the deviations
     #                           BEFORE the equation's day, e_in = e + h xi, so the day's new variance is M (h xi): it
     #                           lies in the region the equation reaches (balanced, on the equation's scales)
@@ -238,7 +244,7 @@ class EntropyDeviationKernel(nn.Module):
         if (cfg.bal_lmin != 1 or cfg.aam_fix) and cfg.noise != "balanced":
             raise ValueError("bal_lmin and aam_fix are options of the balanced noise")
         sphere = cfg.noise in ("sphere", "balanced")
-        if sphere or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0 or cfg.fdt:
+        if sphere or cfg.band_scale or cfg.e0_spec or cfg.noise_mult > 0 or cfg.fdt or cfg.proj:
             H, W = (int(n) for n in core.static.shape[-2:])
             # the data's equiangular grid, south to north: cell centres (5.625 deg) or with the poles (1.5 deg)
             self.sht = SHT(grid_lat(H, W), nlon=W)
@@ -254,6 +260,10 @@ class EntropyDeviationKernel(nn.Module):
             self.register_buffer("e0_amp", (sp / sp.sum()).clamp(min=0).sqrt())  # (L,), unit total variance
         if cfg.band_scale:
             self.g_band = nn.Parameter(torch.zeros(10, 66, nb))  # log scale per lead (day 1..10), channel, band
+        self._clim = None
+        if cfg.proj:
+            self.g_mean = nn.Parameter(torch.zeros(10, 66, nb))  # log strength per lead (day 1..10), channel, band
+            self.g_spread = nn.Parameter(torch.zeros(10, 66))    # log scale of the read-out deviations per lead, channel
         if sphere:
             # the degree spectrum of smooth_noise (unit variance): the start of the band amplitudes
             with torch.no_grad():
@@ -643,6 +653,17 @@ class EntropyDeviationKernel(nn.Module):
                          zin=zin.detach())
         return phi0, e_next, Hn, (lq - le, r)
 
+    def proj_report(self):
+        """The learned strength of the condition exp(g_mean), mean over the channels (tisr excluded), per band at
+        leads 1, 5 and 10; None without ``proj``."""
+        if not self.cfg.proj:
+            return None
+        k = self.keep.reshape(-1) > 0
+        g = torch.exp(self.g_mean.detach())[:, k].mean(1).cpu()                             # (10, nb)
+        sp = torch.exp(self.g_spread.detach())[:, k].mean(1).cpu()                          # (10,)
+        return dict(mean={f"day{l + 1}": [round(float(v), 3) for v in g[l]] for l in (0, 4, 9)},
+                    spread=[round(float(v), 3) for v in sp])
+
     def eq_report(self):
         """What the kernelized equation's direction term learned: A per variable and level (u, v, T, q x 12 levels,
         50 -> 1000 hPa); None without eq_kernel."""
@@ -704,6 +725,39 @@ class EntropyDeviationKernel(nn.Module):
         k = self.keep.reshape(-1) > 0
         return v[:, k].mean()
 
+    def set_clim(self, clim):
+        """The z-scored daily climatology of the training years, (366, 66, H, W) (a numpy array, kept on the host and
+        indexed by the day: 0.2 GB at 5.625 deg, 2.8 GB at 1.5 deg): what ``read`` relaxes the mean to."""
+        self._clim = clim
+
+    def read(self, xbar, doy, lead: int):
+        """The forecast mean of the day: xbar (B, 66, H, W) the chain's mean after ``day``, doy (B,) the index of
+        THAT day in its year (the day's ``doy`` + 1), lead as ``day``'s. Without ``proj``: xbar itself. With it:
+        climatology + exp(g_mean) (.) (xbar - climatology), band by band (the identity plus the band-wise change, so
+        the start is exactly the kernel without it). Only the forecast is read out so: the next day starts from the
+        chain's xbar (a damped mean fed back through the core would be damped again every day)."""
+        if not self.cfg.proj:
+            return xbar
+        if self._clim is None:
+            raise RuntimeError("a kernel with proj needs the daily climatology: set_clim")
+        i = doy.detach().clamp(0, self._clim.shape[0] - 1).cpu().numpy()
+        f = xbar - torch.as_tensor(self._clim[i], dtype=xbar.dtype, device=xbar.device)
+        gl = torch.expm1(self.g_mean[min(lead, 9)])                             # (66, nb)
+        c = self.sht.analysis(f)
+        # what the transform does not hold (the grid's part above the degrees) goes with the last band, as in the
+        # least-squares fit of scripts/diag_projection.py
+        rest = f - self.sht.synthesis(c)
+        d = self.sht.synthesis(c * gl[:, self.band_of][:, :, None]) + gl[:, -1].view(66, 1, 1) * rest
+        return xbar + d * self.keep
+
+    def spread(self, lead: int):
+        """The read-out scale of the day's deviations, (1, 66, 1, 1): exp(g_spread[lead]) with ``proj`` (tisr 1), else 1.
+        The members of the forecast are read(xbar) +- s spread e, its entropy H + log spread; the chain goes on
+        with e."""
+        if not self.cfg.proj:
+            return torch.ones(1, 66, 1, 1, device=self.keep.device)
+        return torch.exp(self.g_spread[min(lead, 9)] * self.keep.reshape(-1)).view(1, 66, 1, 1)
+
     @staticmethod
     def members(xbar, e, s):
         """(B, 2 P, 66, H, W): the member states xbar +- s e."""
@@ -717,8 +771,9 @@ class EntropyDeviationKernel(nn.Module):
         x, out, ent = xd0, [], []
         for L in range(leads):
             x, e, H, _ = self.day(x, e, doy0 + L, tisr[:, L], L, gen)
-            out.append(self.members(x, e, self.s))
-            ent.append(H + HALF_LOG_2PIE)
+            k = self.spread(L)
+            out.append(self.members(self.read(x, doy0 + L + 1, L), e * k, self.s))
+            ent.append(H + torch.log(k) + HALF_LOG_2PIE)
         return torch.stack(out, 2), torch.stack(ent, 1)
 
 
