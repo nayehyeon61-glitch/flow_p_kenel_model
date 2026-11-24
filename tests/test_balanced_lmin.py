@@ -264,9 +264,10 @@ def test_checkpoint_key_sets(mcore, tmp_path):
         assert all(a.shape == b.shape for a, b in zip(A.state_dict().values(), B.state_dict().values()))
         state = {k: v for k, v in A.state_dict().items() if not k.startswith("core.")}
         old = {k: v for k, v in A.cfg.__dict__.items() if k in CFG_OLD}                # the cfg of an old checkpoint
-        # the two options, and the + version's three (fpk/devkernel.py: noise_cells, the U-Net nets)
+        # the two options, the + version's three (fpk/devkernel.py: noise_cells, the U-Net nets) and the kernelized
+        # equation's three (eq_kernel, eq_core, eq_clamp)
         assert sorted(old) == sorted(CFG_OLD) and sorted(set(A.cfg.__dict__) - set(old)) == [
-            "aam_fix", "bal_lmin", "noise_cells", "unet", "unet_reps"]
+            "aam_fix", "bal_lmin", "eq_clamp", "eq_core", "eq_kernel", "noise_cells", "unet", "unet_reps"]
         L = EntropyDeviationKernel(mcore, DevConfig(**old))
         miss = L.load_state_dict(state, strict=False)
         assert not miss.unexpected_keys and all(k.startswith("core.") for k in miss.missing_keys)
