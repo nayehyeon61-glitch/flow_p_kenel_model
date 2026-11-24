@@ -406,15 +406,13 @@ def cmd_devk(a, rest):
         if own:  # the options of this run decide the fixed buffers of the balanced noise / fdt, not the checkpoint
             log(dict(init=a.init, buffers_of_this_run_kept=own))
     if a.proj_init:
-        # the start of the strength: its least-squares value on a year's trajectories of this core, and the spread
-        # follows the error that is left (g_band acts day by day on the chain's deviations: the day's own change)
+        # the start: the least-squares strength on a year's trajectories of this core (not its training years: the
+        # validation year), and the read-out spread follows the error that is left
         g, kap = proj_fit(a.proj_init, a.core_tag)
         with torch.no_grad():
             Dk.g_mean.copy_(torch.log(torch.tensor(g, dtype=torch.float32).clamp(min=0.02)).to(dev))
-            if Dk.cfg.band_scale:
-                lk = np.log(kap)
-                Dk.g_band.add_(torch.tensor(np.diff(lk, axis=0, prepend=0.0), dtype=torch.float32)[:, :, None].to(dev))
-        log(dict(proj_init=a.proj_init, strength=Dk.proj_report(), spread_follows=bool(Dk.cfg.band_scale)))
+            Dk.g_spread.copy_(torch.log(torch.tensor(kap, dtype=torch.float32)).to(dev))
+        log(dict(proj_init=a.proj_init, proj=Dk.proj_report()))
     Dk.through = a.through
     if a.energy_weight:
         names = json.load(open(os.path.join(a.out, "score_devk_m.json")))["meta"]["channels"]
@@ -433,9 +431,9 @@ def cmd_devk(a, rest):
     params = [p_ for p_ in Dk.parameters() if p_.requires_grad]
     cn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_.startswith("cnet.")]
     eqa = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_ == "eq_a"]
-    gmn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_ == "g_mean"]
+    gmn = [p_ for n_, p_ in Dk.named_parameters() if p_.requires_grad and n_ in ("g_mean", "g_spread")]
     rest_ = [p_ for n_, p_ in Dk.named_parameters()
-             if p_.requires_grad and not n_.startswith("cnet.") and n_ not in ("eq_a", "g_mean")]
+             if p_.requires_grad and not n_.startswith("cnet.") and n_ not in ("eq_a", "g_mean", "g_spread")]
     cw, cpar, th0, n0, ck_core = {}, [], [], 1.0, None
     if a.core_lr > 0:  # after the kernel's own lists: the core's weights are a group and a clipping of their own
         ck_core = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -473,8 +471,10 @@ def cmd_devk(a, rest):
         xprev = xd
         for k in range(days):
             xb, e, H, (st, r) = Dk.day(xb, e, doy + k, tns[:, k], k, gen)
-            xm = Dk.read(xb, doy + k + 1, k)  # the forecast (xb itself without --proj); the chain goes on from xb
-            i, h_ = Dk.lead_loss(H, xm, e, yd[:, k], w, a.band_weight)  # the band term on e before the detach
+            # the forecast (xb, e, H themselves without --proj): its mean and spread read out; the chain goes on
+            # from xb and e
+            xm, ks = Dk.read(xb, doy + k + 1, k), Dk.spread(k)
+            i, h_ = Dk.lead_loss(H + torch.log(ks), xm, e * ks, yd[:, k], w, a.band_weight)  # the band term on e before the detach
             if a.fdt_weight:  # the spread about the mean stays below the climate's variance, band by band
                 fd = Dk.fdt_penalty(e)
                 i = i + a.fdt_weight * fd
@@ -488,7 +488,7 @@ def cmd_devk(a, rest):
             xprev = xb.detach()
             e = e.detach()
             es.append((xm - yd[:, k]) / Dk.s)
-            vs.append(torch.exp(2 * H))
+            vs.append(torch.exp(2 * H) * ks.pow(2))
             rm.append(float(((((xm - yd[:, k]) / Dk.s).pow(2) * Dk.keep * w).sum() / (Dk.keep * w).expand_as(xb).sum()).detach()))
             if not a.through or (k + 1) % a.through == 0:
                 xb = xb.detach()  # the window of the gradient through the chain ends (--through 0: every day)
@@ -615,6 +615,36 @@ def proj_fit(path, core_tag):
     new = np.einsum("lci,lcij,lcj->lc", g, S, g) - 2 * (g * c).sum(-1) + oo
     kap[:, k] = np.sqrt(np.clip(new[:, k] / raw[:, k], 0.25, 1.0))
     return g, kap
+
+
+def cmd_projk(a, rest):
+    """A fitted kernel with the condition read out (``devk --proj`` without training): --dev-tag's checkpoint, cfg
+    proj = True, g_mean = log of the least-squares strength of --core-tag's trajectories in --proj-init (a
+    diag_projection.py stats npz of a year the kernel was not trained on), g_spread = log of the error that is left.
+    The chain's own parameters are untouched; ``score`` reads it as any kernel."""
+    src, dst = os.path.join(a.out, f"{a.dev_tag}.pt"), os.path.join(a.out, f"{a.tag}.pt")
+    if a.tag == a.dev_tag or os.path.exists(dst):
+        raise SystemExit(f"{dst}: exists (or is the kernel itself); another --tag")
+    ck = torch.load(src, map_location="cpu", weights_only=False)
+    if ck.get("core_tag") not in (None, a.core_tag):
+        raise SystemExit(f"{a.dev_tag} was fitted on core {ck['core_tag']}, not --core-tag {a.core_tag}")
+    cfg = dict(ck["cfg"])
+    if cfg.get("proj"):
+        raise SystemExit(f"{a.dev_tag} already reads its mean out (proj)")
+    g, kap = proj_fit(a.proj_init, a.core_tag)
+    nb = g.shape[-1]
+    if g.shape[0] != 10 or ("g_band" in ck["state"] and ck["state"]["g_band"].shape[-1] != nb):
+        raise SystemExit(f"{a.proj_init}: {g.shape[0]} leads and {nb} bands, the kernel has 10 leads"
+                         + (f" and {ck['state']['g_band'].shape[-1]} bands" if "g_band" in ck["state"] else ""))
+    cfg["proj"] = True
+    state = dict(ck["state"], g_mean=torch.log(torch.tensor(g, dtype=torch.float32).clamp(min=0.02)),
+                 g_spread=torch.log(torch.tensor(kap, dtype=torch.float32)))
+    torch.save({**ck, "cfg": cfg, "state": state, "proj_of": a.dev_tag, "proj_init": a.proj_init}, dst)
+    k = [i for i in range(66) if i != TISR_DYN]
+    z = DYN.index(contract.CHANNEL_INDEX["z500"])
+    log(dict(projk=a.tag, of=a.dev_tag, proj_init=a.proj_init, clamped=int((g[:, k] < 0.02).sum()),
+             z500_strength=[round(float(v), 3) for v in g[[0, 4, 9], z].mean(-1)],
+             spread_day10=round(float(kap[9, k].mean()), 3)))
 
 
 def load_devk(a, core, tag):
@@ -1481,8 +1511,8 @@ def main(argv=None):
                         "(from 1), learned by the log score; the chain itself is not changed")
     d.add_argument("--proj-lr", type=float, default=10.0, help="--proj: the step size of log g as a multiple of --lr")
     d.add_argument("--proj-init", default="",
-                   help="--proj: start g at its least-squares value of this core (a diag_projection.py stats npz of "
-                        "TRAINING years) and move the band scales by the error that is left")
+                   help="--proj: start g at its least-squares value of this core (a diag_projection.py stats npz, e.g. "
+                        "of the validation year) and the read-out spread at the error that is left")
     d.add_argument("--noise-cells", type=int, default=3,
                    help="cells of the smoothed noise (3 = 17 deg at 5.625 deg; 11 = the same at 1.5 deg)")
     d.add_argument("--iters", type=int, default=800)
@@ -1606,6 +1636,11 @@ def main(argv=None):
                    help="flow, with --through: also the equation's Jacobian of the next day's source and conditioning")
     t.add_argument("--val-batches", type=int, default=4)
     t.add_argument("--log-every", type=int, default=50)
+    pk = sub.add_parser("projk")
+    common(pk)
+    pk.add_argument("--dev-tag", required=True, help="the fitted kernel")
+    pk.add_argument("--tag", required=True, help="the new checkpoint (never an existing one)")
+    pk.add_argument("--proj-init", required=True, help="diag_projection.py stats npz holding --core-tag")
     s = sub.add_parser("score")
     common(s)
     s.add_argument("--arms", nargs="+", default=["persistence", "core", "kernel", "flow"])
@@ -1627,7 +1662,7 @@ def main(argv=None):
         torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
     {"stats": cmd_stats, "core": cmd_core, "kernel": cmd_kernel, "flow": cmd_flow, "tune": cmd_tune, "devk": cmd_devk, "devflow": cmd_devflow,
-     "devtune": cmd_devtune, "score": cmd_score}[a.cmd](a, rest)
+     "devtune": cmd_devtune, "projk": cmd_projk, "score": cmd_score}[a.cmd](a, rest)
 
 
 if __name__ == "__main__":

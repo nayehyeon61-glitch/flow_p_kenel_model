@@ -47,7 +47,9 @@ def test_the_readout_starts_as_the_chains_mean_and_the_rollout_as_the_kernel_wit
     e0, h0 = Pl.rollout(xd, doy, tis, 3, gen=torch.Generator().manual_seed(2))
     e1, h1 = Pr.rollout(xd, doy, tis, 3, gen=torch.Generator().manual_seed(2))
     assert torch.equal(e0, e1) and torch.equal(h0, h1)
-    assert Pl.proj_report() is None and Pr.proj_report() == {k: [1.0] * Pr.n_bands for k in ("day1", "day5", "day10")}
+    assert Pl.proj_report() is None
+    assert Pr.proj_report() == dict(mean={k: [1.0] * Pr.n_bands for k in ("day1", "day5", "day10")}, spread=[1.0] * 10)
+    assert torch.equal(Pl.spread(3), torch.ones(1, 66, 1, 1)) and torch.equal(Pr.spread(3), torch.ones(1, 66, 1, 1))
 
 
 def test_the_readout_scales_the_anomaly_of_one_band_and_one_lead():
@@ -88,10 +90,17 @@ def test_the_rollouts_members_are_around_the_read_out_mean_and_the_chain_is_the_
     e1, h1 = Pr.rollout(xd, doy, tis, 3, gen=torch.Generator().manual_seed(2))
     m0, m1 = e0.mean(1), e1.mean(1)                                       # (B, L, 66, H, W)
     assert torch.allclose(e0 - m0[:, None], e1 - m1[:, None], atol=1e-5) and torch.equal(h0, h1)   # the deviations, H
+    with torch.no_grad():                                                 # the read-out spread: x 0.8 on day 2
+        Pr.g_spread[1] = math.log(0.8)
+    e2, h2 = Pr.rollout(xd, doy, tis, 3, gen=torch.Generator().manual_seed(2))
+    d1, d2 = e1 - m1[:, None], e2 - e2.mean(1)[:, None]
+    assert torch.allclose(e2.mean(1), m1, atol=1e-5)
+    assert torch.allclose(d2[:, :, 1, KEPT], 0.8 * d1[:, :, 1, KEPT], atol=1e-5) and torch.allclose(d2[:, :, 1, TISR_DYN], d1[:, :, 1, TISR_DYN])
+    assert torch.allclose(d2[:, :, [0, 2]], d1[:, :, [0, 2]], atol=1e-6)    # the chain's day 3 is the same
+    assert torch.allclose(h2[:, 1, KEPT], h1[:, 1, KEPT] + math.log(0.8), atol=1e-5) and torch.equal(h2[:, [0, 2]], h1[:, [0, 2]])
     for L in range(3):                                                    # day L + 1 of the IC's doy
         c = torch.from_numpy(np.stack([cl[5 + L + 1], cl[6 + L + 1]]))
-        f = m0[:, L] - c
-        want = m0[:, L] - 0.5 * Pr.sht.synthesis(Pr.sht.analysis(f)) * Pr.keep
+        want = m0[:, L] - 0.5 * (m0[:, L] - c) * Pr.keep                   # every band and the grid's rest: x 0.5
         assert torch.allclose(m1[:, L], want, atol=1e-5)
     assert float((m1 - m0)[:, :, KEPT].abs().max()) > 0.05
 
@@ -141,10 +150,11 @@ def test_devk_cli_proj_trains_the_strength_starts_from_a_fit_and_reloads(mcore, 
     capsys.readouterr()
     R.main(base + ["--tag", "b", "--init", "a", "--proj", "--proj-lr", "500", "--fresh-best"])
     logs = [json.loads(q) for q in capsys.readouterr().out.strip().splitlines() if q.startswith("{")]
-    assert sorted(logs[-1]["proj"]) == ["day1", "day10", "day5"] and all(math.isfinite(v) for v in logs[-1]["val_ign"])
+    assert sorted(logs[-1]["proj"]["mean"]) == ["day1", "day10", "day5"] and all(math.isfinite(v) for v in logs[-1]["val_ign"])
     b = torch.load(tmp_path / "b.pt", weights_only=False)
-    assert b["cfg"]["proj"] is True and float(b["state"]["g_mean"][:2].abs().max()) > 1e-3   # days 1, 2 were trained
-    assert float(b["state"]["g_mean"][2:].abs().max()) == 0.0
+    assert b["cfg"]["proj"] is True
+    for k in ("g_mean", "g_spread"):                                       # days 1, 2 were trained, the rest not
+        assert float(b["state"][k][:2].abs().max()) > 1e-3 and float(b["state"][k][2:].abs().max()) == 0.0
     ns = SimpleNamespace(out=str(tmp_path), core_tag="c", device="cpu")
     Dk = R.load_devk(ns, mcore, "b")
     assert Dk.cfg.proj and Dk._clim.shape == (366, 66, H, W) and Dk._clim.dtype == np.float32
@@ -170,11 +180,31 @@ def test_devk_cli_proj_trains_the_strength_starts_from_a_fit_and_reloads(mcore, 
     capsys.readouterr()
     R.main(base + ["--tag", "f", "--init", "a", "--proj", "--proj-init", str(tmp_path / "proj.npz"), "--lr", "0", "--fresh-best"])
     logs = [json.loads(q) for q in capsys.readouterr().out.strip().splitlines() if q.startswith("{")]
-    assert any("proj_init" in q and q["spread_follows"] for q in logs)
+    assert any("proj_init" in q for q in logs)
     f = torch.load(tmp_path / "f.pt", weights_only=False)
     assert torch.allclose(f["state"]["g_mean"][:, KEPT], torch.tensor(math.log(0.5))) and float(f["state"]["g_mean"][:, TISR_DYN].abs().max()) == 0.0
-    d = f["state"]["g_band"] - a["state"]["g_band"]
-    assert torch.allclose(d[0][KEPT], torch.tensor(0.5 * math.log(1.0 / (0.25 * nb + 1.0))), atol=1e-6)   # day 1: log kap
-    assert float(d[1:].abs().max()) < 1e-6 and float(d[0, TISR_DYN].abs().max()) == 0.0                  # then no more
+    assert torch.allclose(f["state"]["g_spread"][:, KEPT], torch.tensor(0.5 * math.log(1.0 / (0.25 * nb + 1.0))), atol=1e-6)
+    assert float(f["state"]["g_spread"][:, TISR_DYN].abs().max()) == 0.0
+    assert torch.equal(f["state"]["g_band"], a["state"]["g_band"])          # the chain's own band scales: untouched
     with pytest.raises(SystemExit):
         R.main(base + ["--tag", "g", "--proj-init", str(tmp_path / "proj.npz")])   # the start of --proj only
+    # projk: the same start written onto a fitted kernel without training; the chain's parameters untouched
+    pk = ["projk", "--out", str(tmp_path), "--core-tag", "c", "--dev-tag", "a", "--proj-init", str(tmp_path / "proj.npz")]
+    R.main(pk + ["--tag", "a_p"])
+    p = torch.load(tmp_path / "a_p.pt", weights_only=False)
+    assert p["cfg"]["proj"] is True and p["proj_of"] == "a" and {k: v for k, v in p["cfg"].items() if k != "proj"} == {
+        k: v for k, v in a["cfg"].items() if k != "proj"}
+    assert sorted(p["state"]) == sorted(list(a["state"]) + ["g_mean", "g_spread"])
+    assert all(torch.equal(p["state"][k], a["state"][k]) for k in a["state"])
+    assert torch.equal(p["state"]["g_mean"], f["state"]["g_mean"]) and torch.equal(p["state"]["g_spread"], f["state"]["g_spread"])
+    Dp = R.load_devk(ns, mcore, "a_p")
+    e2, _ = Dp.rollout(xd, doy, tis, 2, hist=hist, gen=torch.Generator().manual_seed(2))
+    e0, _ = R.load_devk(ns, mcore, "a").rollout(xd, doy, tis, 2, hist=hist, gen=torch.Generator().manual_seed(2))
+    d0, d2 = e0 - e0.mean(1, keepdim=True), e2 - e2.mean(1, keepdim=True)
+    kap0 = math.sqrt(1.0 / (0.25 * nb + 1.0))
+    assert torch.allclose(d2[:, :, :, KEPT], kap0 * d0[:, :, :, KEPT], atol=1e-5)
+    for bad in (["--tag", "a_p"], ["--tag", "a"]):                        # never over an existing checkpoint
+        with pytest.raises(SystemExit):
+            R.main(pk + bad)
+    with pytest.raises(SystemExit):                                       # not twice
+        R.main(pk[:6] + ["--dev-tag", "a_p", "--proj-init", str(tmp_path / "proj.npz"), "--tag", "a_pp"])
