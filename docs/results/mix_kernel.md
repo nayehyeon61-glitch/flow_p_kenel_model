@@ -123,6 +123,29 @@ The t2m and t850 means of day 10 were WORSE than the climatology; with the condi
 (My first reading, "the z500 mean moves 40 % more than is predictable", from activity 0.535 against ACC 0.381, was
 wrong: those are means of per-IC ratios. The fitted strength is 0.86.)
 
+### The condition on the distribution, not only on the mean
+
+`scripts/score_mix.py mixkp_W_NW core_gngmz8W:devk_band_sphW core_ngmz8W:devk_band_sphNW --proj runs/fpk/proj_2016.npz`:
+each kernel's mean read out with its OWN core's g per lead, channel and band (fitted on 2016), its deviations scaled
+by the error that is left (κ = RMSE of that mean over the raw one, 2016: z500 0.99, t850 0.93, t2m 0.90 at day 10),
+then the two mixed as above (`runs/fpk/score_mixkp_W_NW*`, pairs `mixkp_W_NW_vs_{W,NW}.json`).
+
+| | 1 | 3 | 5 | 7 | 10 |
+| --- | --- | --- | --- | --- | --- |
+| CRPS, no-physics kernel | 0.1004 | 0.1693 | 0.2061 | 0.2277 | 0.2429 |
+| CRPS, mixed kernel | 0.0949 | 0.1631 | 0.2001 | 0.2218 | 0.2369 |
+| **CRPS, mixed kernel + condition** | **0.0941** | **0.1607** | **0.1966** | **0.2170** | **0.2298** |
+| − no-physics kernel | **−0.0062** | **−0.0085** | **−0.0095** | **−0.0108** | **−0.0131** [−0.0139, −0.0123] |
+| − mixed kernel | **−0.0007** | **−0.0023** | **−0.0036** | **−0.0048** | **−0.0071** [−0.0078, −0.0064] |
+| nRMSE gain % vs no physics | **+5.87** | **+4.16** | **+3.61** | **+3.50** | **+3.95** [+3.56, +4.34] |
+| z500 RMSE | 154.8 | 389.7 | 555.9 | 656.6 | 718.2 |
+| − mixed kernel | **−0.3** | **−1.1** | **−1.4** | **−2.4** | **−4.3** [−7.3, −1.3] |
+| spread/skill (65 ch) | 1.086 | 1.043 | 1.013 | 0.998 | 1.003 |
+| t2m RMSE (K) | 0.897 | 1.570 | 1.861 | 2.034 | 2.144 |
+
+One kernel with the condition alone: CRPS day 10 0.2324 (no physics) / 0.2319 (physics), z500 724 / 726. The day-10
+CRPS falls 5.4 % from the current kernel, the largest single step of the project's distributions so far.
+
 ## Together
 
 | day 10 | z500 | nRMSE |
@@ -130,6 +153,7 @@ wrong: those are means of per-IC ratios. The fitted strength is 0.86.)
 | the current kernel (no physics) | 733.4 | 0.4766 |
 | mixed kernel | 722.5 | 0.4673 |
 | mixed kernel + the condition (mean; cores' trajectories) | 717.3 | 0.4566 |
+| mixed kernel + the condition per kernel (the distribution, CRPS 0.2298) | 718.2 | 0.4577 |
 
 710 is 7 below: the correlation term (95 % of the error) only falls with more independent information, i.e. more cores
 in the mixture (estimate: 4 cores + the condition ≈ 711).
