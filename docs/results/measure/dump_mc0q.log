@@ -1,0 +1,16 @@
+{"archive": 5844, "nv": 1024, "sec": 14}
+{"dump": "mc0q", "dim": 67584, "npc": 400, "explained": 0.838, "sec": 41}
+{"tau": 0, "lags": 0, "ridge": 0.01, "val_mse_over_var": 0.2998, "sec": 46}
+{"year": 2016, "day": 3, "k": 3, "tau": 0, "lags": 0, "sec": 47}
+{"year": 2016, "day": 5, "k": 5, "tau": 0, "lags": 0, "sec": 50}
+{"year": 2016, "day": 7, "k": 7, "tau": 0, "lags": 0, "sec": 53}
+{"year": 2016, "day": 10, "k": 10, "tau": 0, "lags": 0, "sec": 55}
+{"year": 2020, "day": 3, "k": 3, "tau": 0, "lags": 0, "sec": 59}
+{"year": 2020, "day": 5, "k": 5, "tau": 0, "lags": 0, "sec": 62}
+{"year": 2020, "day": 7, "k": 7, "tau": 0, "lags": 0, "sec": 65}
+{"year": 2020, "day": 10, "k": 10, "tau": 0, "lags": 0, "sec": 68}
+{"year": 2017, "day": 3, "k": 3, "tau": 0, "lags": 0, "sec": 69}
+{"year": 2017, "day": 5, "k": 5, "tau": 0, "lags": 0, "sec": 69}
+{"year": 2017, "day": 7, "k": 7, "tau": 0, "lags": 0, "sec": 70}
+{"year": 2017, "day": 10, "k": 10, "tau": 0, "lags": 0, "sec": 70}
+done 70
