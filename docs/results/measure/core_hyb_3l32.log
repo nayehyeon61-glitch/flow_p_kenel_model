@@ -1,0 +1,7 @@
+{"archive": 5844, "nv": 1024, "sec": 11}
+{"chan": "z500", "inputs": 66, "dim": 67584, "npc": 400, "explained": 0.838, "sec": 37}
+{"chan": "z500", "tau": 0, "ridge": 0.01, "val_skill": 0.9465, "sec": 37}
+{"chan": "z500", "day": 10, "year": 2016, "k": 10, "tau": 0, "rmse": 732.1, "rmse_scaled": 732.04, "g": 0.975, "clim": 815.82, "sec": 38}
+{"chan": "z500", "day": 10, "year": 2020, "k": 10, "tau": 0, "rmse": 722.09, "rmse_scaled": 722.09, "g": 0.998, "clim": 806.77, "sec": 40}
+{"chan": "z500", "day": 10, "year": 2017, "k": 10, "tau": 0, "rmse": 717.52, "rmse_scaled": 716.52, "g": 0.897, "clim": 789.23, "sec": 40}
+done 40

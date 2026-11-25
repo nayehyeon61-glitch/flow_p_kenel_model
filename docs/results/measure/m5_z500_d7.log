@@ -1,0 +1,14 @@
+day  7 z500 bands                        K    6  test  655.7  cv  651.1  oracle  655.1   cv 2016: 654.3 2020: 647.7
+    band 0: g 1.006 (oracle 0.891)  forecast var 0.008  truth var 0.004  error share 0.003  corr 0.769
+    band 1: g 0.887 (oracle 0.834)  forecast var 0.015  truth var 0.013  error share 0.013  corr 0.560
+    band 2: g 1.011 (oracle 0.914)  forecast var 0.095  truth var 0.077  error share 0.070  corr 0.622
+    band 3: g 1.014 (oracle 0.962)  forecast var 0.569  truth var 0.457  error share 0.383  corr 0.658
+    band 4: g 0.936 (oracle 0.895)  forecast var 0.294  truth var 0.412  error share 0.478  corr 0.464
+    band 5: g 0.292 (oracle 0.248)  forecast var 0.018  truth var 0.037  error share 0.054  corr 0.108
+day  7 z500 hyb7                         K   12  test  652.6  cv  649.1  oracle  651.9  [-3.03, -4.23, -1.94] cv 2016: 653.4 2020: 644.9
+day  7 z500 hyb6                         K   12  test  652.0  cv  648.8  oracle  651.3  [-3.68, -5.27, -2.28] cv 2016: 652.7 2020: 644.8
+day  7 z500 hyb5                         K   12  test  652.8  cv  649.1  oracle  652.1  [-2.88, -4.04, -1.66] cv 2016: 653.0 2020: 645.2
+day  7 z500 hyb4                         K   12  test  653.4  cv  649.5  oracle  652.7  [-2.27, -3.32, -1.25] cv 2016: 653.4 2020: 645.6
+day  7 z500 hyb3                         K   12  test  653.9  cv  649.8  oracle  653.1  [-1.77, -2.81, -0.69] cv 2016: 653.8 2020: 645.9
+day  7 z500 hyb7+hyb5                    K   18  test  651.6  cv  648.4  oracle  650.8  [-4.05, -5.36, -2.81] cv 2016: 652.7 2020: 644.0
+day  7 z500 hyb7+hyb4                    K   18  test  651.7  cv  648.4  oracle  650.9  [-3.94, -5.15, -2.79] cv 2016: 652.9 2020: 643.9

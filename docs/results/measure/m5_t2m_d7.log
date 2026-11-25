@@ -1,0 +1,14 @@
+day  7 t2m bands                        K    6  test    2.0  cv    2.0  oracle    2.0   cv 2016: 2.0 2020: 2.0
+    band 0: g 0.940 (oracle 0.807)  forecast var 0.018  truth var 0.010  error share 0.004  corr 0.822
+    band 1: g 0.749 (oracle 0.646)  forecast var 0.020  truth var 0.014  error share 0.013  corr 0.574
+    band 2: g 0.842 (oracle 0.781)  forecast var 0.089  truth var 0.069  error share 0.047  corr 0.680
+    band 3: g 0.830 (oracle 0.732)  forecast var 0.347  truth var 0.299  error share 0.246  corr 0.602
+    band 4: g 0.588 (oracle 0.568)  forecast var 0.324  truth var 0.405  error share 0.440  corr 0.387
+    band 5: g 0.257 (oracle 0.248)  forecast var 0.202  truth var 0.203  error share 0.250  corr 0.188
+day  7 t2m hyb7                         K   12  test    2.0  cv    2.0  oracle    2.0  [-0.04, -0.06, -0.03] cv 2016: 2.0 2020: 2.0
+day  7 t2m hyb6                         K   12  test    2.0  cv    2.0  oracle    2.0  [-0.05, -0.07, -0.04] cv 2016: 2.0 2020: 2.0
+day  7 t2m hyb5                         K   12  test    2.0  cv    2.0  oracle    2.0  [-0.06, -0.07, -0.04] cv 2016: 2.0 2020: 2.0
+day  7 t2m hyb4                         K   12  test    2.0  cv    2.0  oracle    2.0  [-0.05, -0.07, -0.04] cv 2016: 2.0 2020: 2.0
+day  7 t2m hyb3                         K   12  test    2.0  cv    2.0  oracle    2.0  [-0.04, -0.06, -0.03] cv 2016: 2.0 2020: 2.0
+day  7 t2m hyb7+hyb5                    K   18  test    2.0  cv    2.0  oracle    2.0  [-0.06, -0.07, -0.04] cv 2016: 2.0 2020: 2.0
+day  7 t2m hyb7+hyb4                    K   18  test    2.0  cv    2.0  oracle    2.0  [-0.05, -0.07, -0.04] cv 2016: 2.0 2020: 2.0

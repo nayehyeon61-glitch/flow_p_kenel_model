@@ -1,0 +1,13 @@
+day  3 t2m bands                        K    6  test    1.6  cv    1.5  oracle    1.6   cv 2016: 1.6 2020: 1.5
+    band 0: g 1.032 (oracle 1.019)  forecast var 0.013  truth var 0.011  error share 0.002  corr 0.950
+    band 1: g 0.935 (oracle 0.830)  forecast var 0.016  truth var 0.012  error share 0.008  corr 0.829
+    band 2: g 0.964 (oracle 0.913)  forecast var 0.081  truth var 0.068  error share 0.036  corr 0.866
+    band 3: g 0.961 (oracle 0.922)  forecast var 0.354  truth var 0.308  error share 0.169  corr 0.859
+    band 4: g 0.898 (oracle 0.846)  forecast var 0.366  truth var 0.392  error share 0.406  corr 0.712
+    band 5: g 0.475 (oracle 0.463)  forecast var 0.170  truth var 0.209  error share 0.378  corr 0.364
+day  3 t2m hyb3                         K   12  test    1.5  cv    1.5  oracle    1.5  [-0.03, -0.04, -0.03] cv 2016: 1.5 2020: 1.5
+day  3 t2m hyb2                         K   12  test    1.5  cv    1.5  oracle    1.5  [-0.04, -0.04, -0.03] cv 2016: 1.5 2020: 1.5
+day  3 t2m hyb1                         K   12  test    1.5  cv    1.5  oracle    1.5  [-0.02, -0.03, -0.02] cv 2016: 1.5 2020: 1.5
+day  3 t2m hyb0                         K   12  test    1.6  cv    1.5  oracle    1.6  [-0.01, -0.02, -0.01] cv 2016: 1.5 2020: 1.5
+day  3 t2m hyb3+hyb2                    K   18  test    1.5  cv    1.5  oracle    1.5  [-0.04, -0.05, -0.03] cv 2016: 1.5 2020: 1.5
+day  3 t2m hyb3+hyb1                    K   18  test    1.5  cv    1.5  oracle    1.5  [-0.04, -0.04, -0.03] cv 2016: 1.5 2020: 1.5

@@ -64,6 +64,8 @@ ap.add_argument("--max-ics", type=int, default=0)
 ap.add_argument("--block", type=int, default=0, help="block length (ICs) of the bootstrap; 0: 1, or 15 with lagged forecasts")
 ap.add_argument("--json", default="")
 ap.add_argument("--save-theta", default="")
+ap.add_argument("--save-pred", nargs="*", default=[], help="TAG:EXP writes the conditioned mean of the candidate EXP as one more dump "
+                "<dir>/<year>_<TAG>.npy (only the leads of --days; the fit years with the strengths that never saw them)")
 A = ap.parse_args()
 torch.set_num_threads(A.threads)
 CORES = A.cores.split(",")
@@ -295,6 +297,11 @@ def batches(d):
         yield np.arange(i, min(i + A.batch, d["n"]))
 
 
+SP = {}
+for sp in A.save_pred:
+    tg_, ex_ = sp.split(":", 1)
+    assert ex_ in A.exps and len(A.fit) == 2, "--save-pred needs its candidate among --exps and two fit years"
+    SP[ex_] = {y: np.lib.format.open_memmap(f"{A.dir}/{y}_{tg_}.npy", mode="w+", dtype=np.float16, shape=(len(D[y]["ics"]), 10, C, H, W)) for y in YEARS}
 out = dict(meta=dict(fit=A.fit, test=A.test, cores=[CW, CN], ridge=A.ridge, zones=A.zones, lb=A.lb, days=A.days), days={})
 t0 = time.time()
 for day in A.days:
@@ -350,6 +357,8 @@ for day in A.days:
                 keys = ["all", "f0"] if y == A.test else ([y] if len(A.fit) == 2 else [])
                 for k in keys:
                     pred = torch.einsum("ck,bckhw->bchw", TH[e][k], X)
+                    if e in SP and k != "f0":
+                        SP[e][y][idx, L] = pred.numpy()
                     m = ((o - pred) ** 2 * w).mean((-2, -1)).double().numpy()
                     MSE[e].setdefault((y, k), []).append(m)
         print(json.dumps(dict(day=day, pass2=y, sec=round(time.time() - t0))), flush=True)
@@ -380,5 +389,8 @@ for day in A.days:
     out["days"][day] = res
     if A.save_theta:
         torch.save({e: TH[e]["all"] for e in A.exps}, f"{A.save_theta}_d{day}.pt")
+for v in SP.values():
+    for m in v.values():
+        m.flush()
 if A.json:
     json.dump(out, open(A.json, "w"), indent=1)

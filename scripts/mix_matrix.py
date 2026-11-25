@@ -69,6 +69,9 @@ ap.add_argument("--flow-proj", action="store_true", help="for a deviation flow w
                 "on that kernel's mean (name@p); with --kappa-maps also their deviations scaled so that the second moment equals the mean's "
                 "squared error on another year, one factor per lead and channel (name@pk) or per latitude too (name@pklat)")
 ap.add_argument("--kappa-maps", default="", help="maps of another year (--save-maps of a run with the flows and --flow-proj)")
+ap.add_argument("--recenter", nargs="*", default=[], help="tags of means in --dir (e.g. the conditioned mean cond_fit.py --save-pred wrote): every "
+                "learned kernel also with its members moved onto that mean (name@<tag>): the condition read out on the kernel. They share the "
+                "kernel's noise: never mix a kernel with its own variant.")
 ap.add_argument("--threads", type=int, default=4)
 ap.add_argument("--seed", type=int, default=0)
 A, PASS = ap.parse_known_args()
@@ -280,6 +283,8 @@ def core_mean(tag, k):
 names = []
 for n, s in enumerate(sides):
     names += [s["name"]] + [f"{s['name']}@c{k}" for k, _ in CAL.get(s["name"], [])]
+    if s["pairs"]:
+        names += [f"{s['name']}@{tg_}" for tg_ in A.recenter]
     if n in FLOWP:
         names += [f"{s['name']}@p"] + [f"{s['name']}@{k}" for k in KAP.get(n, {})]
 names += list(A.synth)
@@ -328,6 +333,10 @@ for i in range(0, len(ics), 2):
             X.append(x); MU.append(mu); KIND.append(kind)
             for _, c in CAL.get(s["name"], []):                                                  # the same noise, another width
                 X.append(mu[None] + c[None] * (x - mu[None])); MU.append(mu); KIND.append(kind)
+            if s["pairs"]:
+                for tg_ in A.recenter:                                                           # the same deviations about another mean
+                    mc = core_mean(tg_, int(k))
+                    X.append(mc[None] + (x - mu[None])); MU.append(mc); KIND.append(kind)
             if n in FLOWP:                                                                       # the flow read on the conditioned mean
                 fdev = x - core_mean(s["a"].core_tag, int(k))[None]
                 mp = learned[FLOWP[n]][b].mean(0)

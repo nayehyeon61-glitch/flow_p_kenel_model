@@ -1,0 +1,35 @@
+{"dress": "sdress45:core_gngmz8W+core_ngmz8W", "pool": 356, "g_z500": [1.013, 1.038, 1.026, 0.974, 0.864]}
+{"dress": "sdress45:cv", "pool": 356, "g_z500": [1.0, 0.999, 1.005, 0.99, 0.952]}
+{"dress": "sdress45:cm", "pool": 356, "g_z500": [0.999, 0.997, 1.0, 0.977, 0.932]}
+{"cache": {"core_gngmz8W:devk_band_sphW_p": "r", "core_ngmz8W:devk_band_sphNW_p": "r"}}
+{"year": 2020, "ics": 2, "of": 60, "sec": 11, "rss_mb": 5906}
+{"year": 2020, "ics": 4, "of": 60, "sec": 21, "rss_mb": 5906}
+{"year": 2020, "ics": 6, "of": 60, "sec": 30, "rss_mb": 5906}
+{"year": 2020, "ics": 8, "of": 60, "sec": 39, "rss_mb": 5906}
+{"year": 2020, "ics": 10, "of": 60, "sec": 49, "rss_mb": 5906}
+{"year": 2020, "ics": 12, "of": 60, "sec": 59, "rss_mb": 5906}
+{"year": 2020, "ics": 14, "of": 60, "sec": 68, "rss_mb": 5906}
+{"year": 2020, "ics": 16, "of": 60, "sec": 77, "rss_mb": 5906}
+{"year": 2020, "ics": 18, "of": 60, "sec": 87, "rss_mb": 5906}
+{"year": 2020, "ics": 20, "of": 60, "sec": 97, "rss_mb": 5906}
+{"year": 2020, "ics": 22, "of": 60, "sec": 107, "rss_mb": 5906}
+{"year": 2020, "ics": 24, "of": 60, "sec": 118, "rss_mb": 5906}
+{"year": 2020, "ics": 26, "of": 60, "sec": 128, "rss_mb": 5906}
+{"year": 2020, "ics": 28, "of": 60, "sec": 138, "rss_mb": 5906}
+{"year": 2020, "ics": 30, "of": 60, "sec": 155, "rss_mb": 5906}
+{"year": 2020, "ics": 32, "of": 60, "sec": 166, "rss_mb": 5906}
+{"year": 2020, "ics": 34, "of": 60, "sec": 177, "rss_mb": 5906}
+{"year": 2020, "ics": 36, "of": 60, "sec": 187, "rss_mb": 5906}
+{"year": 2020, "ics": 38, "of": 60, "sec": 197, "rss_mb": 5906}
+{"year": 2020, "ics": 40, "of": 60, "sec": 208, "rss_mb": 5906}
+{"year": 2020, "ics": 42, "of": 60, "sec": 219, "rss_mb": 5906}
+{"year": 2020, "ics": 44, "of": 60, "sec": 229, "rss_mb": 5906}
+{"year": 2020, "ics": 46, "of": 60, "sec": 241, "rss_mb": 6014}
+{"year": 2020, "ics": 48, "of": 60, "sec": 253, "rss_mb": 6095}
+{"year": 2020, "ics": 50, "of": 60, "sec": 264, "rss_mb": 6105}
+{"year": 2020, "ics": 52, "of": 60, "sec": 275, "rss_mb": 6236}
+{"year": 2020, "ics": 54, "of": 60, "sec": 288, "rss_mb": 6236}
+{"year": 2020, "ics": 56, "of": 60, "sec": 298, "rss_mb": 6340}
+{"year": 2020, "ics": 58, "of": 60, "sec": 307, "rss_mb": 6340}
+{"year": 2020, "ics": 60, "of": 60, "sec": 317, "rss_mb": 6401}
+done 9 ['core_gngmz8W:devk_band_sphW_p', 'core_gngmz8W:devk_band_sphW_p@cv', 'core_gngmz8W:devk_band_sphW_p@cm', 'core_ngmz8W:devk_band_sphNW_p', 'core_ngmz8W:devk_band_sphNW_p@cv', 'core_ngmz8W:devk_band_sphNW_p@cm', 'sdress45:core_gngmz8W+core_ngmz8W', 'sdress45:cv', 'sdress45:cm'] 321
