@@ -1,0 +1,7 @@
+{"archive": 5844, "nv": 256, "sec": 8}
+{"dump": "md3", "dim": 16896, "npc": 200, "explained": 0.83, "sec": 22}
+{"tau": 3, "lags": 0, "ridge": 0.1, "val_mse_over_var": 0.7759, "sec": 23}
+{"year": 2016, "day": 10, "k": 7, "tau": 3, "lags": 0, "sec": 24}
+{"year": 2020, "day": 10, "k": 7, "tau": 3, "lags": 0, "sec": 27}
+{"year": 2017, "day": 10, "k": 7, "tau": 3, "lags": 0, "sec": 29}
+done 29

@@ -62,6 +62,9 @@ ap.add_argument("--lb", type=int, default=4, help="bias: degrees l <= lb")
 ap.add_argument("--lg", type=int, default=2, help="geo: the strength as a field of degree l <= lg")
 ap.add_argument("--max-ics", type=int, default=0)
 ap.add_argument("--block", type=int, default=0, help="block length (ICs) of the bootstrap; 0: 1, or 15 with lagged forecasts")
+ap.add_argument("--ref", default="bands", help="a second reference of the bootstrap (the increment of a candidate over it)")
+ap.add_argument("--test-drop-mod", type=int, default=0, help="score the test year without the ICs whose day is a multiple of N "
+                "(--test-drop-mod 6 on a daily dump: the starts the 60-IC set never used, an untouched test)")
 ap.add_argument("--json", default="")
 ap.add_argument("--save-theta", default="")
 ap.add_argument("--save-pred", nargs="*", default=[], help="TAG:EXP writes the conditioned mean of the candidate EXP as one more dump "
@@ -86,6 +89,9 @@ def load(y):
         if os.path.exists(f"{A.dir}/{y}_{t}.npy"):                                    # other dumps may be linked in
             d[t] = np.load(f"{A.dir}/{y}_{t}.npy", mmap_mode="r")
     d["n"] = min(len(d["ics"]), A.max_ics or 10 ** 9)
+    d["rows"] = np.arange(KLAG, d["n"])
+    if y == A.test and A.test_drop_mod:
+        d["rows"] = d["rows"][d["ics"][d["rows"]] % A.test_drop_mod != 0]
     assert not KLAG or np.all(np.diff(d["ics"]) == 1), "lagged forecasts need a dump of every day"
     return d
 
@@ -293,8 +299,9 @@ def pieces(d, idx, L):
 
 
 def batches(d):
-    for i in range(KLAG, d["n"], A.batch):
-        yield np.arange(i, min(i + A.batch, d["n"]))
+    r = d["rows"]
+    for i in range(0, len(r), A.batch):
+        yield r[i:i + A.batch]
 
 
 SP = {}
@@ -302,7 +309,8 @@ for sp in A.save_pred:
     tg_, ex_ = sp.split(":", 1)
     assert ex_ in A.exps and len(A.fit) == 2, "--save-pred needs its candidate among --exps and two fit years"
     SP[ex_] = {y: np.lib.format.open_memmap(f"{A.dir}/{y}_{tg_}.npy", mode="w+", dtype=np.float16, shape=(len(D[y]["ics"]), 10, C, H, W)) for y in YEARS}
-out = dict(meta=dict(fit=A.fit, test=A.test, cores=[CW, CN], ridge=A.ridge, zones=A.zones, lb=A.lb, days=A.days), days={})
+out = dict(meta=dict(fit=A.fit, test=A.test, cores=[CW, CN], ridge=A.ridge, zones=A.zones, lb=A.lb, days=A.days, dir=A.dir, math=A.math,
+                     ref=A.ref, test_drop_mod=A.test_drop_mod, block=A.block, test_ics=int(len(D[A.test]["rows"]))), days={})
 t0 = time.time()
 for day in A.days:
     L = day - 1
@@ -368,7 +376,8 @@ for day in A.days:
     nr = lambda m: float(np.sqrt(m.mean(0))[SC].mean())  # noqa: E731
     ref = MSE["bands"][(A.test, "all")] if "bands" in MSE else None
     rng = np.random.default_rng(0)
-    nT = D[A.test]["n"] - KLAG
+    nT = len(D[A.test]["rows"])
+    ref2 = MSE[A.ref][(A.test, "all")] if A.ref != "bands" and A.ref in MSE else None
     blk = A.block or (15 if KLAG else 1)                                              # daily starts are not independent
     nB = nT // blk
     draws = (rng.integers(0, nB, size=(2000, nB))[:, :, None] * blk + np.arange(blk)).reshape(2000, -1)
@@ -382,10 +391,16 @@ for day in A.days:
         if ref is not None and e != "bands":
             bs = np.array([rz(mt[i], Z) - rz(ref[i], Z) for i in draws])
             r["z500_minus_bands"] = [round(r["z500"] - rz(ref, Z), 2)] + np.percentile(bs, [2.5, 97.5]).round(2).tolist()
+        if ref2 is not None and e != A.ref:
+            bs2 = np.array([rz(mt[i], Z) - rz(ref2[i], Z) for i in draws])
+            r["z500_minus_ref"] = [round(r["z500"] - rz(ref2, Z), 2)] + np.percentile(bs2, [2.5, 97.5]).round(2).tolist()
+            if len(A.fit) == 2:
+                cvr = np.concatenate([MSE[A.ref][(y, y)] for y in A.fit])
+                r["cv_minus_ref"] = round(r["cv_z500"] - rz(cvr, Z), 2)
         res[e] = r
         print(f"day {day:2d} {e:24s} K {r['K']:3d}  z500 {r['z500']:6.1f} (fit16 {r['z500_fit2016']:6.1f})  cv {r.get('cv_z500', 0):6.1f}  "
               f"t850 {r['t850']:.3f} t2m {r['t2m']:.3f} nrmse {r['nrmse']:.4f} cv {r.get('cv_nrmse', 0):.4f}  "
-              f"{r.get('z500_minus_bands', '')}", flush=True)
+              f"{r.get('z500_minus_bands', '')}" + (f"  vs {A.ref} {r['z500_minus_ref']} cv {r.get('cv_minus_ref', '')}" if "z500_minus_ref" in r else ""), flush=True)
     out["days"][day] = res
     if A.save_theta:
         torch.save({e: TH[e]["all"] for e in A.exps}, f"{A.save_theta}_d{day}.pt")
