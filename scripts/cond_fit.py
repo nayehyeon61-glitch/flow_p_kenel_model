@@ -68,7 +68,8 @@ ap.add_argument("--test-drop-mod", type=int, default=0, help="score the test yea
 ap.add_argument("--json", default="")
 ap.add_argument("--save-theta", default="")
 ap.add_argument("--save-pred", nargs="*", default=[], help="TAG:EXP writes the conditioned mean of the candidate EXP as one more dump "
-                "<dir>/<year>_<TAG>.npy (only the leads of --days; the fit years with the strengths that never saw them)")
+                "<dir>/<year>_<TAG>.npy (only the leads of --days; two fit years: each with the strengths that never saw it; one fit year: "
+                "in sample)")
 A = ap.parse_args()
 torch.set_num_threads(A.threads)
 CORES = A.cores.split(",")
@@ -307,7 +308,7 @@ def batches(d):
 SP = {}
 for sp in A.save_pred:
     tg_, ex_ = sp.split(":", 1)
-    assert ex_ in A.exps and len(A.fit) == 2, "--save-pred needs its candidate among --exps and two fit years"
+    assert ex_ in A.exps and len(A.fit) in (1, 2), "--save-pred needs its candidate among --exps and one or two fit years"
     SP[ex_] = {y: np.lib.format.open_memmap(f"{A.dir}/{y}_{tg_}.npy", mode="w+", dtype=np.float16, shape=(len(D[y]["ics"]), 10, C, H, W)) for y in YEARS}
 out = dict(meta=dict(fit=A.fit, test=A.test, cores=[CW, CN], ridge=A.ridge, zones=A.zones, lb=A.lb, days=A.days, dir=A.dir, math=A.math,
                      ref=A.ref, test_drop_mod=A.test_drop_mod, block=A.block, test_ics=int(len(D[A.test]["rows"]))), days={})
@@ -362,7 +363,8 @@ for day in A.days:
             P, o = pieces(d, idx, L)
             for e in A.exps:
                 X = features(e, P)
-                keys = ["all", "f0"] if y == A.test else ([y] if len(A.fit) == 2 else [])
+                # the fit years: with two, the strengths that never saw the year; with one (the + version: 2016), in sample
+                keys = ["all", "f0"] if y == A.test else ([y] if len(A.fit) == 2 else ["all"])
                 for k in keys:
                     pred = torch.einsum("ck,bckhw->bchw", TH[e][k], X)
                     if e in SP and k != "f0":
@@ -385,6 +387,8 @@ for day in A.days:
         mt, m0 = MSE[e][(A.test, "all")], MSE[e][(A.test, "f0")]
         r = dict(K=int(TH[e]["all"].shape[1]), z500=rz(mt, Z), z500_fit2016=rz(m0, Z), t850=rz(mt, ch.index("t850")),
                  t2m=rz(mt, ch.index("t2m")), nrmse=nr(mt))
+        if len(A.fit) == 1:
+            r["fit_z500"] = rz(MSE[e][(A.fit[0], "all")], Z)                          # in sample
         if len(A.fit) == 2:
             cv = np.concatenate([MSE[e][(y, y)] for y in A.fit])
             r["cv_z500"], r["cv_nrmse"] = rz(cv, Z), nr(cv)

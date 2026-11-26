@@ -37,6 +37,25 @@
 #         mix     2017: the mixed kernel and the mixed kernel under the condition (scripts/score_mix.py), each with
 #                 both sides
 #         mixrep  the table runs/fpk_plus/mix_plus.md, paired comparisons, the IGN without the member-count bias
+#
+# The 711 stack (5.625 deg: z500 day 10 717.6 -> 711.0 on 2017, docs/results/mix_kernel.md and project notes; 감자
+# 2026-11-26 "그것까지 해야 711"): no new kernel, only cores and read-outs of their mean, so all of it but the two sister
+# cores is post hoc (strengths fitted on the validation year).
+#         core_s1 (each chain, after report; SISTERS=0 leaves it out) the sister core: the same recipe with seed 1
+#  then, in the chain without NOPHYS, once the mixture's steps are done and the other chain's sister is there:
+#         arch    the training record in the measure's coordinates (spherical harmonics l < MEASURE_LT, all 66 channels)
+#         dump    the four cores' forecasts, the truth and the start on the validation year (every 2nd day) and the test
+#                 year (the scorer's 60 ICs) (scripts/diag_cond.py)
+#         mcore   the measure continuation (scripts/measure_core.py --dump): the four cores' average carried on by the
+#                 record's transfer operator, mc0 (its projection on the measure's patterns, same day) and mc3 (the cores
+#                 to day 7, the operator the last 3 days)
+#         cfit    the conditioned mean (scripts/cond_fit.py, fitted on the validation year): bands of the four cores'
+#                 average + the neighbouring levels + mc0, mc3 = the mean "cm" of the 711 stack (cond711.json; the
+#                 reference: the two cores' bands, cond_two.json)
+#         kmix    2017: the two conditioned kernels moved onto cm and the error kernel about cm (errors of the
+#                 validation year, the same season) as one matrix (scripts/mix_matrix.py)
+#         rep711  the table runs/fpk_plus/plus711.md: the mean (z500, t850, t2m) of every piece and the CRPS of the
+#                 fixed mixture 0.3 / 0.3 / 0.4 against the + model (scripts/mix_fixed.py)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PY=${PY:-python}
@@ -52,6 +71,9 @@ DEVK_BATCH=${DEVK_BATCH:-4}; THROUGH=${THROUGH:-10}; FLOW_BATCH=${FLOW_BATCH:-4}
 SFX=""; NG=""
 if [ "${NOPHYS:-0}" = 1 ]; then SFX="_ng"; NG="--no-gfeat"; fi
 CORE=core_u64$SFX; K1=devk_m$SFX; K2=devk_band_sph$SFX; F=devflow_line$SFX
+SISTERS=${SISTERS:-1}                    # 1: one more core per chain with seed 1 (the four-core average of the 711 stack)
+THREADS=${THREADS:-16}                   # CPU threads of the post-hoc steps (arch, mcore, cfit, kmix)
+MEASURE_LT=${MEASURE_LT:-32}; MEASURE_NPC=${MEASURE_NPC:-400}
 
 # the 1.5 deg architecture: the core's U-Net (levels 1.5 / 3 / 6 deg), the kernel's and the flow's U-Nets (down to
 # 12 deg), the noise and the entropy's smoothing at the physical sizes of the 5.625 deg runs (17 deg and 28 deg)
@@ -119,6 +141,23 @@ do_smoke() {  # every stage at the full grid and batch, a few iterations, in its
     $FPK projk $S --dev-tag devk_s2 --tag devk_s2_p --proj-init "$SM/proj.npz" || return 1
     $PY scripts/score_mix.py mix_s core_s:devk_s2 core_s:devk_s2_p --data-root "$DATA" --out "$SM" $YRS \
         --max-ics 2 --ic-batch 1 || return 1
+    # the 711 stack, small: a record of three years, a dump of a few ICs, the smoke's core on both sides
+    local SC="$SM/cond" SR="--data-root $DATA --out $SM $YRS"
+    $PY scripts/plus_archive.py --dir "$SC" --lt 8 --years $((Y1 - 2)) $((Y1 - 1)) "$Y1" $SR || return 1
+    $PY scripts/diag_cond.py --cores core_s --year "$VAL" --ic-stride 30 --dir "$SC" $SR || return 1
+    $PY scripts/diag_cond.py --cores core_s --year "$TEST" --ic-stride 90 --dir "$SC" $SR || return 1
+    local MM="--dir $SC --years $VAL $TEST --days 1 3 5 7 10 --lt 8 --npc 50 --cores core_s --threads $THREADS"
+    $PY scripts/measure_core.py --dump mc0 --taus 0 $MM || return 1
+    $PY scripts/measure_core.py --dump mc3 --taus 3 --lags 1 $MM || return 1
+    $PY scripts/cond_fit.py --dir "$SC" --fit "$VAL" --test "$TEST" --cores core_s,core_s --days 1 3 5 7 10 \
+        --exps bands vert vert+math --math mc0,mc3 --save-pred cm:vert+math --batch 1 --threads "$THREADS" \
+        --json "$SM/cond711.json" || return 1
+    $PY scripts/mix_matrix.py --year "$TEST" --ic-stride 90 --max-ics 2 --pool "$VAL" --pool-stride 1 --base-core core_s \
+        --learned core_s:devk_s2 core_s:devk_s2_p --recenter cm --synth sdress400:cm asdress400:cm --dir "$SC" \
+        --npz "$SM/mixmat711.npz" --threads "$THREADS" $SR || return 1
+    $PY scripts/mix_fixed.py "$SM/mixmat711.npz" --base "devk_s2=0.5,devk_s2_p=0.5" \
+        --mix "devk_s2@cm=0.3,devk_s2_p@cm=0.3,sdress400:cm=0.4" > "$SM/mix_fixed711.log" || return 1
+    $PY scripts/report_711.py "$SM/plus711.md" --four "$SM/cond711.json" --fixed "$SM/mix_fixed711.log" || return 1
     echo "== smoke: GPU memory (GB) and seconds of the logged iterations"
     grep -ho '"gpu_gb": [0-9.]*' "$OUT/logs/smoke$SFX.log" | sort -t: -k2 -n | tail -1 || true   # none on the CPU
 }
@@ -163,6 +202,59 @@ do_mixrep() {
 
 mix_ready() { [ -f "$OUT/done/devk2" ] && [ -f "$OUT/done/devk2_ng" ]; }
 
+# ---- the 711 stack (the cores of both chains, the conditioned kernels of the mixture's steps)
+CD=$OUT/cond
+CORES711="$CP,$CN"; [ "$SISTERS" = 1 ] && CORES711="$CP,$CN,${CP}_s1,${CN}_s1"
+s711_ready() { [ -f "$OUT/done/projk" ] && { [ "$SISTERS" != 1 ] || { [ -f "$OUT/done/core_s1" ] && [ -f "$OUT/done/core_s1_ng" ]; }; }; }
+
+do_dump() {   # the validation year every 2nd day (the fit, the error kernel's pool), the test year at the scorer's ICs
+    local ys y s have
+    for ys in "$VAL 2" "$TEST 6"; do
+        set -- $ys; y=$1; s=$2
+        have=""                                   # meta.json is written last: a finished dump of the same cores
+        [ -f "$CD/${y}_meta.json" ] && have=$($PY -c "import json; print(','.join(json.load(open('$CD/${y}_meta.json'))['cores']))")
+        if [ "$have" = "$CORES711" ]; then echo "dump $y: there ($have)"; continue; fi
+        $PY scripts/diag_cond.py --cores "$CORES711" --year "$y" --ic-stride "$s" --dir "$CD" $RA || return 1
+    done
+}
+
+do_mcore() {
+    local M="--dir $CD --years $VAL $TEST --days 1 3 5 7 10 --lt $MEASURE_LT --npc $MEASURE_NPC --cores $CORES711 --threads $THREADS"
+    $PY scripts/measure_core.py --dump mc0 --taus 0 $M || return 1
+    $PY scripts/measure_core.py --dump mc3 --taus 3 --lags 1 $M
+}
+
+do_cfit() {
+    local F="--dir $CD --fit $VAL --test $TEST --days 1 3 5 7 10 --batch 2 --threads $THREADS"
+    $PY scripts/cond_fit.py $F --cores "$CP,$CN" --exps bands --json "$OUT/cond_two.json" || return 1
+    $PY scripts/cond_fit.py $F --cores "$CORES711" --exps bands vert vert+math --math mc0,mc3 \
+        --save-pred cm:vert+math --json "$OUT/cond711.json"
+}
+
+do_kmix() {   # host memory: the pool's truth and errors (f16 / f32) and 2 ICs of 6 kernels' members, about 20 GB
+    $PY scripts/mix_matrix.py --year "$TEST" --pool "$VAL" --pool-stride 1 --base-core "$CP" \
+        --learned "$CP:${KP}_p" "$CN:${KN}_p" --recenter cm --synth sdress45:cm asdress45:cm --dir "$CD" \
+        --npz "$OUT/mixmat711_$TEST.npz" --threads "$THREADS" $RA
+}
+
+do_rep711() {
+    $PY scripts/mix_fixed.py "$OUT/mixmat711_$TEST.npz" --base "sph_p=0.5,sph_ng_p=0.5" --mix \
+        "sph_p@cm=0.3,sph_ng_p@cm=0.3,sdress45:cm=0.4" "sph_p@cm=0.3,sph_ng_p@cm=0.3,asdress45:cm=0.4" \
+        "sph_p@cm=0.5,sph_ng_p@cm=0.5" > "$OUT/mix_fixed711.log" || return 1
+    $PY scripts/report_711.py "$OUT/plus711.md" --two "$OUT/cond_two.json" --four "$OUT/cond711.json" \
+        --fixed "$OUT/mix_fixed711.log" --cores "$CORES711" && cat "$OUT/plus711.md"
+}
+
+wait_for() {  # wait_for MARKER...: while the chain without G(x) writes its logs (6 hours without a line ends the wait)
+    local m ok
+    while :; do
+        ok=1; for m in "$@"; do [ -f "$OUT/done/$m" ] || ok=0; done
+        [ $ok = 1 ] && return 0
+        [ -n "$(find "$OUT/logs" -name '*_ng.log' -mmin -360 2>/dev/null)" ] || return 1
+        sleep 600
+    done
+}
+
 do_report() {
     $PY scripts/eval_fpk_vars.py "$OUT/score_plus$SFX" --ref core --arms $K1 $K2 $F --out "$OUT/vars_plus$SFX.md" \
         --json "$OUT/vars_plus$SFX.json" && cat "$OUT/vars_plus$SFX.md" | head -60
@@ -180,13 +272,15 @@ step flow   $FPK devflow $C --tag $F --dev-tag $K2 --iters "$FLOW_ITERS" $FLOW_A
 step score  $FPK score $C --arms persistence core $K1 $K2 $F --score-tag score_plus$SFX
 step report do_report
 echo "[$(date '+%m-%d %H:%M')] chain finished: $OUT/score_plus$SFX.json, $OUT/vars_plus$SFX.md"
+# the sister core (the 711 stack's four-core average): the same recipe, seed 1, its own tag
+[ "$SISTERS" = 1 ] && step core_s1 $FPK core --data-root "$DATA" --out "$OUT" $YRS --core-tag "${CORE}_s1" $NG --seed 1 \
+    --iters "$CORE_ITERS" --core-ckpt --resume -- $CORE_ARCH --curriculum 1 2 3 4 6 8 10
 
 # ---- the + model: the mixed kernel under the condition (needs the kernels of both chains)
-[ "${NOPHYS:-0}" = 1 ] && { echo "the mixture's steps run in the chain without NOPHYS (it waits for this one's devk2)"; exit 0; }
+[ "${NOPHYS:-0}" = 1 ] && { echo "the mixture's and the 711 stack's steps run in the chain without NOPHYS (it waits for this one)"; exit 0; }
 if ! mix_ready && [ "${DRYRUN:-0}" != 1 ] && [ "${MIX_WAIT:-1}" = 1 ] && [ -f "$OUT/logs/core_ng.log" ]; then
     echo "[$(date '+%m-%d %H:%M')] waiting for the chain without G(x) (done/devk2_ng)"
-    # it waits while that chain writes its logs; 6 hours without a line ends the wait (that chain stopped)
-    while ! mix_ready && [ -n "$(find "$OUT/logs" -name '*_ng.log' -mmin -360 2>/dev/null)" ]; do sleep 600; done
+    wait_for devk2_ng                         # while that chain writes its logs; 6 hours without a line: it stopped
 fi
 if mix_ready || [ "${DRYRUN:-0}" = 1 ]; then
     step proj   $PY scripts/diag_projection.py stats --cores "$CP,$CN" --year "$VAL" --ic-stride 2 --npz "$PROJ" $RA
@@ -194,6 +288,23 @@ if mix_ready || [ "${DRYRUN:-0}" = 1 ]; then
     step mix    do_mix
     step mixrep do_mixrep
     echo "[$(date '+%m-%d %H:%M')] the + model: $OUT/mix_plus.md, $OUT/score_mixkp_plus.json"
+    # ---- the 711 stack: four cores, the measure continuation, the conditioned mean, the kernels on it
+    if [ "$SISTERS" = 1 ] && ! s711_ready && [ "${DRYRUN:-0}" != 1 ] && [ "${MIX_WAIT:-1}" = 1 ]; then
+        echo "[$(date '+%m-%d %H:%M')] waiting for the sister core of the chain without G(x) (done/core_s1_ng)"
+        wait_for core_s1_ng
+    fi
+    if s711_ready || [ "${DRYRUN:-0}" = 1 ]; then
+        step arch   $PY scripts/plus_archive.py --dir "$CD" --lt "$MEASURE_LT" $RA
+        step dump   do_dump
+        step mcore  do_mcore
+        step cfit   do_cfit
+        step kmix   do_kmix
+        step rep711 do_rep711
+        echo "[$(date '+%m-%d %H:%M')] the 711 stack: $OUT/plus711.md"
+    else
+        echo "the 711 stack needs the sister core of the chain without G(x) (done/core_s1_ng): when it is done, start"
+        echo "this chain again (the finished steps are skipped), or SISTERS=0 for the stack on the two cores"
+    fi
 else
     echo "the + model (the mixed kernel) needs the kernel of the chain without G(x) too:"
     echo "  NOPHYS=1 nohup bash scripts/gpu_free.sh bash scripts/run_fpk_plus.sh > $OUT/chain_ng.log 2>&1 &"

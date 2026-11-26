@@ -74,6 +74,7 @@ ap.add_argument("--recenter", nargs="*", default=[], help="tags of means in --di
                 "kernel's noise: never mix a kernel with its own variant.")
 ap.add_argument("--threads", type=int, default=4)
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--base-core", default="core_gngmz8W", help="a core of this folder (only its data, climatology and years are used)")
 A, PASS = ap.parse_known_args()
 assert A.year not in A.pool, "the dressing errors must come from other years"
 torch.set_num_threads(A.threads)
@@ -105,7 +106,7 @@ def grab(a, rest):
 
 R.cmd_score = grab
 common = ["--members", str(A.members), "--threads", str(A.threads), "--test-year", str(A.year), "--ic-stride", str(A.ic_stride)] + PASS
-R.main(["score", "--core-tag", "core_gngmz8W", "--arms", "core"] + common)
+R.main(["score", "--core-tag", A.base_core, "--arms", "core"] + common)
 for n, spec in enumerate(A.learned):
     ct, arm = spec.split(":")
     R.main(["score", "--core-tag", ct, "--arms", arm, "--seed", str(A.seed + n)] + common)    # every side its own noise

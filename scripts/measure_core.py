@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from fpk.sphere import SHT  # noqa: E402
+from fpk.measure import MeasureCoords  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--dir", default="runs/fpk/cond")
@@ -42,40 +42,19 @@ ap.add_argument("--dump", default="", help="write every channel as one more core
 ap.add_argument("--lt", type=int, default=16)
 ap.add_argument("--npc", type=int, default=200)
 ap.add_argument("--threads", type=int, default=4)
+ap.add_argument("--hold", type=int, default=2, help="the last N years of the record choose the ridge (then everything is refitted)")
 A = ap.parse_args()
 torch.set_num_threads(A.threads)
 CORES = A.cores.split(",")
 meta = json.load(open(f"{A.dir}/{A.years[0]}_meta.json"))
 ch, lat = meta["channels"], np.asarray(meta["lat"])
 C = len(ch)
-sht = SHT(lat)
-M = sht.ana.shape[0]
-keep = torch.zeros(sht.L, M, dtype=torch.bool)
-for l in range(A.lt):
-    keep[l, : l + 1] = True
-im0 = torch.zeros(sht.L, M, dtype=torch.bool)
-im0[:, 0] = True
-KI, KIm = keep.flatten().nonzero()[:, 0], (keep & ~im0).flatten().nonzero()[:, 0]
-NV = len(KI) + len(KIm)
+MC = MeasureCoords(lat, A.lt)
+NV, HH, WW = MC.nv, MC.H, MC.W                                                        # the grid's width: 2 (H - 1) with the poles
 wl = np.cos(np.deg2rad(lat))
 wl = torch.tensor(wl / wl.mean(), dtype=torch.float32)[:, None]
+to_vec, to_field = MC.to_vec, MC.to_field
 SURF = ("t2m", "sp", "msl", "tcwv", "skt", "tisr")
-
-
-def to_vec(f):
-    """(D, C, H, W) anomaly (numpy, any float) -> (D, C, NV): the real coefficients l < lt."""
-    out = []
-    for i in range(0, len(f), 64):
-        c = sht.analysis(torch.from_numpy(np.ascontiguousarray(f[i:i + 64], dtype=np.float32))).flatten(-2)
-        out.append(torch.cat([c.real[..., KI], c.imag[..., KIm]], -1))
-    return torch.cat(out)
-
-
-def to_field(v):
-    """(B, NV) of one channel -> (B, H, W)."""
-    re, im = torch.zeros(len(v), sht.L * M), torch.zeros(len(v), sht.L * M)
-    re[:, KI], im[:, KIm] = v[:, : len(KI)], v[:, len(KI):]
-    return sht.synthesis(torch.complex(re, im).view(len(v), sht.L, M))
 
 
 def inputs(chan):
@@ -97,7 +76,13 @@ def inputs(chan):
 
 t0 = time.time()
 am = json.load(open(f"{A.dir}/archive_meta.json"))
-V = to_vec(np.load(f"{A.dir}/archive_anom.npy", mmap_mode="r"))                       # (N, C, NV)
+if os.path.exists(f"{A.dir}/archive_vec.npy"):                                         # the record's coefficients (plus_archive.py)
+    if am.get("lt") != A.lt or am.get("grid") != [HH, WW]:
+        raise SystemExit(f"{A.dir}/archive_vec.npy has lt {am.get('lt')} on {am.get('grid')}, here lt {A.lt} on {[HH, WW]}: "
+                         f"make it again (scripts/plus_archive.py --lt {A.lt})")
+    V = torch.from_numpy(np.load(f"{A.dir}/archive_vec.npy"))                         # (N, C, NV)
+else:                                                                                  # the record's fields (5.625 deg, mix_matrix.py)
+    V = to_vec(np.load(f"{A.dir}/archive_anom.npy", mmap_mode="r"))
 starts = np.cumsum([0] + am["days"])
 YR = np.concatenate([np.full(n, y) for y, n in zip(am["years"], am["days"])])
 print(json.dumps(dict(archive=len(V), nv=NV, sec=round(time.time() - t0))), flush=True)
@@ -130,7 +115,7 @@ if A.dump:                                                                      
     def lim(tau, lags):
         if (tau, lags) not in WD:
             rows = np.concatenate([np.arange(s + lags, e - tau) for s, e in zip(starts[:-1], starts[1:])])
-            hold = np.isin(YR[rows], am["years"][-2:])
+            hold = np.isin(YR[rows], am["years"][-A.hold:])
             X = torch.cat([P[rows - j] for j in range(lags + 1)] + [torch.ones(len(rows), 1)], 1)
             Xt, Xh, Yh = X[~hold], X[hold], Vi[rows[hold] + tau]
             Gt, Bt = Xt.T @ Xt, Xt.T @ Vi[rows[~hold] + tau]
@@ -147,7 +132,7 @@ if A.dump:                                                                      
     T0 = A.taus[0]
     for y in A.years:
         n = len(json.load(open(f"{A.dir}/{y}_meta.json"))["ics"])
-        out = np.lib.format.open_memmap(f"{A.dir}/{y}_{A.dump}.npy", mode="w+", dtype=np.float16, shape=(n, 10, C, len(lat), 2 * len(lat)))
+        out = np.lib.format.open_memmap(f"{A.dir}/{y}_{A.dump}.npy", mode="w+", dtype=np.float16, shape=(n, 10, C, HH, WW))
         for day in A.days:
             tau = 0 if T0 == 0 else (min(T0, day - 1) if day >= 2 else 1)
             k = day - tau
@@ -159,7 +144,7 @@ if A.dump:                                                                      
             Wm = lim(tau, lags)
             for i in range(0, n, 32):
                 pr = (Pk[i:i + 32] @ Wm).view(-1, NV)
-                out[i:i + 32, day - 1] = to_field(pr).view(-1, C, len(lat), 2 * len(lat)).numpy()
+                out[i:i + 32, day - 1] = to_field(pr).view(-1, C, HH, WW).numpy()
             print(json.dumps(dict(year=y, day=day, k=k, tau=tau, lags=lags, sec=round(time.time() - t0))), flush=True)
         out.flush()
         del out
@@ -185,7 +170,7 @@ for chan in A.chans:
     Wt = {}
     for tau in sorted(set(A.taus)):
         rows = np.concatenate([np.arange(s + A.lags, e - tau) for s, e in zip(starts[:-1], starts[1:])])
-        hold = torch.from_numpy(np.isin(YR[rows], am["years"][-2:]))
+        hold = torch.from_numpy(np.isin(YR[rows], am["years"][-A.hold:]))
         X = torch.cat([P[rows - j] for j in range(A.lags + 1)] + [torch.ones(len(rows), 1)], 1)
         Y = T[rows + tau]
 
