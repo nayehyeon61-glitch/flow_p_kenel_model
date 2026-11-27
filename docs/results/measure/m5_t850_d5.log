@@ -1,0 +1,13 @@
+day  5 t850 bands                        K    6  test    2.5  cv    2.5  oracle    2.5   cv 2016: 2.5 2020: 2.5
+    band 0: g 0.969 (oracle 0.991)  forecast var 0.010  truth var 0.007  error share 0.003  corr 0.872
+    band 1: g 0.810 (oracle 0.728)  forecast var 0.017  truth var 0.011  error share 0.010  corr 0.668
+    band 2: g 0.880 (oracle 0.820)  forecast var 0.075  truth var 0.054  error share 0.043  corr 0.712
+    band 3: g 0.936 (oracle 0.932)  forecast var 0.443  truth var 0.374  error share 0.259  corr 0.752
+    band 4: g 0.825 (oracle 0.792)  forecast var 0.351  truth var 0.429  error share 0.491  corr 0.530
+    band 5: g 0.210 (oracle 0.194)  forecast var 0.104  truth var 0.124  error share 0.194  corr 0.132
+day  5 t850 hyb5                         K   12  test    2.4  cv    2.4  oracle    2.4  [-0.07, -0.09, -0.06] cv 2016: 2.4 2020: 2.4
+day  5 t850 hyb4                         K   12  test    2.4  cv    2.4  oracle    2.4  [-0.08, -0.09, -0.07] cv 2016: 2.4 2020: 2.4
+day  5 t850 hyb3                         K   12  test    2.5  cv    2.4  oracle    2.5  [-0.06, -0.07, -0.05] cv 2016: 2.4 2020: 2.4
+day  5 t850 hyb2                         K   12  test    2.5  cv    2.5  oracle    2.5  [-0.04, -0.05, -0.03] cv 2016: 2.5 2020: 2.5
+day  5 t850 hyb5+hyb3                    K   18  test    2.4  cv    2.4  oracle    2.4  [-0.08, -0.09, -0.07] cv 2016: 2.4 2020: 2.4
+day  5 t850 hyb5+hyb2                    K   18  test    2.4  cv    2.4  oracle    2.4  [-0.08, -0.09, -0.07] cv 2016: 2.4 2020: 2.4

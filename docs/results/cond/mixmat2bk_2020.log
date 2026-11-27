@@ -1,0 +1,35 @@
+{"dress": "dress:core_gngmz8W+core_ngmz8W", "pool": 356, "g_z500": [1.013, 1.038, 1.026, 0.974, 0.864]}
+{"kappa": "core_gngmz8W:devflow_gW", "on": "core_gngmz8W:devk_band_sphW_p", "maps_ics": 60, "z500": [0.819, 0.795, 0.835, 0.864, 0.86], "mean_day10": 0.89}
+{"kappa": "core_ngmz8W:devflow_gNW", "on": "core_ngmz8W:devk_band_sphNW_p", "maps_ics": 60, "z500": [0.801, 0.761, 0.789, 0.823, 0.835], "mean_day10": 0.888}
+{"cache": {"core_gngmz8W:devk_band_sphW_p": "r", "core_ngmz8W:devk_band_sphNW_p": "r", "core_gngmz8W:devflow_gW": "r", "core_ngmz8W:devflow_gNW": "r"}}
+{"year": 2020, "ics": 2, "of": 60, "sec": 17, "rss_mb": 4905}
+{"year": 2020, "ics": 4, "of": 60, "sec": 31, "rss_mb": 4905}
+{"year": 2020, "ics": 6, "of": 60, "sec": 39, "rss_mb": 4905}
+{"year": 2020, "ics": 8, "of": 60, "sec": 46, "rss_mb": 4905}
+{"year": 2020, "ics": 10, "of": 60, "sec": 52, "rss_mb": 4905}
+{"year": 2020, "ics": 12, "of": 60, "sec": 59, "rss_mb": 4905}
+{"year": 2020, "ics": 14, "of": 60, "sec": 65, "rss_mb": 4905}
+{"year": 2020, "ics": 16, "of": 60, "sec": 73, "rss_mb": 4905}
+{"year": 2020, "ics": 18, "of": 60, "sec": 81, "rss_mb": 4911}
+{"year": 2020, "ics": 20, "of": 60, "sec": 87, "rss_mb": 5109}
+{"year": 2020, "ics": 22, "of": 60, "sec": 95, "rss_mb": 5119}
+{"year": 2020, "ics": 24, "of": 60, "sec": 103, "rss_mb": 5275}
+{"year": 2020, "ics": 26, "of": 60, "sec": 110, "rss_mb": 5371}
+{"year": 2020, "ics": 28, "of": 60, "sec": 117, "rss_mb": 5570}
+{"year": 2020, "ics": 30, "of": 60, "sec": 125, "rss_mb": 5570}
+{"year": 2020, "ics": 32, "of": 60, "sec": 133, "rss_mb": 5819}
+{"year": 2020, "ics": 34, "of": 60, "sec": 140, "rss_mb": 5819}
+{"year": 2020, "ics": 36, "of": 60, "sec": 147, "rss_mb": 6007}
+{"year": 2020, "ics": 38, "of": 60, "sec": 155, "rss_mb": 6063}
+{"year": 2020, "ics": 40, "of": 60, "sec": 163, "rss_mb": 6259}
+{"year": 2020, "ics": 42, "of": 60, "sec": 170, "rss_mb": 6269}
+{"year": 2020, "ics": 44, "of": 60, "sec": 178, "rss_mb": 6324}
+{"year": 2020, "ics": 46, "of": 60, "sec": 186, "rss_mb": 6604}
+{"year": 2020, "ics": 48, "of": 60, "sec": 195, "rss_mb": 6637}
+{"year": 2020, "ics": 50, "of": 60, "sec": 203, "rss_mb": 6871}
+{"year": 2020, "ics": 52, "of": 60, "sec": 211, "rss_mb": 6871}
+{"year": 2020, "ics": 54, "of": 60, "sec": 218, "rss_mb": 7139}
+{"year": 2020, "ics": 56, "of": 60, "sec": 226, "rss_mb": 7151}
+{"year": 2020, "ics": 58, "of": 60, "sec": 234, "rss_mb": 7246}
+{"year": 2020, "ics": 60, "of": 60, "sec": 242, "rss_mb": 7375}
+done 13 ['core_gngmz8W:devk_band_sphW_p', 'core_ngmz8W:devk_band_sphNW_p', 'core_gngmz8W:devflow_gW', 'core_gngmz8W:devflow_gW@p', 'core_gngmz8W:devflow_gW@pk', 'core_gngmz8W:devflow_gW@pklat', 'core_ngmz8W:devflow_gNW', 'core_ngmz8W:devflow_gNW@p', 'core_ngmz8W:devflow_gNW@pk', 'core_ngmz8W:devflow_gNW@pklat', 'clim', 'dress:core_gngmz8W+core_ngmz8W', 'sdress45:core_gngmz8W+core_ngmz8W'] 253

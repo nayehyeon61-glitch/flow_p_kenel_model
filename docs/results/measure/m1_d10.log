@@ -1,0 +1,19 @@
+{"archive_days": 5844, "eof_explained": {"1": 0.0585, "4": 0.1875, "16": 0.4859, "64": 0.8572, "256": 0.9891, "1024": 0.9998}, "clim_rms": 795.7}
+day 10 z500 bands                        K    6  test  717.6  cv  729.0  oracle  717.0   
+    band 0: g 1.085 (oracle 0.905)  forecast var 0.009  truth var 0.005  error share 0.003  corr 0.659
+    band 1: g 0.822 (oracle 0.810)  forecast var 0.015  truth var 0.012  error share 0.012  corr 0.454
+    band 2: g 0.917 (oracle 0.780)  forecast var 0.107  truth var 0.080  error share 0.077  corr 0.460
+    band 3: g 0.929 (oracle 0.860)  forecast var 0.577  truth var 0.462  error share 0.426  corr 0.489
+    band 4: g 0.803 (oracle 0.782)  forecast var 0.267  truth var 0.402  error share 0.435  corr 0.324
+    band 5: g 0.211 (oracle 0.227)  forecast var 0.025  truth var 0.040  error share 0.048  corr 0.092
+day 10 z500 deg                          K   32  test  717.3  cv  729.1  oracle  716.0  [-0.35, -0.63, -0.09] 
+day 10 z500 mband                        K   14  test  718.0  cv  729.2  oracle  716.6  [0.37, -0.17, 0.94] 
+day 10 z500 eof                          K   12  test  716.7  cv  728.6  oracle  714.4  [-0.92, -2.13, 0.23] 
+day 10 z500 phase                        K   16  test  717.9  cv  729.4  oracle  716.6  [0.29, -0.02, 0.63] 
+day 10 z500 bands+clim16+vert            K   24  test  716.4  cv  728.8  oracle  715.0  [-1.17, -1.81, -0.53] 
+    full R   10  cv 0.03: 741.2  0.1: 738.2  0.3: 733.9  1: 729.9  3: 728.6  10: 728.7
+    full R   20  cv 0.03: 763.1  0.1: 752.8  0.3: 740.5  1: 731.2  3: 728.3  10: 728.2
+    full R   40  cv 0.03: 843.8  0.1: 806.8  0.3: 770.5  1: 743.5  3: 732.6  10: 729.2
+    full R   80  cv 0.03: 925.0  0.1: 861.0  0.3: 806.3  1: 762.0  3: 740.0  10: 730.9
+    full R  160  cv 0.03: 983.5  0.1: 906.3  0.3: 843.0  1: 786.1  3: 752.0  10: 734.5
+day 10 z500 full                         K  400  test  717.5  cv  728.2  oracle  706.7  [-0.06, -0.81, 0.7] R 20 ridge 10

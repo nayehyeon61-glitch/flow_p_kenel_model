@@ -1,0 +1,252 @@
+{"archive": 5844, "nv": 256, "sec": 8}
+{"chan": "z500", "inputs": 66, "dim": 16896, "npc": 200, "explained": 0.83, "sec": 21}
+{"chan": "z500", "tau": 0, "ridge": 0.01, "val_skill": 0.9322, "sec": 21}
+{"chan": "z500", "tau": 1, "ridge": 0.01, "val_skill": 0.7753, "sec": 21}
+{"chan": "z500", "tau": 2, "ridge": 0.1, "val_skill": 0.4994, "sec": 21}
+{"chan": "z500", "tau": 3, "ridge": 0.1, "val_skill": 0.2965, "sec": 21}
+{"chan": "z500", "tau": 4, "ridge": 0.1, "val_skill": 0.1655, "sec": 21}
+{"chan": "z500", "tau": 5, "ridge": 1.0, "val_skill": 0.0881, "sec": 21}
+{"chan": "z500", "tau": 7, "ridge": 1.0, "val_skill": 0.0167, "sec": 21}
+{"chan": "z500", "tau": 10, "ridge": 1.0, "val_skill": -0.0292, "sec": 21}
+{"chan": "z500", "day": 3, "year": 2016, "k": 3, "tau": 0, "rmse": 418.95, "rmse_scaled": 413.48, "g": 1.106, "clim": 818.37, "sec": 22}
+{"chan": "z500", "day": 3, "year": 2016, "k": 2, "tau": 1, "rmse": 467.63, "rmse_scaled": 466.73, "g": 1.045, "clim": 818.37, "sec": 24}
+{"chan": "z500", "day": 3, "year": 2016, "k": 1, "tau": 2, "rmse": 565.24, "rmse_scaled": 563.96, "g": 1.069, "clim": 818.37, "sec": 25}
+{"chan": "z500", "day": 3, "year": 2016, "k": 0, "tau": 3, "rmse": 643.13, "rmse_scaled": 643.05, "g": 1.022, "clim": 818.37, "sec": 26}
+{"chan": "z500", "day": 3, "year": 2020, "k": 3, "tau": 0, "rmse": 418.1, "rmse_scaled": 413.24, "g": 1.101, "clim": 804.75, "sec": 27}
+{"chan": "z500", "day": 3, "year": 2020, "k": 2, "tau": 1, "rmse": 465.7, "rmse_scaled": 464.79, "g": 1.046, "clim": 804.75, "sec": 29}
+{"chan": "z500", "day": 3, "year": 2020, "k": 1, "tau": 2, "rmse": 562.45, "rmse_scaled": 561.24, "g": 1.068, "clim": 804.75, "sec": 30}
+{"chan": "z500", "day": 3, "year": 2020, "k": 0, "tau": 3, "rmse": 640.48, "rmse_scaled": 640.45, "g": 1.012, "clim": 804.75, "sec": 31}
+{"chan": "z500", "day": 3, "year": 2017, "k": 3, "tau": 0, "rmse": 414.73, "rmse_scaled": 410.56, "g": 1.095, "clim": 790.0, "sec": 31}
+{"chan": "z500", "day": 3, "year": 2017, "k": 2, "tau": 1, "rmse": 457.4, "rmse_scaled": 456.94, "g": 1.033, "clim": 790.0, "sec": 31}
+{"chan": "z500", "day": 3, "year": 2017, "k": 1, "tau": 2, "rmse": 550.98, "rmse_scaled": 550.33, "g": 1.05, "clim": 790.0, "sec": 31}
+{"chan": "z500", "day": 3, "year": 2017, "k": 0, "tau": 3, "rmse": 624.44, "rmse_scaled": 624.44, "g": 1.003, "clim": 790.0, "sec": 32}
+{"chan": "z500", "day": 5, "year": 2016, "k": 5, "tau": 0, "rmse": 560.61, "rmse_scaled": 557.32, "g": 1.113, "clim": 817.13, "sec": 33}
+{"chan": "z500", "day": 5, "year": 2016, "k": 4, "tau": 1, "rmse": 572.95, "rmse_scaled": 571.7, "g": 1.069, "clim": 817.13, "sec": 34}
+{"chan": "z500", "day": 5, "year": 2016, "k": 3, "tau": 2, "rmse": 618.07, "rmse_scaled": 616.17, "g": 1.099, "clim": 817.13, "sec": 34}
+{"chan": "z500", "day": 5, "year": 2016, "k": 2, "tau": 3, "rmse": 665.43, "rmse_scaled": 665.13, "g": 1.044, "clim": 817.13, "sec": 34}
+{"chan": "z500", "day": 5, "year": 2016, "k": 1, "tau": 4, "rmse": 707.16, "rmse_scaled": 706.94, "g": 0.959, "clim": 817.13, "sec": 34}
+{"chan": "z500", "day": 5, "year": 2016, "k": 0, "tau": 5, "rmse": 743.48, "rmse_scaled": 740.88, "g": 1.22, "clim": 817.13, "sec": 34}
+{"chan": "z500", "day": 5, "year": 2020, "k": 5, "tau": 0, "rmse": 558.92, "rmse_scaled": 556.26, "g": 1.103, "clim": 805.31, "sec": 36}
+{"chan": "z500", "day": 5, "year": 2020, "k": 4, "tau": 1, "rmse": 572.41, "rmse_scaled": 571.46, "g": 1.062, "clim": 805.31, "sec": 37}
+{"chan": "z500", "day": 5, "year": 2020, "k": 3, "tau": 2, "rmse": 615.11, "rmse_scaled": 613.33, "g": 1.098, "clim": 805.31, "sec": 37}
+{"chan": "z500", "day": 5, "year": 2020, "k": 2, "tau": 3, "rmse": 660.4, "rmse_scaled": 660.07, "g": 1.047, "clim": 805.31, "sec": 37}
+{"chan": "z500", "day": 5, "year": 2020, "k": 1, "tau": 4, "rmse": 700.64, "rmse_scaled": 700.5, "g": 0.965, "clim": 805.31, "sec": 37}
+{"chan": "z500", "day": 5, "year": 2020, "k": 0, "tau": 5, "rmse": 737.07, "rmse_scaled": 733.92, "g": 1.259, "clim": 805.31, "sec": 37}
+{"chan": "z500", "day": 5, "year": 2017, "k": 5, "tau": 0, "rmse": 561.54, "rmse_scaled": 559.4, "g": 1.094, "clim": 797.3, "sec": 38}
+{"chan": "z500", "day": 5, "year": 2017, "k": 4, "tau": 1, "rmse": 573.02, "rmse_scaled": 572.39, "g": 1.051, "clim": 797.3, "sec": 38}
+{"chan": "z500", "day": 5, "year": 2017, "k": 3, "tau": 2, "rmse": 611.95, "rmse_scaled": 610.36, "g": 1.094, "clim": 797.3, "sec": 38}
+{"chan": "z500", "day": 5, "year": 2017, "k": 2, "tau": 3, "rmse": 653.54, "rmse_scaled": 653.19, "g": 1.049, "clim": 797.3, "sec": 38}
+{"chan": "z500", "day": 5, "year": 2017, "k": 1, "tau": 4, "rmse": 690.65, "rmse_scaled": 690.55, "g": 0.971, "clim": 797.3, "sec": 38}
+{"chan": "z500", "day": 5, "year": 2017, "k": 0, "tau": 5, "rmse": 725.31, "rmse_scaled": 722.43, "g": 1.237, "clim": 797.3, "sec": 38}
+{"chan": "z500", "day": 7, "year": 2016, "k": 7, "tau": 0, "rmse": 659.33, "rmse_scaled": 658.65, "g": 1.066, "clim": 816.41, "sec": 39}
+{"chan": "z500", "day": 7, "year": 2016, "k": 6, "tau": 1, "rmse": 661.25, "rmse_scaled": 661.0, "g": 1.039, "clim": 816.41, "sec": 41}
+{"chan": "z500", "day": 7, "year": 2016, "k": 5, "tau": 2, "rmse": 677.25, "rmse_scaled": 676.21, "g": 1.089, "clim": 816.41, "sec": 41}
+{"chan": "z500", "day": 7, "year": 2016, "k": 4, "tau": 3, "rmse": 698.55, "rmse_scaled": 698.13, "g": 1.061, "clim": 816.41, "sec": 41}
+{"chan": "z500", "day": 7, "year": 2016, "k": 3, "tau": 4, "rmse": 722.06, "rmse_scaled": 722.05, "g": 0.995, "clim": 816.41, "sec": 41}
+{"chan": "z500", "day": 7, "year": 2016, "k": 2, "tau": 5, "rmse": 750.05, "rmse_scaled": 747.47, "g": 1.234, "clim": 816.41, "sec": 41}
+{"chan": "z500", "day": 7, "year": 2016, "k": 0, "tau": 7, "rmse": 772.5, "rmse_scaled": 772.21, "g": 1.086, "clim": 816.41, "sec": 41}
+{"chan": "z500", "day": 7, "year": 2020, "k": 7, "tau": 0, "rmse": 651.27, "rmse_scaled": 650.43, "g": 1.074, "clim": 806.01, "sec": 42}
+{"chan": "z500", "day": 7, "year": 2020, "k": 6, "tau": 1, "rmse": 654.46, "rmse_scaled": 654.1, "g": 1.048, "clim": 806.01, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2020, "k": 5, "tau": 2, "rmse": 671.22, "rmse_scaled": 669.95, "g": 1.101, "clim": 806.01, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2020, "k": 4, "tau": 3, "rmse": 692.22, "rmse_scaled": 691.62, "g": 1.075, "clim": 806.01, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2020, "k": 3, "tau": 4, "rmse": 713.88, "rmse_scaled": 713.84, "g": 1.02, "clim": 806.01, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2020, "k": 2, "tau": 5, "rmse": 743.04, "rmse_scaled": 739.32, "g": 1.301, "clim": 806.01, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2020, "k": 0, "tau": 7, "rmse": 766.32, "rmse_scaled": 765.81, "g": 1.126, "clim": 806.01, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 7, "tau": 0, "rmse": 655.26, "rmse_scaled": 655.24, "g": 1.012, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 6, "tau": 1, "rmse": 656.69, "rmse_scaled": 656.69, "g": 0.995, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 5, "tau": 2, "rmse": 670.32, "rmse_scaled": 669.88, "g": 1.06, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 4, "tau": 3, "rmse": 688.64, "rmse_scaled": 688.38, "g": 1.05, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 3, "tau": 4, "rmse": 708.41, "rmse_scaled": 708.4, "g": 1.011, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 2, "tau": 5, "rmse": 733.5, "rmse_scaled": 730.89, "g": 1.243, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 7, "year": 2017, "k": 0, "tau": 7, "rmse": 750.94, "rmse_scaled": 750.27, "g": 1.135, "clim": 796.27, "sec": 43}
+{"chan": "z500", "day": 10, "year": 2016, "k": 10, "tau": 0, "rmse": 737.3, "rmse_scaled": 737.08, "g": 0.952, "clim": 815.82, "sec": 44}
+{"chan": "z500", "day": 10, "year": 2016, "k": 9, "tau": 1, "rmse": 737.42, "rmse_scaled": 737.1, "g": 0.942, "clim": 815.82, "sec": 45}
+{"chan": "z500", "day": 10, "year": 2016, "k": 8, "tau": 2, "rmse": 739.52, "rmse_scaled": 739.52, "g": 1.01, "clim": 815.82, "sec": 46}
+{"chan": "z500", "day": 10, "year": 2016, "k": 7, "tau": 3, "rmse": 744.95, "rmse_scaled": 744.94, "g": 1.012, "clim": 815.82, "sec": 46}
+{"chan": "z500", "day": 10, "year": 2016, "k": 6, "tau": 4, "rmse": 752.25, "rmse_scaled": 752.23, "g": 0.985, "clim": 815.82, "sec": 46}
+{"chan": "z500", "day": 10, "year": 2016, "k": 5, "tau": 5, "rmse": 765.09, "rmse_scaled": 763.08, "g": 1.238, "clim": 815.82, "sec": 46}
+{"chan": "z500", "day": 10, "year": 2016, "k": 3, "tau": 7, "rmse": 776.41, "rmse_scaled": 775.89, "g": 1.127, "clim": 815.82, "sec": 46}
+{"chan": "z500", "day": 10, "year": 2016, "k": 0, "tau": 10, "rmse": 790.01, "rmse_scaled": 789.85, "g": 0.928, "clim": 815.82, "sec": 46}
+{"chan": "z500", "day": 10, "year": 2020, "k": 10, "tau": 0, "rmse": 725.02, "rmse_scaled": 725.01, "g": 0.991, "clim": 806.77, "sec": 47}
+{"chan": "z500", "day": 10, "year": 2020, "k": 9, "tau": 1, "rmse": 723.97, "rmse_scaled": 723.97, "g": 0.993, "clim": 806.77, "sec": 48}
+{"chan": "z500", "day": 10, "year": 2020, "k": 8, "tau": 2, "rmse": 727.69, "rmse_scaled": 727.33, "g": 1.07, "clim": 806.77, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2020, "k": 7, "tau": 3, "rmse": 734.46, "rmse_scaled": 734.09, "g": 1.075, "clim": 806.77, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2020, "k": 6, "tau": 4, "rmse": 742.69, "rmse_scaled": 742.54, "g": 1.049, "clim": 806.77, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2020, "k": 5, "tau": 5, "rmse": 759.59, "rmse_scaled": 756.62, "g": 1.315, "clim": 806.77, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2020, "k": 3, "tau": 7, "rmse": 771.19, "rmse_scaled": 770.27, "g": 1.186, "clim": 806.77, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2020, "k": 0, "tau": 10, "rmse": 785.57, "rmse_scaled": 785.47, "g": 0.936, "clim": 806.77, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 10, "tau": 0, "rmse": 718.23, "rmse_scaled": 717.18, "g": 0.895, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 9, "tau": 1, "rmse": 718.2, "rmse_scaled": 717.03, "g": 0.889, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 8, "tau": 2, "rmse": 719.15, "rmse_scaled": 719.03, "g": 0.962, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 7, "tau": 3, "rmse": 722.68, "rmse_scaled": 722.67, "g": 0.988, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 6, "tau": 4, "rmse": 727.43, "rmse_scaled": 727.43, "g": 0.998, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 5, "tau": 5, "rmse": 741.61, "rmse_scaled": 739.69, "g": 1.24, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 3, "tau": 7, "rmse": 752.55, "rmse_scaled": 752.05, "g": 1.129, "clim": 789.23, "sec": 49}
+{"chan": "z500", "day": 10, "year": 2017, "k": 0, "tau": 10, "rmse": 761.98, "rmse_scaled": 761.98, "g": 0.989, "clim": 789.23, "sec": 50}
+{"chan": "t850", "tau": 0, "ridge": 0.1, "val_skill": 0.6211, "sec": 50}
+{"chan": "t850", "tau": 1, "ridge": 0.1, "val_skill": 0.5837, "sec": 50}
+{"chan": "t850", "tau": 2, "ridge": 0.1, "val_skill": 0.4139, "sec": 50}
+{"chan": "t850", "tau": 3, "ridge": 0.1, "val_skill": 0.257, "sec": 50}
+{"chan": "t850", "tau": 4, "ridge": 0.1, "val_skill": 0.1464, "sec": 50}
+{"chan": "t850", "tau": 5, "ridge": 1.0, "val_skill": 0.0836, "sec": 50}
+{"chan": "t850", "tau": 7, "ridge": 1.0, "val_skill": 0.0228, "sec": 50}
+{"chan": "t850", "tau": 10, "ridge": 1.0, "val_skill": -0.0155, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2016, "k": 3, "tau": 0, "rmse": 2.27, "rmse_scaled": 2.24, "g": 1.176, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2016, "k": 2, "tau": 1, "rmse": 2.28, "rmse_scaled": 2.27, "g": 1.099, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2016, "k": 1, "tau": 2, "rmse": 2.47, "rmse_scaled": 2.47, "g": 1.04, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2016, "k": 0, "tau": 3, "rmse": 2.67, "rmse_scaled": 2.67, "g": 0.983, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2020, "k": 3, "tau": 0, "rmse": 2.29, "rmse_scaled": 2.27, "g": 1.18, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2020, "k": 2, "tau": 1, "rmse": 2.3, "rmse_scaled": 2.29, "g": 1.111, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2020, "k": 1, "tau": 2, "rmse": 2.49, "rmse_scaled": 2.48, "g": 1.054, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2020, "k": 0, "tau": 3, "rmse": 2.69, "rmse_scaled": 2.69, "g": 0.992, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2017, "k": 3, "tau": 0, "rmse": 2.28, "rmse_scaled": 2.26, "g": 1.16, "clim": 3.14, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2017, "k": 2, "tau": 1, "rmse": 2.29, "rmse_scaled": 2.28, "g": 1.088, "clim": 3.14, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2017, "k": 1, "tau": 2, "rmse": 2.46, "rmse_scaled": 2.46, "g": 1.036, "clim": 3.14, "sec": 50}
+{"chan": "t850", "day": 3, "year": 2017, "k": 0, "tau": 3, "rmse": 2.65, "rmse_scaled": 2.65, "g": 0.979, "clim": 3.14, "sec": 50}
+{"chan": "t850", "day": 5, "year": 2016, "k": 5, "tau": 0, "rmse": 2.55, "rmse_scaled": 2.53, "g": 1.181, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 5, "year": 2016, "k": 4, "tau": 1, "rmse": 2.53, "rmse_scaled": 2.53, "g": 1.121, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 5, "year": 2016, "k": 3, "tau": 2, "rmse": 2.61, "rmse_scaled": 2.61, "g": 1.075, "clim": 3.2, "sec": 50}
+{"chan": "t850", "day": 5, "year": 2016, "k": 2, "tau": 3, "rmse": 2.73, "rmse_scaled": 2.73, "g": 1.014, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2016, "k": 1, "tau": 4, "rmse": 2.85, "rmse_scaled": 2.85, "g": 0.931, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2016, "k": 0, "tau": 5, "rmse": 2.96, "rmse_scaled": 2.95, "g": 1.211, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2020, "k": 5, "tau": 0, "rmse": 2.57, "rmse_scaled": 2.55, "g": 1.188, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2020, "k": 4, "tau": 1, "rmse": 2.56, "rmse_scaled": 2.55, "g": 1.127, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2020, "k": 3, "tau": 2, "rmse": 2.64, "rmse_scaled": 2.63, "g": 1.087, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2020, "k": 2, "tau": 3, "rmse": 2.76, "rmse_scaled": 2.75, "g": 1.028, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2020, "k": 1, "tau": 4, "rmse": 2.88, "rmse_scaled": 2.87, "g": 0.941, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2020, "k": 0, "tau": 5, "rmse": 2.99, "rmse_scaled": 2.98, "g": 1.248, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2017, "k": 5, "tau": 0, "rmse": 2.56, "rmse_scaled": 2.54, "g": 1.183, "clim": 3.17, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2017, "k": 4, "tau": 1, "rmse": 2.54, "rmse_scaled": 2.53, "g": 1.119, "clim": 3.17, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2017, "k": 3, "tau": 2, "rmse": 2.61, "rmse_scaled": 2.6, "g": 1.092, "clim": 3.17, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2017, "k": 2, "tau": 3, "rmse": 2.72, "rmse_scaled": 2.72, "g": 1.049, "clim": 3.17, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2017, "k": 1, "tau": 4, "rmse": 2.83, "rmse_scaled": 2.83, "g": 0.971, "clim": 3.17, "sec": 51}
+{"chan": "t850", "day": 5, "year": 2017, "k": 0, "tau": 5, "rmse": 2.94, "rmse_scaled": 2.93, "g": 1.26, "clim": 3.17, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 7, "tau": 0, "rmse": 2.77, "rmse_scaled": 2.76, "g": 1.135, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 6, "tau": 1, "rmse": 2.75, "rmse_scaled": 2.75, "g": 1.095, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 5, "tau": 2, "rmse": 2.78, "rmse_scaled": 2.78, "g": 1.075, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 4, "tau": 3, "rmse": 2.83, "rmse_scaled": 2.83, "g": 1.04, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 3, "tau": 4, "rmse": 2.89, "rmse_scaled": 2.89, "g": 0.974, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 2, "tau": 5, "rmse": 2.98, "rmse_scaled": 2.97, "g": 1.232, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2016, "k": 0, "tau": 7, "rmse": 3.05, "rmse_scaled": 3.05, "g": 1.082, "clim": 3.19, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 7, "tau": 0, "rmse": 2.79, "rmse_scaled": 2.79, "g": 1.147, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 6, "tau": 1, "rmse": 2.78, "rmse_scaled": 2.78, "g": 1.105, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 5, "tau": 2, "rmse": 2.8, "rmse_scaled": 2.8, "g": 1.087, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 4, "tau": 3, "rmse": 2.86, "rmse_scaled": 2.85, "g": 1.055, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 3, "tau": 4, "rmse": 2.92, "rmse_scaled": 2.92, "g": 0.996, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 2, "tau": 5, "rmse": 3.0, "rmse_scaled": 2.99, "g": 1.291, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2020, "k": 0, "tau": 7, "rmse": 3.08, "rmse_scaled": 3.07, "g": 1.121, "clim": 3.2, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 7, "tau": 0, "rmse": 2.78, "rmse_scaled": 2.78, "g": 1.059, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 6, "tau": 1, "rmse": 2.77, "rmse_scaled": 2.77, "g": 1.021, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 5, "tau": 2, "rmse": 2.78, "rmse_scaled": 2.78, "g": 1.015, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 4, "tau": 3, "rmse": 2.83, "rmse_scaled": 2.83, "g": 1.003, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 3, "tau": 4, "rmse": 2.88, "rmse_scaled": 2.88, "g": 0.967, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 2, "tau": 5, "rmse": 2.95, "rmse_scaled": 2.94, "g": 1.216, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 7, "year": 2017, "k": 0, "tau": 7, "rmse": 3.01, "rmse_scaled": 3.01, "g": 1.098, "clim": 3.14, "sec": 51}
+{"chan": "t850", "day": 10, "year": 2016, "k": 10, "tau": 0, "rmse": 2.96, "rmse_scaled": 2.96, "g": 1.02, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 9, "tau": 1, "rmse": 2.95, "rmse_scaled": 2.95, "g": 1.002, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 8, "tau": 2, "rmse": 2.95, "rmse_scaled": 2.95, "g": 1.007, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 7, "tau": 3, "rmse": 2.96, "rmse_scaled": 2.96, "g": 1.003, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 6, "tau": 4, "rmse": 2.98, "rmse_scaled": 2.98, "g": 0.977, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 5, "tau": 5, "rmse": 3.03, "rmse_scaled": 3.02, "g": 1.254, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 3, "tau": 7, "rmse": 3.06, "rmse_scaled": 3.06, "g": 1.145, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2016, "k": 0, "tau": 10, "rmse": 3.1, "rmse_scaled": 3.1, "g": 0.954, "clim": 3.19, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 10, "tau": 0, "rmse": 2.98, "rmse_scaled": 2.98, "g": 1.035, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 9, "tau": 1, "rmse": 2.97, "rmse_scaled": 2.97, "g": 1.027, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 8, "tau": 2, "rmse": 2.97, "rmse_scaled": 2.97, "g": 1.036, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 7, "tau": 3, "rmse": 2.99, "rmse_scaled": 2.99, "g": 1.038, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 6, "tau": 4, "rmse": 3.0, "rmse_scaled": 3.0, "g": 1.021, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 5, "tau": 5, "rmse": 3.05, "rmse_scaled": 3.04, "g": 1.32, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 3, "tau": 7, "rmse": 3.09, "rmse_scaled": 3.08, "g": 1.203, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2020, "k": 0, "tau": 10, "rmse": 3.13, "rmse_scaled": 3.13, "g": 0.944, "clim": 3.2, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 10, "tau": 0, "rmse": 2.95, "rmse_scaled": 2.95, "g": 0.957, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 9, "tau": 1, "rmse": 2.94, "rmse_scaled": 2.94, "g": 0.945, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 8, "tau": 2, "rmse": 2.94, "rmse_scaled": 2.94, "g": 0.969, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 7, "tau": 3, "rmse": 2.94, "rmse_scaled": 2.94, "g": 0.995, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 6, "tau": 4, "rmse": 2.95, "rmse_scaled": 2.95, "g": 0.995, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 5, "tau": 5, "rmse": 3.0, "rmse_scaled": 2.99, "g": 1.267, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 3, "tau": 7, "rmse": 3.03, "rmse_scaled": 3.03, "g": 1.162, "clim": 3.15, "sec": 52}
+{"chan": "t850", "day": 10, "year": 2017, "k": 0, "tau": 10, "rmse": 3.06, "rmse_scaled": 3.06, "g": 1.013, "clim": 3.15, "sec": 52}
+{"chan": "t2m", "tau": 0, "ridge": 0.1, "val_skill": 0.4681, "sec": 52}
+{"chan": "t2m", "tau": 1, "ridge": 0.1, "val_skill": 0.4725, "sec": 52}
+{"chan": "t2m", "tau": 2, "ridge": 0.1, "val_skill": 0.3587, "sec": 52}
+{"chan": "t2m", "tau": 3, "ridge": 0.1, "val_skill": 0.2314, "sec": 52}
+{"chan": "t2m", "tau": 4, "ridge": 0.1, "val_skill": 0.1285, "sec": 52}
+{"chan": "t2m", "tau": 5, "ridge": 1.0, "val_skill": 0.0734, "sec": 52}
+{"chan": "t2m", "tau": 7, "ridge": 1.0, "val_skill": 0.005, "sec": 52}
+{"chan": "t2m", "tau": 10, "ridge": 1.0, "val_skill": -0.0438, "sec": 52}
+{"chan": "t2m", "day": 3, "year": 2016, "k": 3, "tau": 0, "rmse": 1.84, "rmse_scaled": 1.84, "g": 1.121, "clim": 2.37, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2016, "k": 2, "tau": 1, "rmse": 1.83, "rmse_scaled": 1.83, "g": 1.055, "clim": 2.37, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2016, "k": 1, "tau": 2, "rmse": 1.9, "rmse_scaled": 1.9, "g": 0.994, "clim": 2.37, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2016, "k": 0, "tau": 3, "rmse": 1.99, "rmse_scaled": 1.99, "g": 0.942, "clim": 2.37, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2020, "k": 3, "tau": 0, "rmse": 1.87, "rmse_scaled": 1.86, "g": 1.144, "clim": 2.39, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2020, "k": 2, "tau": 1, "rmse": 1.85, "rmse_scaled": 1.85, "g": 1.091, "clim": 2.39, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2020, "k": 1, "tau": 2, "rmse": 1.91, "rmse_scaled": 1.91, "g": 1.031, "clim": 2.39, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2020, "k": 0, "tau": 3, "rmse": 2.01, "rmse_scaled": 2.01, "g": 0.975, "clim": 2.39, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2017, "k": 3, "tau": 0, "rmse": 1.82, "rmse_scaled": 1.82, "g": 1.08, "clim": 2.27, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2017, "k": 2, "tau": 1, "rmse": 1.8, "rmse_scaled": 1.8, "g": 1.026, "clim": 2.27, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2017, "k": 1, "tau": 2, "rmse": 1.86, "rmse_scaled": 1.86, "g": 0.969, "clim": 2.27, "sec": 53}
+{"chan": "t2m", "day": 3, "year": 2017, "k": 0, "tau": 3, "rmse": 1.95, "rmse_scaled": 1.95, "g": 0.92, "clim": 2.27, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2016, "k": 5, "tau": 0, "rmse": 1.96, "rmse_scaled": 1.95, "g": 1.136, "clim": 2.36, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2016, "k": 4, "tau": 1, "rmse": 1.94, "rmse_scaled": 1.94, "g": 1.089, "clim": 2.36, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2016, "k": 3, "tau": 2, "rmse": 1.97, "rmse_scaled": 1.97, "g": 1.041, "clim": 2.36, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2016, "k": 2, "tau": 3, "rmse": 2.02, "rmse_scaled": 2.02, "g": 0.981, "clim": 2.36, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2016, "k": 1, "tau": 4, "rmse": 2.08, "rmse_scaled": 2.08, "g": 0.909, "clim": 2.36, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2016, "k": 0, "tau": 5, "rmse": 2.16, "rmse_scaled": 2.15, "g": 1.148, "clim": 2.36, "sec": 53}
+{"chan": "t2m", "day": 5, "year": 2020, "k": 5, "tau": 0, "rmse": 1.99, "rmse_scaled": 1.98, "g": 1.167, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2020, "k": 4, "tau": 1, "rmse": 1.97, "rmse_scaled": 1.97, "g": 1.121, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2020, "k": 3, "tau": 2, "rmse": 2.0, "rmse_scaled": 1.99, "g": 1.078, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2020, "k": 2, "tau": 3, "rmse": 2.05, "rmse_scaled": 2.05, "g": 1.021, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2020, "k": 1, "tau": 4, "rmse": 2.11, "rmse_scaled": 2.11, "g": 0.949, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2020, "k": 0, "tau": 5, "rmse": 2.18, "rmse_scaled": 2.18, "g": 1.254, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2017, "k": 5, "tau": 0, "rmse": 1.95, "rmse_scaled": 1.95, "g": 1.121, "clim": 2.31, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2017, "k": 4, "tau": 1, "rmse": 1.93, "rmse_scaled": 1.93, "g": 1.072, "clim": 2.31, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2017, "k": 3, "tau": 2, "rmse": 1.95, "rmse_scaled": 1.95, "g": 1.04, "clim": 2.31, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2017, "k": 2, "tau": 3, "rmse": 2.0, "rmse_scaled": 2.0, "g": 0.993, "clim": 2.31, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2017, "k": 1, "tau": 4, "rmse": 2.06, "rmse_scaled": 2.06, "g": 0.934, "clim": 2.31, "sec": 54}
+{"chan": "t2m", "day": 5, "year": 2017, "k": 0, "tau": 5, "rmse": 2.12, "rmse_scaled": 2.12, "g": 1.174, "clim": 2.31, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 7, "tau": 0, "rmse": 2.06, "rmse_scaled": 2.05, "g": 1.107, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 6, "tau": 1, "rmse": 2.04, "rmse_scaled": 2.04, "g": 1.081, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 5, "tau": 2, "rmse": 2.05, "rmse_scaled": 2.05, "g": 1.057, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 4, "tau": 3, "rmse": 2.07, "rmse_scaled": 2.07, "g": 1.017, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 3, "tau": 4, "rmse": 2.11, "rmse_scaled": 2.11, "g": 0.958, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 2, "tau": 5, "rmse": 2.17, "rmse_scaled": 2.16, "g": 1.167, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2016, "k": 0, "tau": 7, "rmse": 2.22, "rmse_scaled": 2.22, "g": 1.048, "clim": 2.36, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 7, "tau": 0, "rmse": 2.09, "rmse_scaled": 2.09, "g": 1.156, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 6, "tau": 1, "rmse": 2.08, "rmse_scaled": 2.08, "g": 1.125, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 5, "tau": 2, "rmse": 2.09, "rmse_scaled": 2.08, "g": 1.098, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 4, "tau": 3, "rmse": 2.11, "rmse_scaled": 2.11, "g": 1.059, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 3, "tau": 4, "rmse": 2.14, "rmse_scaled": 2.14, "g": 1.007, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 2, "tau": 5, "rmse": 2.2, "rmse_scaled": 2.19, "g": 1.29, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2020, "k": 0, "tau": 7, "rmse": 2.25, "rmse_scaled": 2.25, "g": 1.162, "clim": 2.39, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 7, "tau": 0, "rmse": 2.06, "rmse_scaled": 2.06, "g": 1.011, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 6, "tau": 1, "rmse": 2.05, "rmse_scaled": 2.05, "g": 0.987, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 5, "tau": 2, "rmse": 2.05, "rmse_scaled": 2.05, "g": 0.981, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 4, "tau": 3, "rmse": 2.06, "rmse_scaled": 2.06, "g": 0.966, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 3, "tau": 4, "rmse": 2.09, "rmse_scaled": 2.09, "g": 0.938, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 2, "tau": 5, "rmse": 2.14, "rmse_scaled": 2.13, "g": 1.135, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 7, "year": 2017, "k": 0, "tau": 7, "rmse": 2.17, "rmse_scaled": 2.17, "g": 1.059, "clim": 2.3, "sec": 54}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 10, "tau": 0, "rmse": 2.16, "rmse_scaled": 2.16, "g": 1.016, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 9, "tau": 1, "rmse": 2.15, "rmse_scaled": 2.15, "g": 1.01, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 8, "tau": 2, "rmse": 2.15, "rmse_scaled": 2.15, "g": 1.01, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 7, "tau": 3, "rmse": 2.15, "rmse_scaled": 2.15, "g": 1.002, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 6, "tau": 4, "rmse": 2.16, "rmse_scaled": 2.16, "g": 0.979, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 5, "tau": 5, "rmse": 2.2, "rmse_scaled": 2.2, "g": 1.186, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 3, "tau": 7, "rmse": 2.22, "rmse_scaled": 2.22, "g": 1.094, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2016, "k": 0, "tau": 10, "rmse": 2.26, "rmse_scaled": 2.26, "g": 0.947, "clim": 2.35, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 10, "tau": 0, "rmse": 2.19, "rmse_scaled": 2.19, "g": 1.085, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 9, "tau": 1, "rmse": 2.18, "rmse_scaled": 2.18, "g": 1.083, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 8, "tau": 2, "rmse": 2.18, "rmse_scaled": 2.18, "g": 1.084, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 7, "tau": 3, "rmse": 2.19, "rmse_scaled": 2.19, "g": 1.077, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 6, "tau": 4, "rmse": 2.2, "rmse_scaled": 2.2, "g": 1.058, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 5, "tau": 5, "rmse": 2.24, "rmse_scaled": 2.23, "g": 1.327, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 3, "tau": 7, "rmse": 2.26, "rmse_scaled": 2.26, "g": 1.228, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2020, "k": 0, "tau": 10, "rmse": 2.3, "rmse_scaled": 2.3, "g": 1.039, "clim": 2.39, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 10, "tau": 0, "rmse": 2.14, "rmse_scaled": 2.14, "g": 0.893, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 9, "tau": 1, "rmse": 2.13, "rmse_scaled": 2.13, "g": 0.89, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 8, "tau": 2, "rmse": 2.13, "rmse_scaled": 2.13, "g": 0.9, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 7, "tau": 3, "rmse": 2.13, "rmse_scaled": 2.13, "g": 0.909, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 6, "tau": 4, "rmse": 2.14, "rmse_scaled": 2.13, "g": 0.902, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 5, "tau": 5, "rmse": 2.16, "rmse_scaled": 2.16, "g": 1.095, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 3, "tau": 7, "rmse": 2.18, "rmse_scaled": 2.18, "g": 1.006, "clim": 2.28, "sec": 55}
+{"chan": "t2m", "day": 10, "year": 2017, "k": 0, "tau": 10, "rmse": 2.21, "rmse_scaled": 2.21, "g": 0.887, "clim": 2.28, "sec": 55}
+done 55

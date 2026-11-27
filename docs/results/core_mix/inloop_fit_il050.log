@@ -1,0 +1,18 @@
+{"day": 3, "pass1": 2016, "sec": 1}
+{"day": 3, "pass1": 2020, "sec": 1}
+{"day": 3, "pass2": 2016, "sec": 2}
+{"day": 3, "pass2": 2020, "sec": 2}
+{"day": 3, "pass2": 2017, "sec": 3}
+day  3 bands                    K   6  z500  384.2 (fit16  384.2)  cv  380.4  t850 2.049 t2m 1.560 nrmse 0.3122 cv 0.3161  
+{"day": 5, "pass1": 2016, "sec": 3}
+{"day": 5, "pass1": 2020, "sec": 4}
+{"day": 5, "pass2": 2016, "sec": 4}
+{"day": 5, "pass2": 2020, "sec": 5}
+{"day": 5, "pass2": 2017, "sec": 5}
+day  5 bands                    K   6  z500  553.6 (fit16  553.6)  cv  548.5  t850 2.497 t2m 1.846 nrmse 0.3875 cv 0.3919  
+{"day": 10, "pass1": 2016, "sec": 6}
+{"day": 10, "pass1": 2020, "sec": 7}
+{"day": 10, "pass2": 2016, "sec": 7}
+{"day": 10, "pass2": 2020, "sec": 7}
+{"day": 10, "pass2": 2017, "sec": 8}
+day 10 bands                    K   6  z500  730.3 (fit16  729.8)  cv  733.3  t850 2.990 t2m 2.159 nrmse 0.4594 cv 0.4677  

@@ -1,0 +1,10 @@
+{"archive": 5844, "nv": 1024, "sec": 12}
+{"dump": "mc0", "dim": 67584, "npc": 400, "explained": 0.838, "sec": 34}
+{"tau": 0, "lags": 0, "ridge": 0.01, "val_mse_over_var": 0.2998, "sec": 39}
+{"year": 2016, "day": 5, "k": 5, "tau": 0, "lags": 0, "sec": 40}
+{"year": 2016, "day": 10, "k": 10, "tau": 0, "lags": 0, "sec": 43}
+{"year": 2020, "day": 5, "k": 5, "tau": 0, "lags": 0, "sec": 46}
+{"year": 2020, "day": 10, "k": 10, "tau": 0, "lags": 0, "sec": 49}
+{"year": 2017, "day": 5, "k": 5, "tau": 0, "lags": 0, "sec": 152}
+{"year": 2017, "day": 10, "k": 10, "tau": 0, "lags": 0, "sec": 187}
+done 187

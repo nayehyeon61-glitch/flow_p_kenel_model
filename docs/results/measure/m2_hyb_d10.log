@@ -1,0 +1,23 @@
+{"archive_days": 5844, "eof_explained": {"1": 0.0585, "4": 0.1875, "16": 0.4859, "64": 0.8572, "256": 0.9891, "1024": 0.9998}, "clim_rms": 795.7}
+day 10 z500 bands                        K    6  test  717.6  cv  729.0  oracle  717.0   
+    band 0: g 1.085 (oracle 0.905)  forecast var 0.009  truth var 0.005  error share 0.003  corr 0.659
+    band 1: g 0.822 (oracle 0.810)  forecast var 0.015  truth var 0.012  error share 0.012  corr 0.454
+    band 2: g 0.917 (oracle 0.780)  forecast var 0.107  truth var 0.080  error share 0.077  corr 0.460
+    band 3: g 0.929 (oracle 0.860)  forecast var 0.577  truth var 0.462  error share 0.426  corr 0.489
+    band 4: g 0.803 (oracle 0.782)  forecast var 0.267  truth var 0.402  error share 0.435  corr 0.324
+    band 5: g 0.211 (oracle 0.227)  forecast var 0.025  truth var 0.040  error share 0.048  corr 0.092
+day 10 z500 hyb0                         K   12  test  717.0  cv  728.9  oracle  715.4  [-0.65, -1.39, 0.11] 
+day 10 z500 hyb3                         K   12  test  716.5  cv  728.3  oracle  715.3  [-1.09, -2.27, 0.05] 
+day 10 z500 hyb5                         K   12  test  715.7  cv  727.8  oracle  714.6  [-1.93, -3.43, -0.45] 
+day 10 z500 hyb7                         K   12  test  714.5  cv  726.7  oracle  713.5  [-3.07, -5.41, -0.71] 
+day 10 z500 hyb8                         K   12  test  714.8  cv  726.6  oracle  713.9  [-2.76, -5.16, -0.33] 
+day 10 z500 hyb9                         K   12  test  715.2  cv  727.2  oracle  714.3  [-2.45, -4.48, -0.36] 
+day 10 z500 hyb7+hyb9                    K   18  test  714.4  cv  726.7  oracle  713.3  [-3.18, -5.57, -0.8] 
+day 10 z500 hyb5+hyb7+hyb8+hyb9          K   30  test  714.0  cv  726.9  oracle  712.1  [-3.61, -5.98, -1.1] 
+day 10 z500 hyb0+hyb3+hyb5+hyb7+hyb8+hyb9 K   42  test  714.3  cv  727.0  oracle  711.8  [-3.26, -5.61, -0.77] 
+day 10 z500 only:hyb9                    K    6  test  718.0  cv  730.9  oracle  716.6  [0.35, -2.99, 3.95] 
+day 10 z500 eof+hyb9                     K   18  test  716.1  cv  728.0  oracle  713.1  [-1.54, -3.27, 0.19] 
+day 10 z500 bands+clim16+vert            K   24  test  716.4  cv  728.8  oracle  715.0  [-1.17, -1.81, -0.53] 
+day 10 z500 bands+clim16+vert+hyb9       K   30  test  714.4  cv  727.0  oracle  712.8  [-3.18, -5.17, -1.14] 
+day 10 z500 eof+clim16+vert              K   30  test  716.0  cv  728.4  oracle  712.8  [-1.63, -3.09, -0.19] 
+day 10 z500 eof+clim16+vert+hyb9         K   36  test  714.9  cv  727.8  oracle  711.5  [-2.71, -4.79, -0.57] 

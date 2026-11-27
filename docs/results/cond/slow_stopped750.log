@@ -1,0 +1,7 @@
+{"fit": [2000, 2013], "val": [2014, 2015], "samples": 4778, "val_samples": 138, "sec": 19}
+/home/claude/flow_p_kenel_model/scripts/slow_core.py:147: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:820.)
+  print(json.dumps(dict(it=it, loss=round(float(loss), 4), val_mse_over_var=round(v, 4), val_z500=round(vz, 4), best=round(best, 4),
+{"it": 250, "loss": 0.1663, "val_mse_over_var": 1.0693, "val_z500": 1.1359, "best": 1.0693, "sec": 154}
+{"it": 500, "loss": 0.1595, "val_mse_over_var": 1.0694, "val_z500": 1.0979, "best": 1.0693, "sec": 297}
+{"it": 750, "loss": 0.1566, "val_mse_over_var": 1.0903, "val_z500": 1.1385, "best": 1.0693, "sec": 440}

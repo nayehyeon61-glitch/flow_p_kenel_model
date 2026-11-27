@@ -1,0 +1,11 @@
+{"archive": 5844, "nv": 1024, "sec": 11}
+{"chan": "z500", "inputs": 66, "dim": 67584, "npc": 400, "explained": 0.838, "sec": 35}
+{"chan": "z500", "tau": 3, "ridge": 0.1, "val_skill": 0.2807, "sec": 35}
+{"chan": "z500", "tau": 4, "ridge": 1.0, "val_skill": 0.1581, "sec": 36}
+{"chan": "z500", "day": 10, "year": 2016, "k": 7, "tau": 3, "rmse": 742.71, "rmse_scaled": 742.68, "g": 0.983, "clim": 815.82, "sec": 38}
+{"chan": "z500", "day": 10, "year": 2016, "k": 6, "tau": 4, "rmse": 752.49, "rmse_scaled": 752.21, "g": 1.071, "clim": 815.82, "sec": 40}
+{"chan": "z500", "day": 10, "year": 2020, "k": 7, "tau": 3, "rmse": 731.42, "rmse_scaled": 731.27, "g": 1.045, "clim": 806.77, "sec": 43}
+{"chan": "z500", "day": 10, "year": 2020, "k": 6, "tau": 4, "rmse": 744.24, "rmse_scaled": 743.19, "g": 1.144, "clim": 806.77, "sec": 44}
+{"chan": "z500", "day": 10, "year": 2017, "k": 7, "tau": 3, "rmse": 720.52, "rmse_scaled": 720.41, "g": 0.962, "clim": 789.23, "sec": 45}
+{"chan": "z500", "day": 10, "year": 2017, "k": 6, "tau": 4, "rmse": 728.58, "rmse_scaled": 728.24, "g": 1.079, "clim": 789.23, "sec": 45}
+done 45
